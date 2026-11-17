@@ -1,0 +1,397 @@
+"""Central monitoring platform bridge (HTTP + optional MQTT)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any, Callable, Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("patrol.bridge")
+
+CENTRAL_HOLDER_PREFIX = "central"
+BRIDGE_CLIENT_ID = "central-bridge"
+ROBOT_DEVICE_ID = "m20_robot_1"
+LIFT_DEVICE_ID = "lift_pole_1"
+PTZ_DEVICE_IDS = ("dog_ptz_1", "roof_ptz_1")
+# 本地已用目标滑条+到位覆盖；集中平台暂不开放，需要时再放开。
+BRIDGE_LIFT_HIDDEN_ACTIONS = frozenset({"max", "min", "set_retracted_zero"})
+
+
+def is_central_holder_name(holder_name: str) -> bool:
+    name = (holder_name or "").strip().lower()
+    return name == CENTRAL_HOLDER_PREFIX or name.startswith(f"{CENTRAL_HOLDER_PREFIX}:") or name.startswith(
+        f"{CENTRAL_HOLDER_PREFIX}-"
+    )
+
+
+def lease_role_for_holder(holder_name: str) -> str:
+    return "central" if is_central_holder_name(holder_name) else "local"
+
+
+class BridgeLiftCommand(BaseModel):
+    action: str
+    speed: Optional[float] = Field(default=None, ge=0, le=1)
+    height: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class BridgePTZCommand(BaseModel):
+    command: str
+    speed: int = Field(default=5, ge=1, le=15)
+
+
+class BridgeLightCommand(BaseModel):
+    enabled: bool
+
+
+class BridgeLeaseRequest(BaseModel):
+    holder_name: str = Field(default="central", min_length=1)
+
+
+class BridgeDeps:
+    """Late-bound collaborators from main.py to avoid circular imports."""
+
+    def __init__(self) -> None:
+        self.get_settings: Optional[Callable[[], Any]] = None
+        self.lease_manager: Any = None
+        self.handle_expired_lease: Optional[Callable] = None
+        self.emergency_stop_device: Optional[Callable] = None
+        self.m20_status: Optional[Callable] = None
+        self.lift_status: Optional[Callable] = None
+        self.lift_control: Optional[Callable] = None
+        self.ptz_start: Optional[Callable] = None
+        self.ptz_stop: Optional[Callable] = None
+        self.ptz_home: Optional[Callable] = None
+        self.ptz_light: Optional[Callable] = None
+        self.ensure_ptz_device: Optional[Callable] = None
+        self.control_log_add: Optional[Callable] = None
+        self.broadcast: Optional[Callable] = None
+        self.LiftCommand = None
+        self.PTZCommand = None
+        self.LightCommand = None
+        self.ControlEvent = None
+
+
+deps = BridgeDeps()
+router = APIRouter(prefix="/api/bridge/v1", tags=["bridge"])
+_mqtt_task: Optional[asyncio.Task] = None
+
+
+
+def _settings():
+    if not deps.get_settings:
+        raise RuntimeError("bridge deps not bound")
+    return deps.get_settings()
+
+
+def require_bridge(request: Request) -> None:
+    settings = _settings()
+    if not getattr(settings, "bridge_enabled", False):
+        raise HTTPException(status_code=404, detail="Bridge API is disabled")
+    token = (getattr(settings, "bridge_token", None) or "").strip()
+    if not token:
+        return
+    provided = (request.headers.get("X-Patrol-Bridge-Token") or "").strip()
+    if not provided:
+        auth = (request.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if provided != token:
+        raise HTTPException(status_code=401, detail="Invalid bridge token")
+
+
+def _normalize_central_holder(holder_name: str) -> str:
+    name = (holder_name or "").strip() or "central"
+    if not is_central_holder_name(name):
+        return f"central:{name}"
+    return name
+
+
+async def _ensure_central_lease(device_id: str, holder_name: str = "central") -> Dict[str, Any]:
+    assert deps.lease_manager and deps.handle_expired_lease
+    await deps.handle_expired_lease(device_id)
+    holder = _normalize_central_holder(holder_name)
+    return deps.lease_manager.acquire(device_id, BRIDGE_CLIENT_ID, holder, role="central")
+
+
+def _media_urls(settings: Any) -> Dict[str, Any]:
+    rtsp_base = (getattr(settings, "bridge_rtsp_public_base", None) or "").strip().rstrip("/")
+    if not rtsp_base:
+        # Derive host from mediamtx_public_base when possible.
+        webrtc = (settings.mediamtx_public_base or "").strip().rstrip("/")
+        host = "127.0.0.1"
+        if "://" in webrtc:
+            host_port = webrtc.split("://", 1)[1]
+            host = host_port.split("/")[0].split(":")[0] or host
+        rtsp_base = f"rtsp://{host}:8554"
+    return {
+        "webrtc_base": settings.mediamtx_public_base,
+        "rtsp_base": rtsp_base,
+        "rtsp": {
+            "m20_front": f"{rtsp_base}/m20-front",
+            "m20_rear": f"{rtsp_base}/m20-rear",
+            "dog_ptz": f"{rtsp_base}/dog-ptz-1",
+            "roof_ptz": f"{rtsp_base}/roof-ptz-1",
+        },
+    }
+
+
+def _lease_public(device_id: str) -> Dict[str, Any]:
+    assert deps.lease_manager
+    return deps.lease_manager.payload(device_id, None)
+
+
+@router.get("/health")
+async def bridge_health(_: None = Depends(require_bridge)) -> Dict[str, Any]:
+    settings = _settings()
+    return {
+        "ok": True,
+        "enabled": True,
+        "mqtt_enabled": bool(settings.bridge_mqtt_enabled),
+        "robot_control_via_bridge": False,
+        "local_priority": True,
+        "capabilities": [
+            "robot.status",
+            "lift.status",
+            "lift.control",
+            "ptz.proxy",
+            "media.urls",
+            "mqtt.status",
+        ],
+    }
+
+
+@router.get("/snapshot")
+async def bridge_snapshot(_: None = Depends(require_bridge)) -> Dict[str, Any]:
+    assert deps.m20_status and deps.lift_status
+    settings = _settings()
+    robot = await deps.m20_status()
+    lift = await deps.lift_status()
+    return {
+        "robot": robot,
+        "lift": lift,
+        "leases": {
+            ROBOT_DEVICE_ID: _lease_public(ROBOT_DEVICE_ID),
+            LIFT_DEVICE_ID: _lease_public(LIFT_DEVICE_ID),
+            "dog_ptz_1": _lease_public("dog_ptz_1"),
+            "roof_ptz_1": _lease_public("roof_ptz_1"),
+        },
+        "media": _media_urls(settings),
+    }
+
+
+@router.get("/robot/status")
+async def bridge_robot_status(_: None = Depends(require_bridge)) -> Dict[str, Any]:
+    assert deps.m20_status
+    return await deps.m20_status()
+
+
+@router.get("/lift/status")
+async def bridge_lift_status(_: None = Depends(require_bridge)) -> Dict[str, Any]:
+    assert deps.lift_status
+    return await deps.lift_status()
+
+
+@router.post("/lift/lease/acquire")
+async def bridge_lift_lease_acquire(
+    body: BridgeLeaseRequest,
+    _: None = Depends(require_bridge),
+) -> Dict[str, Any]:
+    assert deps.broadcast and deps.ControlEvent
+    payload = await _ensure_central_lease(LIFT_DEVICE_ID, body.holder_name)
+    await deps.broadcast(deps.ControlEvent(device_id=LIFT_DEVICE_ID, type="lease_acquired", payload=payload))
+    return payload
+
+
+@router.post("/lift/lease/release")
+async def bridge_lift_lease_release(_: None = Depends(require_bridge)) -> Dict[str, Any]:
+    assert deps.lease_manager and deps.handle_expired_lease and deps.broadcast and deps.ControlEvent
+    await deps.handle_expired_lease(LIFT_DEVICE_ID)
+    held = deps.lease_manager.payload(LIFT_DEVICE_ID, BRIDGE_CLIENT_ID).get("can_control")
+    payload = deps.lease_manager.release(LIFT_DEVICE_ID, BRIDGE_CLIENT_ID)
+    if held and deps.emergency_stop_device:
+        await deps.emergency_stop_device(LIFT_DEVICE_ID, "bridge_lease_released")
+    await deps.broadcast(deps.ControlEvent(device_id=LIFT_DEVICE_ID, type="lease_released", payload=payload))
+    return payload
+
+
+@router.post("/lift/control")
+async def bridge_lift_control(
+    command: BridgeLiftCommand,
+    _: None = Depends(require_bridge),
+) -> Dict[str, Any]:
+    action = command.action
+    if action in BRIDGE_LIFT_HIDDEN_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Lift action '{action}' is not available on the Bridge",
+        )
+    assert deps.lease_manager and deps.handle_expired_lease and deps.lift_control and deps.LiftCommand
+    await deps.handle_expired_lease(LIFT_DEVICE_ID)
+    if action != "stop":
+        await _ensure_central_lease(LIFT_DEVICE_ID, "central")
+        deps.lease_manager.require_control(LIFT_DEVICE_ID, BRIDGE_CLIENT_ID)
+    else:
+        # Allow stop if we hold the lease or nobody holds it.
+        lease = deps.lease_manager.payload(LIFT_DEVICE_ID, BRIDGE_CLIENT_ID)
+        if lease.get("holder_id") and not lease.get("can_control"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Local operator holds lift lease; central stop denied",
+                    "lease": lease,
+                },
+            )
+    lift_cmd = deps.LiftCommand(action=command.action, speed=command.speed, height=command.height)
+    return await deps.lift_control(LIFT_DEVICE_ID, BRIDGE_CLIENT_ID, lift_cmd)
+
+
+@router.post("/ptz/{device_id}/lease/acquire")
+async def bridge_ptz_lease_acquire(
+    device_id: str,
+    body: BridgeLeaseRequest,
+    _: None = Depends(require_bridge),
+) -> Dict[str, Any]:
+    assert deps.ensure_ptz_device and deps.broadcast and deps.ControlEvent
+    deps.ensure_ptz_device(device_id)
+    payload = await _ensure_central_lease(device_id, body.holder_name)
+    await deps.broadcast(deps.ControlEvent(device_id=device_id, type="lease_acquired", payload=payload))
+    return payload
+
+
+@router.post("/ptz/{device_id}/lease/release")
+async def bridge_ptz_lease_release(device_id: str, _: None = Depends(require_bridge)) -> Dict[str, Any]:
+    assert deps.ensure_ptz_device and deps.lease_manager and deps.handle_expired_lease
+    assert deps.broadcast and deps.ControlEvent
+    deps.ensure_ptz_device(device_id)
+    await deps.handle_expired_lease(device_id)
+    held = deps.lease_manager.payload(device_id, BRIDGE_CLIENT_ID).get("can_control")
+    payload = deps.lease_manager.release(device_id, BRIDGE_CLIENT_ID)
+    if held and deps.emergency_stop_device:
+        await deps.emergency_stop_device(device_id, "bridge_lease_released")
+    await deps.broadcast(deps.ControlEvent(device_id=device_id, type="lease_released", payload=payload))
+    return payload
+
+
+@router.post("/ptz/{device_id}/start")
+async def bridge_ptz_start(
+    device_id: str,
+    command: BridgePTZCommand,
+    _: None = Depends(require_bridge),
+) -> Dict[str, Any]:
+    assert deps.ensure_ptz_device and deps.ptz_start and deps.PTZCommand
+    deps.ensure_ptz_device(device_id)
+    await _ensure_central_lease(device_id, "central")
+    return await deps.ptz_start(device_id, BRIDGE_CLIENT_ID, deps.PTZCommand(command=command.command, speed=command.speed))
+
+
+@router.post("/ptz/{device_id}/stop")
+async def bridge_ptz_stop(
+    device_id: str,
+    command: BridgePTZCommand,
+    _: None = Depends(require_bridge),
+) -> Dict[str, Any]:
+    assert deps.ensure_ptz_device and deps.ptz_stop and deps.PTZCommand and deps.lease_manager
+    deps.ensure_ptz_device(device_id)
+    lease = deps.lease_manager.payload(device_id, BRIDGE_CLIENT_ID)
+    if lease.get("holder_id") and not lease.get("can_control"):
+        raise HTTPException(status_code=409, detail={"message": "Local operator holds PTZ lease", "lease": lease})
+    if not lease.get("holder_id"):
+        await _ensure_central_lease(device_id, "central")
+    return await deps.ptz_stop(device_id, BRIDGE_CLIENT_ID, deps.PTZCommand(command=command.command, speed=command.speed))
+
+
+@router.post("/ptz/{device_id}/home")
+async def bridge_ptz_home(device_id: str, _: None = Depends(require_bridge)) -> Dict[str, Any]:
+    assert deps.ensure_ptz_device and deps.ptz_home
+    deps.ensure_ptz_device(device_id)
+    await _ensure_central_lease(device_id, "central")
+    return await deps.ptz_home(device_id, BRIDGE_CLIENT_ID)
+
+
+@router.post("/ptz/{device_id}/light")
+async def bridge_ptz_light(
+    device_id: str,
+    command: BridgeLightCommand,
+    _: None = Depends(require_bridge),
+) -> Dict[str, Any]:
+    assert deps.ensure_ptz_device and deps.ptz_light and deps.LightCommand
+    deps.ensure_ptz_device(device_id)
+    await _ensure_central_lease(device_id, "central")
+    return await deps.ptz_light(device_id, BRIDGE_CLIENT_ID, deps.LightCommand(enabled=command.enabled))
+
+
+async def _build_mqtt_payloads() -> Dict[str, Any]:
+    assert deps.m20_status and deps.lift_status
+    settings = _settings()
+    robot = await deps.m20_status()
+    lift = await deps.lift_status()
+    snapshot = {
+        "robot": robot,
+        "lift": lift,
+        "leases": {
+            ROBOT_DEVICE_ID: _lease_public(ROBOT_DEVICE_ID),
+            LIFT_DEVICE_ID: _lease_public(LIFT_DEVICE_ID),
+        },
+        "media": _media_urls(settings),
+    }
+    return {"robot": robot, "lift": lift, "snapshot": snapshot}
+
+
+async def _mqtt_loop() -> None:
+    while True:
+        settings = _settings()
+        interval = max(2.0, float(getattr(settings, "bridge_mqtt_interval_s", 5) or 5))
+        if not getattr(settings, "bridge_enabled", False) or not getattr(settings, "bridge_mqtt_enabled", False):
+            await asyncio.sleep(interval)
+            continue
+        try:
+            payloads = await _build_mqtt_payloads()
+            _publish_mqtt(settings, payloads)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("bridge mqtt publish failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
+def _publish_mqtt(settings: Any, payloads: Dict[str, Any]) -> None:
+    try:
+        import paho.mqtt.publish as publish
+    except ImportError:
+        logger.warning("bridge_mqtt_enabled but paho-mqtt is not installed")
+        return
+    host = (settings.bridge_mqtt_host or "127.0.0.1").strip()
+    port = int(settings.bridge_mqtt_port or 1883)
+    prefix = (settings.bridge_mqtt_topic_prefix or "patrol/vehicle1").strip().rstrip("/")
+    auth = None
+    user = (settings.bridge_mqtt_username or "").strip()
+    if user:
+        auth = {"username": user, "password": settings.bridge_mqtt_password or ""}
+    msgs = [
+        {"topic": f"{prefix}/robot/status", "payload": json.dumps(payloads["robot"], ensure_ascii=False), "qos": 0},
+        {"topic": f"{prefix}/lift/status", "payload": json.dumps(payloads["lift"], ensure_ascii=False), "qos": 0},
+        {"topic": f"{prefix}/snapshot", "payload": json.dumps(payloads["snapshot"], ensure_ascii=False), "qos": 0},
+    ]
+    publish.multiple(msgs, hostname=host, port=port, auth=auth)
+
+
+async def start_bridge_mqtt() -> None:
+    global _mqtt_task
+    if _mqtt_task and not _mqtt_task.done():
+        return
+    _mqtt_task = asyncio.create_task(_mqtt_loop(), name="bridge-mqtt")
+
+
+async def stop_bridge_mqtt() -> None:
+    global _mqtt_task
+    if _mqtt_task and not _mqtt_task.done():
+        _mqtt_task.cancel()
+        try:
+            await _mqtt_task
+        except asyncio.CancelledError:
+            pass
+    _mqtt_task = None

@@ -1,0 +1,27 @@
+{
+  "source_repository": "https://github.com/liuchang-t/OMNI-Patrol",
+  "commit": "25cfe85705c1a36f6cfbb1719f4b38f88faaf25e",
+  "captured": "2026-11-12",
+  "files": [
+    {
+      "snapshot": "baseline/main.py.txt",
+      "source": "backend/app/main.py",
+      "sha256": "3edc9e15b992419cd913e3ae830f3116e7984ec57b41ea1ce34bd8f4d717a921"
+    },
+    {
+      "snapshot": "baseline/lift_modbus.py",
+      "source": "backend/app/lift_modbus.py",
+      "sha256": "ad2d4f37b638203794ec2bdf91fced2eca7f79e76ea1d1f6d3bebcd957f70db6"
+    },
+    {
+      "snapshot": "baseline/bridge.py.txt",
+      "source": "backend/app/bridge.py",
+      "sha256": "5bd00cdb943ddf444b89cdb97f7237dcfe6e4bf5ffdfe3e2d114724f32ee2c20"
+    },
+    {
+      "snapshot": "baseline/app.js.txt",
+      "source": "frontend/app.js",
+      "sha256": "f39aa0334ebd3a27a6d26ab14c332e73601c93c50e4c47e447b7aae071e3e5b0"
+    }
+  ]
+}

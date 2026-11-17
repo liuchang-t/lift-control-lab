@@ -1,0 +1,3317 @@
+const state = {
+  devices: [],
+  device: null,
+  videoDevice: null,
+  auxVideoDevice: null,
+  robotDevice: null,
+  liftDevice: null,
+  config: null,
+  lease: null,
+  status: null,
+  clientId: getClientId(),
+  activeCommand: null,
+  activeRenewTimer: null,
+  renewTimer: null,
+  leasePollTimer: null,
+  statusTimer: null,
+  robotStatusTimer: null,
+  liftStatusTimer: null,
+  liftLease: null,
+  liftTargetDragging: false,
+  liftSpeedDragging: false,
+  lastRemoteLiftTargetPct: null,
+  lastRemoteLiftSpeed: null,
+  robotStatusInFlight: false,
+  robotStatusBurstTimers: [],
+  operatorDirection: "front",
+  robotMove: {
+    active: false,
+    command: null,
+    activeInputs: new Map(),
+    timer: null,
+    renewTimer: null,
+    inFlight: false,
+    stopInFlight: false,
+  },
+  robotInputMode: "joystick",
+  ptzLightOn: false,
+  socket: null,
+  logs: [],
+  videoPlayers: new Map(),
+  stableStatuses: new Map(),
+  activeWorkspace: "ops",
+  auxVideoPickerOpen: false,
+  videoLayout: "single",
+};
+
+const VIDEO_ROLE_MAIN = "main";
+const VIDEO_ROLE_AUX = "aux";
+const VIDEO_LAYOUT_SINGLE = "single";
+const VIDEO_LAYOUT_QUAD = "quad";
+
+const ROBOT_MOVE_INTENT_INTERVAL_MS = 100;
+const LIFT_JOG_KEEPALIVE_MS = 400;
+const LIFT_CM_PER_REV = 0.35;
+const LIFT_PULSES_PER_REV = 10000;
+const DEFAULT_LIFT_TRAVEL_CM = 180;
+
+function liftTravelCm() {
+  const fromConfig = Number(state.config?.lift_travel_height);
+  if (Number.isFinite(fromConfig) && fromConfig > 0) return fromConfig;
+  return DEFAULT_LIFT_TRAVEL_CM;
+}
+
+function liftTravelMeters() {
+  return liftTravelCm() / 100;
+}
+
+function liftBaseHeightCm() {
+  const raw = state.config?.lift_base_height_cm;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function liftHeightScale() {
+  const travel = liftTravelCm();
+  const base = liftBaseHeightCm();
+  const hasBase = base !== null;
+  return {
+    travel,
+    base: hasBase ? base : 0,
+    hasBase,
+    min: hasBase ? base : 0,
+    max: hasBase ? base + travel : travel,
+  };
+}
+
+function liftSliderValueToExtensionCm(sliderValue) {
+  const scale = liftHeightScale();
+  return Number(sliderValue) - (scale.hasBase ? scale.base : 0);
+}
+
+function liftExtensionToSliderValue(extensionCm) {
+  const scale = liftHeightScale();
+  const ext = Math.max(0, Math.min(scale.travel, Number(extensionCm) || 0));
+  return scale.hasBase ? scale.base + ext : ext;
+}
+
+function liftCmToHeightPercent(cm) {
+  const travel = liftTravelCm();
+  if (!(travel > 0)) return 0;
+  // 整数百分比一步是 travel/100（180 cm 行程约 1.8 cm）。10 cm 四舍五入会变成 6%→10.8 cm。
+  const pct = (Number(cm) / travel) * 100;
+  return Math.max(0, Math.min(Number(pct.toFixed(4)), 100));
+}
+
+function liftMetersToHeightPercent(meters) {
+  return liftCmToHeightPercent(Number(meters) * 100);
+}
+
+function readLiftTargetCm(sliderId) {
+  return Number(document.getElementById(sliderId)?.value || 0);
+}
+
+async function sendLiftGotoFromSlider(sliderId) {
+  const extension = liftSliderValueToExtensionCm(readLiftTargetCm(sliderId));
+  const height = liftCmToHeightPercent(extension);
+  state.lastRemoteLiftTargetPct = height;
+  return sendLiftCommand({ action: "goto", height });
+}
+
+const LIFT_SET_ZERO_CONFIRM = "请确认升缩杆已经完全收回到底。将把当前位置记为收回零点（0 cm）。杆未到底时不要确定。";
+
+async function sendLiftSetRetractedZero() {
+  if (!window.confirm(LIFT_SET_ZERO_CONFIRM)) return null;
+  return sendLiftCommand({ action: "set_retracted_zero" });
+}
+
+function liftCommandSpeedCmS(ratio = Number(document.getElementById("roofLiftSpeedInput")?.value
+  ?? document.getElementById("liftSpeedInput")?.value
+  ?? 0.3)) {
+  const maxPr = Number(state.config?.lift_max_pv_speed_pr_s ?? 100000);
+  const minPr = Number(state.config?.lift_min_pv_speed_pr_s ?? 3000);
+  const pr = Math.max(minPr, Math.min(maxPr, Math.round(Number(ratio) * maxPr)));
+  return (pr / LIFT_PULSES_PER_REV) * LIFT_CM_PER_REV;
+}
+
+function formatLiftSpeedLabel(ratio) {
+  const value = Number(ratio || 0);
+  return `${value.toFixed(2)} · ${liftCommandSpeedCmS(value).toFixed(2)} cm/s`;
+}
+
+function applyLiftTravelToControls() {
+  const scale = liftHeightScale();
+  ["roofLiftHeightSlider", "liftHeightSlider"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const previous = Number(el.value || 0);
+    const prevMin = Number(el.min || 0);
+    const prevMax = Number(el.max || 0);
+    const wasMetersScale = prevMax <= 3;
+    const prevWasTotal = el.dataset.liftScale === "total" || prevMin > 0;
+    let extension = previous;
+    if (wasMetersScale) extension = previous * 100;
+    else if (prevWasTotal) extension = previous - prevMin;
+    const minChanged = el.min !== String(scale.min);
+    const maxChanged = el.max !== String(scale.max);
+    el.min = String(scale.min);
+    el.max = String(scale.max);
+    el.step = "1";
+    el.dataset.liftScale = scale.hasBase ? "total" : "extension";
+    // 拖动中或量程未变时不要写 value，否则浏览器会丢掉 range 的原生拖动。
+    if (state.liftTargetDragging || (!minChanged && !maxChanged && !wasMetersScale)) return;
+    el.value = String(liftExtensionToSliderValue(extension));
+  });
+  ["roofLiftCurrentHeight", "liftCurrentHeight"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.min = String(scale.min);
+    el.max = String(scale.max);
+    el.step = "0.1";
+  });
+  syncLiftTargetLabels();
+  updateLiftSpeedLabels();
+}
+
+function syncLiftTargetLabels() {
+  const pairs = [
+    ["roofLiftHeightSlider", "roofLiftHeightValue"],
+    ["liftHeightSlider", "liftHeightValue"],
+  ];
+  pairs.forEach(([sliderId, outputId]) => {
+    const slider = document.getElementById(sliderId);
+    const output = document.getElementById(outputId);
+    if (!slider || !output) return;
+    const extension = liftSliderValueToExtensionCm(slider.value);
+    const total = liftHeightScale().hasBase ? Number(slider.value) : null;
+    output.textContent = formatLiftHeightLabel(extension, total);
+  });
+}
+
+function updateLiftSpeedLabels(ratio) {
+  const value = ratio === undefined
+    ? Number(document.getElementById("roofLiftSpeedInput")?.value
+      ?? document.getElementById("liftSpeedInput")?.value
+      ?? 0.3)
+    : Number(ratio);
+  const label = formatLiftSpeedLabel(value);
+  const roofOut = document.getElementById("roofLiftSpeedValue");
+  const drawerOut = document.getElementById("liftSpeedValue");
+  if (roofOut) roofOut.textContent = label;
+  if (drawerOut) drawerOut.textContent = label;
+}
+
+function formatLiftHeightLabel(extensionCm, totalCm = null) {
+  if (extensionCm === null || extensionCm === undefined || !Number.isFinite(Number(extensionCm))) {
+    return "未知";
+  }
+  const extend = Number(extensionCm);
+  // null/undefined 不能用 Number() 判断：Number(null)===0，会误显示「总高 0.0」。
+  if (totalCm !== null && totalCm !== undefined && totalCm !== "" && Number.isFinite(Number(totalCm))) {
+    return `伸出 ${extend.toFixed(1)} · 总高 ${Number(totalCm).toFixed(1)} cm`;
+  }
+  return `伸出 ${extend.toFixed(1)} cm（总高待配车厢离地）`;
+}
+
+function updateLiftCurrentHeightUi(heightCm, totalHeightCm = null) {
+  const travel = liftTravelCm();
+  const value = Number.isFinite(Number(heightCm)) ? Math.max(0, Math.min(travel, Number(heightCm))) : null;
+  const base = liftBaseHeightCm();
+  const hasTotal = totalHeightCm !== null && totalHeightCm !== undefined && totalHeightCm !== ""
+    && Number.isFinite(Number(totalHeightCm));
+  const total = hasTotal
+    ? Number(totalHeightCm)
+    : (value !== null && base !== null ? base + value : null);
+  [
+    ["roofLiftCurrentHeight", "roofLiftCurrentHeightValue"],
+    ["liftCurrentHeight", "liftCurrentHeightValue"],
+  ].forEach(([sliderId, outputId]) => {
+    const slider = document.getElementById(sliderId);
+    const output = document.getElementById(outputId);
+    if (slider) {
+      // 滑条量程用“总高上限”更直观：车厢离地 + 行程；未配车厢离地时仍用行程。
+      const span = base !== null ? base + travel : travel;
+      slider.min = base !== null ? String(base) : "0";
+      slider.max = String(span);
+      if (total !== null) slider.value = String(total);
+      else if (value !== null) slider.value = String(value);
+    }
+    if (output) {
+      output.textContent = formatLiftHeightLabel(value, total);
+    }
+  });
+  document.querySelectorAll('[data-lift-status-field="height"]').forEach((item) => {
+    item.textContent = formatLiftHeightLabel(value, total);
+  });
+}
+// Keep the existing UI/API shape for compatibility: command.y -> M20 X,
+// command.x uses screen-right-positive input and is inverted before sending as M20 Y.
+const ROBOT_KEY_MOVES = {
+  KeyW: { x: 0, y: 1, rotation: 0 },
+  KeyS: { x: 0, y: -1, rotation: 0 },
+  KeyQ: { x: -1, y: 0, rotation: 0 },
+  KeyE: { x: 1, y: 0, rotation: 0 },
+  KeyA: { x: 0, y: 0, rotation: -1 },
+  KeyD: { x: 0, y: 0, rotation: 1 },
+};
+
+// PTZ 云台键盘映射：方向 + 变倍，与机器狗共用键盘模式切换
+const DOG_PTZ_KEY_COMMANDS = {
+  KeyI: "up",
+  KeyK: "down",
+  KeyJ: "left",
+  KeyL: "right",
+  Equal: "zoom_in", NumpadAdd: "zoom_in",
+  Minus: "zoom_out", NumpadSubtract: "zoom_out",
+};
+const ROOF_PTZ_KEY_COMMANDS = {
+  ArrowUp: "up",
+  ArrowDown: "down",
+  ArrowLeft: "left",
+  ArrowRight: "right",
+  BracketLeft: "zoom_out",
+  BracketRight: "zoom_in",
+};
+
+function getClientId() {
+  const existing = sessionStorage.getItem("patrol_client_id");
+  if (existing) return existing;
+
+  const generated = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  sessionStorage.setItem("patrol_client_id", generated);
+  return generated;
+}
+
+const log = (message, data = null) => {
+  const target = document.getElementById("eventLog");
+  const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+  target.textContent = `${line}${data ? ` ${JSON.stringify(data)}` : ""}\n${target.textContent}`;
+};
+
+async function loadDevices() {
+  const response = await fetch("/api/devices");
+  const payload = await response.json();
+  state.devices = payload.devices || [];
+  state.device = pickDevice(state.device?.id, (device) => device.capabilities?.includes("ptz"))
+    || pickDevice("dog_ptz_1")
+    || pickDevice("hikvision_ptz_1")
+    || state.devices[0];
+  state.videoDevice = pickDevice(state.videoDevice?.id, (device) => isSelectableVideoDevice(device))
+    || pickDevice("m20_front_camera", isSelectableVideoDevice)
+    || pickDevice("m20_rear_camera", isSelectableVideoDevice)
+    || state.devices.find(isSelectableVideoDevice);
+  state.robotDevice = pickDevice("m20_robot_1");
+  state.liftDevice = pickDevice("lift_pole_1");
+
+  renderDeviceSelectors();
+  if (state.videoDevice?.video?.player_url && state.videoDevice.video.enabled !== false) {
+    await syncVideoPlayers();
+    await activateVideoDevice(state.videoDevice, { logSwitch: false });
+    renderAuxVideoControls();
+  } else {
+    stopAllVideoPlayers();
+    document.getElementById("deviceName").textContent = "未开启视频";
+    state.auxVideoDevice = null;
+    renderAuxVideoControls();
+  }
+  updateControlMode();
+  await loadStatus();
+  await loadLease();
+  await loadRoofPtzStatus();
+  await loadRoofPtzLease();
+  await loadRobotStatus();
+  await loadLiftStatus();
+  await loadLiftLease();
+  await loadRobotLease();
+  if (state.robotDevice) {
+    const robotSpeed = document.getElementById("robotSpeedInput");
+    if (robotSpeed) {
+      await sendRobotCommand({ action: "set_speed", speed: Number(robotSpeed.value) }).catch(() => {});
+    }
+  }
+  log("设备已加载", state.device);
+}
+
+function pickDevice(id, predicate = null) {
+  return state.devices.find((device) => {
+    if (id && device.id !== id) return false;
+    return predicate ? predicate(device) : true;
+  });
+}
+
+function renderDeviceSelectors() {
+  // 设备下拉已移除，仅渲染视频设备列表
+  renderVideoDeviceList();
+  renderAuxVideoControls();
+}
+
+function renderVideoDeviceList() {
+  const target = document.getElementById("videoDeviceList");
+  const videoDevices = state.devices.filter((device) => device.video && !device.legacy);
+  if (!videoDevices.length) {
+    target.innerHTML = "";
+    return;
+  }
+  target.innerHTML = videoDevices.map((device) => {
+    const active = state.videoLayout !== VIDEO_LAYOUT_QUAD && state.videoDevice?.id === device.id;
+    const enabled = device.video.enabled !== false;
+    const rawStatus = state.videoPlayers.get(videoPlayerKey(VIDEO_ROLE_MAIN, device.id))?.status || (enabled ? "idle" : "disabled");
+    const status = stableStatus(`main-video-button:${device.id}`, normalizeStatus(rawStatus));
+    return `
+      <button type="button" data-video-device="${device.id}" data-active="${active}" data-player-status="${status}" title="${escapeHtml(device.name)}" aria-label="${escapeHtml(device.name)}" ${enabled ? "" : "disabled"}>
+        ${videoDeviceIconSvg(device)}
+      </button>
+    `;
+  }).join("") + `
+    <button type="button" data-video-layout="quad" data-active="${state.videoLayout === VIDEO_LAYOUT_QUAD}" data-player-status="${quadVideoStatus()}" title="四宫格" aria-label="四宫格">
+      ${quadVideoIconSvg()}
+    </button>
+  `;
+}
+
+function videoDeviceIconSvg(device) {
+  const id = device.id || "";
+  if (id.includes("rear")) {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z"/><path d="M15 8l-5 4 5 4z"/></svg>';
+  }
+  if (id.includes("front") || id.startsWith("m20_")) {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z"/><path d="M9 8l5 4-5 4z"/></svg>';
+  }
+  if (id.includes("roof")) {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 5v10H5V9z"/><path d="M9 13h6v4H9z"/></svg>';
+  }
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h11v8H4z"/><path d="M15 11l5-3v10l-5-3z"/></svg>';
+}
+
+function quadVideoIconSvg() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4z"/><path d="M13 4h7v7h-7z"/><path d="M4 13h7v7H4z"/><path d="M13 13h7v7h-7z"/></svg>';
+}
+
+function quadVideoStatus() {
+  const devices = quadVideoDeviceIds().map((id) => pickDevice(id)).filter(Boolean);
+  if (!devices.length) return "unknown";
+  const statuses = devices.map((device) => {
+    if (!isSelectableVideoDevice(device)) return "disabled";
+    const player = state.videoPlayers.get(videoPlayerKey(VIDEO_ROLE_MAIN, device.id));
+    return normalizeStatus(player?.status || "idle");
+  });
+  if (statuses.some((status) => status === "error")) return "error";
+  if (statuses.every((status) => status === "ok")) return "ok";
+  if (statuses.every((status) => status === "disabled")) return "disabled";
+  return "connecting";
+}
+
+function quadVideoDeviceIds() {
+  const m20Ids = state.operatorDirection === "rear"
+    ? ["m20_rear_camera", "m20_front_camera"]
+    : ["m20_front_camera", "m20_rear_camera"];
+  return [...m20Ids, "dog_ptz_1", "roof_ptz_1"];
+}
+
+function normalizeStatus(value) {
+  if (value === "connected") return "ok";
+  if (value === "connecting" || value === "idle") return "connecting";
+  if (value === "ok" || value === "error" || value === "disabled" || value === "unknown") return value;
+  return value ? String(value) : "unknown";
+}
+
+function stableStatus(key, nextStatus) {
+  const next = normalizeStatus(nextStatus);
+  const now = Date.now();
+  const entry = state.stableStatuses.get(key);
+  if (!entry) {
+    const initial = next === "error" ? "connecting" : next;
+    state.stableStatuses.set(key, { display: initial, pending: next, pendingAt: now });
+    return initial;
+  }
+  if (next === "ok" || next === "disabled") {
+    entry.display = next;
+    entry.pending = next;
+    entry.pendingAt = now;
+    return entry.display;
+  }
+  if (entry.display === next) {
+    entry.pending = next;
+    entry.pendingAt = now;
+    return entry.display;
+  }
+  if (entry.pending !== next) {
+    entry.pending = next;
+    entry.pendingAt = now;
+  }
+  const delayMs = next === "error" ? 3500 : next === "connecting" ? 1200 : 2500;
+  if (now - entry.pendingAt >= delayMs) {
+    entry.display = next;
+  }
+  return entry.display;
+}
+
+function videoPlayerKey(role, deviceId) {
+  return `${role}:${deviceId}`;
+}
+
+function parseVideoPlayerKey(key) {
+  const index = key.indexOf(":");
+  if (index < 0) return { role: VIDEO_ROLE_MAIN, deviceId: key };
+  return { role: key.slice(0, index), deviceId: key.slice(index + 1) };
+}
+
+function selectableVideoDevices() {
+  return state.devices.filter(isSelectableVideoDevice);
+}
+
+function setWorkspace(workspaceId) {
+  state.activeWorkspace = workspaceId;
+  document.querySelectorAll("[data-workspace-tab]").forEach((button) => {
+    button.dataset.active = String(button.dataset.workspaceTab === workspaceId);
+  });
+  document.querySelectorAll("[data-workspace]").forEach((section) => {
+    section.hidden = section.dataset.workspace !== workspaceId;
+  });
+}
+
+function bindWorkspaceTabs() {
+  document.querySelectorAll("[data-workspace-tab]").forEach((button) => {
+    button.addEventListener("click", () => setWorkspace(button.dataset.workspaceTab));
+  });
+  setWorkspace(state.activeWorkspace);
+}
+
+async function syncVideoPlayers() {
+  const enabledDevices = selectableVideoDevices();
+  const enabledIds = new Set(enabledDevices.map((device) => device.id));
+  for (const key of Array.from(state.videoPlayers.keys())) {
+    const { role, deviceId } = parseVideoPlayerKey(key);
+    if (!enabledIds.has(deviceId)) {
+      stopWebRtcPlayer(deviceId, { role, allowReconnect: false, removeElement: role === VIDEO_ROLE_MAIN });
+    }
+  }
+  if (state.auxVideoDevice && !enabledIds.has(state.auxVideoDevice.id)) {
+    state.auxVideoDevice = null;
+    renderAuxVideoControls();
+  }
+  await Promise.all(enabledDevices.map((device) => startWebRtcPlayer(device, { role: VIDEO_ROLE_MAIN })));
+  if (state.auxVideoDevice?.video?.player_url) {
+    await startWebRtcPlayer(state.auxVideoDevice, { role: VIDEO_ROLE_AUX });
+  }
+}
+
+async function activateVideoDevice(device, { logSwitch = true } = {}) {
+  if (!device?.video?.player_url || device.video.enabled === false) return;
+  state.videoLayout = VIDEO_LAYOUT_SINGLE;
+  state.videoDevice = device;
+  document.getElementById("videoFrameWrap").dataset.videoLayout = VIDEO_LAYOUT_SINGLE;
+  document.getElementById("deviceName").textContent = device.name;
+  renderVideoDeviceList();
+  renderAuxVideoControls();
+  updateVideoOverlayMode(device.id);
+  ensureVideoElement(device, VIDEO_ROLE_MAIN);
+  setActiveMainVideoElement(device.id);
+  await startWebRtcPlayer(device, { role: VIDEO_ROLE_MAIN });
+  setActiveMainVideoElement(device.id);
+  renderQuadVideoLabels();
+  if (logSwitch) {
+    log("主视频已切换", { device_id: device.id, name: device.name });
+  }
+}
+
+function setActiveMainVideoElement(deviceId) {
+  const wrap = document.getElementById("videoFrameWrap");
+  wrap.dataset.videoLayout = state.videoLayout;
+  wrap.querySelectorAll('.video-frame[data-video-role="main"]').forEach((video) => {
+    const isQuadItem = state.videoLayout === VIDEO_LAYOUT_QUAD && quadVideoDeviceIds().includes(video.dataset.videoDevice);
+    video.dataset.active = String(isQuadItem || video.dataset.videoDevice === deviceId);
+  });
+}
+
+async function activateQuadVideoLayout({ logSwitch = true } = {}) {
+  const wrap = document.getElementById("videoFrameWrap");
+  const referenceDevice = pickDevice("m20_front_camera", isSelectableVideoDevice) || state.videoDevice || selectableVideoDevices()[0];
+  if (!referenceDevice) return;
+
+  closeAuxVideo({ logClose: false });
+  collapseOverlayDrawers();
+  state.videoLayout = VIDEO_LAYOUT_QUAD;
+  state.videoDevice = referenceDevice;
+  document.getElementById("deviceName").textContent = "四宫格";
+  updateVideoOverlayMode(referenceDevice.id);
+  quadVideoDeviceIds().forEach((deviceId) => {
+    const device = pickDevice(deviceId, isSelectableVideoDevice);
+    if (device) ensureVideoElement(device, VIDEO_ROLE_MAIN);
+  });
+  wrap.dataset.videoLayout = VIDEO_LAYOUT_QUAD;
+  setActiveMainVideoElement(referenceDevice.id);
+  renderQuadVideoLabels();
+  renderVideoDeviceList();
+  renderAuxVideoControls();
+  syncVideoPlayers().catch((error) => {
+    log("四宫格视频池同步失败", { error: error.message });
+  });
+  if (logSwitch) {
+    log("已进入四宫格模式");
+  }
+}
+
+function collapseOverlayDrawers() {
+  document.querySelectorAll("[data-overlay-drawer]").forEach((drawer) => {
+    drawer.dataset.open = "false";
+  });
+}
+
+function renderQuadVideoLabels() {
+  const wrap = document.getElementById("videoFrameWrap");
+  if (!wrap) return;
+  wrap.querySelectorAll(".quad-video-label").forEach((label) => label.remove());
+  if (state.videoLayout !== VIDEO_LAYOUT_QUAD) return;
+  quadVideoDeviceIds().forEach((deviceId) => {
+    const device = pickDevice(deviceId);
+    const label = document.createElement("div");
+    label.className = "quad-video-label";
+    label.dataset.quadDevice = deviceId;
+    label.dataset.quadSlot = quadVideoSlot(deviceId);
+    label.textContent = device?.name || deviceId;
+    wrap.appendChild(label);
+  });
+}
+
+// 根据当前视频切换叠加控制组件
+function updateVideoOverlayMode(videoDeviceId) {
+  const dogPanel = document.getElementById("dogPtzVideoPanel");
+  const roofPanel = document.getElementById("roofPtzVideoPanel");
+  const joystickOverlay = document.getElementById("videoJoystickOverlay");
+  const robotOverlay = document.getElementById("robotVideoOverlay");
+
+  const isDogMode = !videoDeviceId || videoDeviceId === "dog_ptz_1"
+    || videoDeviceId.startsWith("m20_");
+
+  if (isDogMode) {
+    if (dogPanel) dogPanel.hidden = false;
+    if (roofPanel) roofPanel.hidden = true;
+    if (joystickOverlay) joystickOverlay.style.display = "";
+    if (robotOverlay) robotOverlay.style.display = "";
+  } else if (videoDeviceId === "roof_ptz_1") {
+    if (dogPanel) dogPanel.hidden = true;
+    if (roofPanel) roofPanel.hidden = false;
+    if (joystickOverlay) joystickOverlay.style.display = "none";
+    if (robotOverlay) robotOverlay.style.display = "none";
+  }
+}
+
+// 车顶视频面板控制同步
+function bindRoofVideoPanel() {
+  const liftSpeed = document.getElementById("roofLiftSpeedInput");
+  const liftHeightSlider = document.getElementById("roofLiftHeightSlider");
+
+  liftSpeed?.addEventListener("input", () => {
+    const speed = Number(liftSpeed.value);
+    const drawerSpeed = document.getElementById("liftSpeedInput");
+    if (drawerSpeed) drawerSpeed.value = String(speed);
+    updateLiftSpeedLabels(speed);
+  });
+  liftSpeed?.addEventListener("change", async () => {
+    await sendLiftCommand({ action: "set_speed", speed: Number(liftSpeed.value) });
+  });
+
+  liftHeightSlider?.addEventListener("input", () => {
+    syncLiftTargetLabels();
+    const drawer = document.getElementById("liftHeightSlider");
+    if (drawer) drawer.value = liftHeightSlider.value;
+  });
+  liftHeightSlider?.addEventListener("change", () => {
+    // 仅更新显示，等「到位」按钮再发送绝对 PP 定高。
+  });
+  document.getElementById("roofLiftGoto")?.addEventListener("click", async () => {
+    await sendLiftGotoFromSlider("roofLiftHeightSlider");
+  });
+  document.getElementById("roofLiftSetRetractedZero")?.addEventListener("click", sendLiftSetRetractedZero);
+  bindLiftDragGuards();
+}
+
+// 车顶视频面板控制同步结束
+
+async function startWebRtcPlayer(device, { role = VIDEO_ROLE_MAIN } = {}) {
+  const key = videoPlayerKey(role, device.id);
+  const existing = state.videoPlayers.get(key);
+  if (existing && existing.playerUrl === device.video.player_url && existing.status === "connected") {
+    return existing;
+  }
+  if (existing && existing.status === "connecting") {
+    return existing;
+  }
+
+  stopWebRtcPlayer(device.id, {
+    role,
+    allowReconnect: false,
+    removeElement: false,
+    clearVideo: role !== VIDEO_ROLE_AUX && state.videoLayout !== VIDEO_LAYOUT_QUAD,
+  });
+
+  const video = ensureVideoElement(device, role);
+  const playerUrl = device.video.player_url;
+  const whepUrl = `${playerUrl.replace(/\/$/, "")}/whep`;
+  const pc = new RTCPeerConnection();
+  const generation = (existing?.generation || 0) + 1;
+  const player = {
+    pc,
+    resourceUrl: null,
+    playerUrl,
+    deviceId: device.id,
+    role,
+    generation,
+    reconnectAttempt: existing?.reconnectAttempt || 0,
+    reconnectTimer: null,
+    status: "connecting",
+    video,
+  };
+  state.videoPlayers.set(key, player);
+
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.ontrack = (event) => {
+    video.srcObject = event.streams[0];
+    video.play().catch(() => {});
+  };
+  pc.onconnectionstatechange = () => {
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+      scheduleVideoReconnect(device.id, `connection ${pc.connectionState}`, generation, role);
+    }
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (["failed", "disconnected"].includes(pc.iceConnectionState)) {
+      scheduleVideoReconnect(device.id, `ice ${pc.iceConnectionState}`, generation, role);
+    }
+  };
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceGathering(pc);
+
+    const response = await fetch(whepUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: pc.localDescription.sdp,
+    });
+    if (!response.ok) {
+      throw new Error(`WHEP ${response.status}`);
+    }
+
+    const resourceUrl = response.headers.get("Location");
+    player.resourceUrl = resourceUrl ? new URL(resourceUrl, whepUrl).toString() : null;
+    const answer = await response.text();
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    player.reconnectAttempt = 0;
+    player.status = "connected";
+    renderVideoDeviceList();
+    renderAuxVideoControls();
+    updateStatusUi();
+    log("WebRTC 视频已连接", { role, device_id: device.id, name: device.name, whep_url: whepUrl });
+    return player;
+  } catch (error) {
+    player.status = "error";
+    renderVideoDeviceList();
+    renderAuxVideoControls();
+    updateStatusUi();
+    log("WebRTC 视频连接失败", { role, device_id: device.id, name: device.name, error: error.message, whep_url: whepUrl });
+    scheduleVideoReconnect(device.id, error.message, generation, role);
+    return player;
+  }
+}
+
+async function reloadVideo() {
+  if (!state.videoDevice?.video?.player_url) return;
+  log("正在重载视频", { device_id: state.videoDevice.id, name: state.videoDevice.name });
+  stopWebRtcPlayer(state.videoDevice.id, { role: VIDEO_ROLE_MAIN, allowReconnect: false, removeElement: false });
+  await startWebRtcPlayer(state.videoDevice, { role: VIDEO_ROLE_MAIN });
+  await activateVideoDevice(state.videoDevice, { logSwitch: false });
+}
+
+function closeCurrentVideo() {
+  if (!state.videoDevice) return;
+  stopWebRtcPlayer(state.videoDevice.id, { role: VIDEO_ROLE_MAIN, allowReconnect: false, removeElement: false });
+  log("视频已关闭", { device_id: state.videoDevice.id, name: state.videoDevice.name });
+}
+
+function renderAuxVideoControls() {
+  const panel = document.getElementById("auxVideoPanel");
+  const openButton = document.getElementById("openAuxVideo");
+  const select = document.getElementById("auxVideoSelect");
+  const status = document.getElementById("auxVideoStatus");
+  if (!panel || !openButton || !select || !status) return;
+  if (state.videoLayout === VIDEO_LAYOUT_QUAD) {
+    panel.hidden = true;
+    openButton.hidden = true;
+    panel.dataset.status = "closed";
+    return;
+  }
+
+  const devices = selectableVideoDevices();
+  const currentId = state.auxVideoDevice?.id || "";
+  select.innerHTML = [
+    '<option value="">关闭辅助画面</option>',
+    ...devices.map((device) => {
+      const sameAsMain = state.videoDevice?.id === device.id ? "（同主画面）" : "";
+      return `<option value="${escapeHtml(device.id)}">${escapeHtml(device.name)}${sameAsMain}</option>`;
+    }),
+  ].join("");
+  select.value = currentId;
+
+  const player = currentId ? state.videoPlayers.get(videoPlayerKey(VIDEO_ROLE_AUX, currentId)) : null;
+  const visible = devices.length > 0 && (state.auxVideoPickerOpen || Boolean(currentId));
+  panel.hidden = !visible;
+  openButton.hidden = devices.length === 0 || visible;
+  panel.dataset.status = player?.status || (visible ? "idle" : "closed");
+  if (!visible) {
+    status.textContent = "暂无可用视频";
+  } else if (!currentId) {
+    status.textContent = "选择辅助视频";
+  } else {
+    const suffix = state.videoDevice?.id === currentId ? " / 同主画面" : "";
+    const playerStatus = player?.status === "connected" ? "已连接"
+      : player?.status === "connecting" ? "连接中"
+        : player?.status === "error" ? "连接失败" : "等待";
+    status.textContent = `${state.auxVideoDevice.name} / ${playerStatus}${suffix}`;
+  }
+}
+
+async function activateAuxVideoDevice(device, { logSwitch = true } = {}) {
+  if (!device?.video?.player_url || device.video.enabled === false) return;
+  const previous = state.auxVideoDevice;
+  state.auxVideoDevice = device;
+  state.auxVideoPickerOpen = true;
+  renderAuxVideoControls();
+  const player = await startWebRtcPlayer(device, { role: VIDEO_ROLE_AUX });
+  if (previous?.id && previous.id !== device.id && player?.status === "connected") {
+    stopAuxVideoPlayers({ exceptDeviceId: device.id, clearVideo: false });
+  }
+  renderAuxVideoControls();
+  if (logSwitch) {
+    log("辅助视频已切换", { device_id: device.id, name: device.name });
+  }
+}
+
+function closeAuxVideo({ logClose = true } = {}) {
+  if (state.auxVideoDevice) {
+    const closed = state.auxVideoDevice;
+    stopAuxVideoPlayers();
+    state.auxVideoDevice = null;
+    if (logClose) log("辅助视频已关闭", { device_id: closed.id, name: closed.name });
+  }
+  state.auxVideoPickerOpen = false;
+  renderAuxVideoControls();
+}
+
+function stopAuxVideoPlayers({ exceptDeviceId = null, clearVideo = true } = {}) {
+  Array.from(state.videoPlayers.keys()).forEach((key) => {
+    const { role, deviceId } = parseVideoPlayerKey(key);
+    if (role !== VIDEO_ROLE_AUX) return;
+    if (exceptDeviceId && deviceId === exceptDeviceId) return;
+    stopWebRtcPlayer(deviceId, { role, allowReconnect: false, removeElement: false, clearVideo });
+  });
+}
+
+async function swapMainAndAuxVideo() {
+  if (!state.videoDevice || !state.auxVideoDevice) return;
+  const nextMain = state.auxVideoDevice;
+  const nextAux = state.videoDevice;
+  closeAuxVideo({ logClose: false });
+  await activateVideoDevice(nextMain, { logSwitch: false });
+  await activateAuxVideoDevice(nextAux, { logSwitch: false });
+  log("主辅视频已交换", {
+    main_device_id: nextMain.id,
+    main_name: nextMain.name,
+    aux_device_id: nextAux.id,
+    aux_name: nextAux.name,
+  });
+}
+
+function stopWebRtcPlayer(deviceId, { role = VIDEO_ROLE_MAIN, allowReconnect = false, removeElement = false, clearVideo = true } = {}) {
+  const key = videoPlayerKey(role, deviceId);
+  const player = state.videoPlayers.get(key);
+  if (!player) return;
+
+  if (!allowReconnect) {
+    clearPlayerReconnect(deviceId, role);
+  }
+  player.generation += 1;
+  state.videoPlayers.delete(key);
+  if (player.video && clearVideo) {
+    player.video.srcObject = null;
+    player.video.dataset.active = "false";
+    player.video.dataset.videoDevice = "";
+    if (removeElement) {
+      player.video.remove();
+    }
+  }
+  if (player.resourceUrl) {
+    fetch(player.resourceUrl, { method: "DELETE" }).catch(() => {});
+  }
+  player.pc.close();
+}
+
+function stopAllVideoPlayers() {
+  Array.from(state.videoPlayers.keys()).forEach((key) => {
+    const { role, deviceId } = parseVideoPlayerKey(key);
+    stopWebRtcPlayer(deviceId, { role, allowReconnect: false, removeElement: role === VIDEO_ROLE_MAIN });
+  });
+}
+
+function scheduleVideoReconnect(deviceId, reason, generation, role = VIDEO_ROLE_MAIN) {
+  const key = videoPlayerKey(role, deviceId);
+  const player = state.videoPlayers.get(key);
+  if (!player) return;
+  if (generation !== player.generation) return;
+  if (player.reconnectTimer) return;
+  const device = pickDevice(deviceId);
+  if (!device?.video?.player_url || device.video.enabled === false) return;
+
+  const attempt = Math.min(player.reconnectAttempt + 1, 6);
+  player.reconnectAttempt = attempt;
+  const baseDelayMs = state.videoLayout === VIDEO_LAYOUT_QUAD && role === VIDEO_ROLE_MAIN ? 10000 : 1000;
+  const delayMs = Math.min(30000, baseDelayMs * 2 ** (attempt - 1));
+  log("WebRTC 视频将自动重连", { role, device_id: deviceId, reason, delay_ms: delayMs });
+  player.reconnectTimer = setTimeout(async () => {
+    const latest = state.videoPlayers.get(key);
+    if (!latest || generation !== latest.generation) return;
+    latest.reconnectTimer = null;
+    stopWebRtcPlayer(deviceId, {
+      role,
+      allowReconnect: true,
+      removeElement: false,
+      clearVideo: !(state.videoLayout === VIDEO_LAYOUT_QUAD && role === VIDEO_ROLE_MAIN),
+    });
+    await startWebRtcPlayer(device, { role });
+    if (role === VIDEO_ROLE_MAIN && state.videoLayout === VIDEO_LAYOUT_QUAD) {
+      setActiveMainVideoElement(state.videoDevice?.id || "m20_front_camera");
+      renderQuadVideoLabels();
+      renderVideoDeviceList();
+    } else if (role === VIDEO_ROLE_MAIN && state.videoDevice?.id === deviceId) {
+      await activateVideoDevice(device, { logSwitch: false });
+    } else if (role === VIDEO_ROLE_AUX && state.auxVideoDevice?.id === deviceId) {
+      renderAuxVideoControls();
+    }
+  }, delayMs);
+}
+
+function clearPlayerReconnect(deviceId, role = VIDEO_ROLE_MAIN) {
+  const player = state.videoPlayers.get(videoPlayerKey(role, deviceId));
+  if (!player?.reconnectTimer) return;
+  clearTimeout(player.reconnectTimer);
+  player.reconnectTimer = null;
+}
+
+function ensureVideoElement(device, role = VIDEO_ROLE_MAIN) {
+  const wrap = document.getElementById("videoFrameWrap");
+  if (role === VIDEO_ROLE_AUX) {
+    const video = document.getElementById("auxVideoFrame");
+    video.dataset.videoRole = VIDEO_ROLE_AUX;
+    video.dataset.videoDevice = device.id;
+    return video;
+  }
+
+  let video = wrap.querySelector(`.video-frame[data-video-role="main"][data-video-device="${cssEscape(device.id)}"]`);
+  if (!video) {
+    video = wrap.querySelector('#videoFrame:not([data-video-device]), #videoFrame[data-video-device=""]') || document.createElement("video");
+    video.className = "video-frame";
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.dataset.active = "false";
+    video.dataset.videoRole = VIDEO_ROLE_MAIN;
+    video.dataset.videoDevice = device.id;
+    video.dataset.quadSlot = quadVideoSlot(device.id);
+    if (!video.parentElement) {
+      wrap.appendChild(video);
+    }
+  }
+  video.dataset.quadSlot = quadVideoSlot(device.id);
+  return video;
+}
+
+function quadVideoSlot(deviceId) {
+  const index = quadVideoDeviceIds().indexOf(deviceId);
+  return ["front", "rear", "dog-ptz", "roof-ptz"][index] || "";
+}
+
+function isSelectableVideoDevice(device) {
+  return Boolean(device?.video?.player_url && device.video.enabled !== false && !device.legacy);
+}
+
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function loadDeviceConfig() {
+  const response = await fetch("/api/config/device");
+  const config = await response.json();
+  if (!response.ok) {
+    throw new Error(config.detail || "request failed");
+  }
+
+  state.config = config;
+  document.getElementById("dogPtzHostInput").value = config.dog_ptz_host || config.device_host || "10.21.31.64";
+  document.getElementById("dogPtzOnvifPortInput").value = config.dog_ptz_onvif_port || config.onvif_port || 80;
+  document.getElementById("dogPtzIsapiChannelInput").value = config.dog_ptz_isapi_channel || config.isapi_channel || 1;
+  document.getElementById("dogPtzAuxLightIdInput").value = config.dog_ptz_aux_light_id || config.ptz_aux_light_id || 1;
+  document.getElementById("dogPtzSupplementLightModeInput").value = config.dog_ptz_supplement_light_mode || config.supplement_light_mode || "colorVuWhiteLight";
+  document.getElementById("dogPtzSupplementLightBrightnessInput").value = config.dog_ptz_supplement_light_brightness ?? config.supplement_light_brightness ?? 100;
+  document.getElementById("dogPtzUserInput").value = config.dog_ptz_user || config.device_user || "admin";
+  document.getElementById("dogPtzPasswordInput").value = config.dog_ptz_password || config.device_password || "";
+  document.getElementById("dogPtzVideoEnabledInput").checked = config.dog_ptz_video_enabled !== false;
+  document.getElementById("mediaBaseInput").value = config.mediamtx_public_base;
+  document.getElementById("dogPtzDryRunInput").checked = (config.dog_ptz_dry_run ?? config.dry_run) !== false;
+  document.getElementById("m20HostInput").value = config.m20_host || "10.21.31.103";
+  document.getElementById("m20TcpPortInput").value = config.m20_tcp_port || 30001;
+  document.getElementById("m20UdpPortInput").value = config.m20_udp_port || 30000;
+  document.getElementById("m20DryRunInput").checked = config.m20_dry_run !== false;
+  document.getElementById("m20FrontVideoEnabledInput").checked = config.m20_front_video_enabled !== false;
+  document.getElementById("m20RearVideoEnabledInput").checked = config.m20_rear_video_enabled !== false;
+  document.getElementById("m20FrontRtspInput").value = config.m20_front_rtsp || "rtsp://10.21.31.103:8554/video1";
+  document.getElementById("m20RearRtspInput").value = config.m20_rear_rtsp || "rtsp://10.21.31.103:8554/video2";
+  // 车顶云台
+  document.getElementById("roofPtzHostInput").value = config.roof_ptz_host || "10.21.31.64";
+  document.getElementById("roofPtzOnvifPortInput").value = config.roof_ptz_onvif_port || 80;
+  document.getElementById("roofPtzIsapiChannelInput").value = config.roof_ptz_isapi_channel || 1;
+  document.getElementById("roofPtzAuxLightIdInput").value = config.roof_ptz_aux_light_id || 1;
+  document.getElementById("roofPtzSupplementLightModeInput").value = config.roof_ptz_supplement_light_mode || "colorVuWhiteLight";
+  document.getElementById("roofPtzSupplementLightBrightnessInput").value = config.roof_ptz_supplement_light_brightness ?? 100;
+  document.getElementById("roofPtzUserInput").value = config.roof_ptz_user || "admin";
+  document.getElementById("roofPtzPasswordInput").value = config.roof_ptz_password || "";
+  document.getElementById("roofPtzDryRunInput").checked = config.roof_ptz_dry_run !== false;
+  document.getElementById("roofPtzVideoEnabledInput").checked = config.roof_ptz_video_enabled === true;
+  // 升降杆
+  document.getElementById("liftHostInput").value = config.lift_host || "";
+  document.getElementById("liftPortInput").value = config.lift_port || 502;
+  document.getElementById("liftDryRunInput").checked = config.lift_dry_run !== false;
+  const travelInput = document.getElementById("liftTravelHeightInput");
+  if (travelInput) travelInput.value = config.lift_travel_height ?? DEFAULT_LIFT_TRAVEL_CM;
+  const baseInput = document.getElementById("liftBaseHeightInput");
+  if (baseInput) {
+    baseInput.value = (config.lift_base_height_cm === null || config.lift_base_height_cm === undefined)
+      ? ""
+      : config.lift_base_height_cm;
+  }
+  applyLiftTravelToControls();
+  initSettingsPasswordGate(config.has_settings_password);
+  updateControlMode();
+}
+
+// 系统参数密码门
+function initSettingsPasswordGate(hasPassword) {
+  const gate = document.getElementById("settingsPasswordGate");
+  const formWrap = document.getElementById("settingsFormWrap");
+  if (!gate || !formWrap) return;
+  if (!hasPassword) {
+    gate.hidden = true;
+    formWrap.hidden = false;
+    return;
+  }
+  gate.hidden = false;
+  formWrap.hidden = true;
+  document.getElementById("settingsPasswordInput").value = "";
+  document.getElementById("settingsPasswordError").hidden = true;
+}
+
+async function unlockSettingsPassword() {
+  const password = document.getElementById("settingsPasswordInput").value;
+  const result = await postJson("/api/config/verify-password", { password });
+  if (result.ok) {
+    document.getElementById("settingsPasswordGate").hidden = true;
+    document.getElementById("settingsFormWrap").hidden = false;
+    document.getElementById("settingsPasswordError").hidden = true;
+  } else {
+    document.getElementById("settingsPasswordError").hidden = false;
+  }
+}
+
+function updateControlMode() {
+  const badge = document.getElementById("controlMode");
+  const dryRun = state.device?.control?.dry_run ?? (state.config ? state.config.dog_ptz_dry_run : true);
+  badge.textContent = dryRun ? "Dry run" : "ONVIF / ISAPI";
+  badge.dataset.mode = dryRun ? "dry" : "real";
+}
+
+function connectControlSocket() {
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  state.socket = new WebSocket(`${protocol}://${location.host}/ws/control?client_id=${encodeURIComponent(state.clientId)}`);
+
+  state.socket.onopen = () => {
+    document.getElementById("connectionStatus").textContent = "控制服务已连接";
+    log("WebSocket connected");
+  };
+
+  state.socket.onmessage = async (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type !== "device_status_updated" && message.type !== "lift_up" && message.type !== "lift_down") {
+      log("事件", message);
+    }
+    if (message.type?.startsWith("lease_") && state.device && message.device_id === state.device.id) {
+      await loadLease();
+    }
+    if (message.type?.startsWith("lease_") && state.liftDevice && message.device_id === state.liftDevice.id) {
+      state.liftLease = message.payload;
+      updateLiftOccupancyUi();
+    }
+    if (message.type?.startsWith("lift_") && state.liftDevice && message.device_id === state.liftDevice.id) {
+      const remoteState = message.payload?.payload?.state;
+      if (remoteState) syncLiftRemoteControls(remoteState);
+    }
+    if (message.type === "device_status_updated" && state.device && message.device_id === state.device.id) {
+      state.status = message.payload;
+      updateStatusUi();
+    }
+    if (message.type === "device_status_updated" && state.robotDevice && message.device_id === state.robotDevice.id) {
+      renderRobotStatus(message.payload);
+    }
+    if (message.type?.startsWith("lease_") && state.robotDevice && message.device_id === state.robotDevice.id) {
+      const lease = message.payload || {};
+      if (state.robotMove.active && lease.holder_id && lease.holder_id !== state.clientId) {
+        await stopRobotMove({ reason: "robot lease changed" });
+      }
+    }
+    if (message.type === "control_failed") {
+      updateLastFailure(message.payload);
+      await loadControlLogs();
+    }
+  };
+
+  state.socket.onclose = () => {
+    document.getElementById("connectionStatus").textContent = "控制服务已断开，正在重连...";
+    stopRobotMove({ reason: "websocket disconnected" });
+    setTimeout(connectControlSocket, 1000);
+  };
+}
+
+async function readJson(response) {
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { detail: text || `HTTP ${response.status}` };
+  }
+  if (!response.ok) {
+    const detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+    throw new Error(detail || "request failed");
+  }
+  return payload;
+}
+
+async function getJson(url) {
+  const response = await fetch(url, {
+    headers: { "X-Patrol-Client-Id": state.clientId },
+  });
+  return readJson(response);
+}
+
+async function postJson(url, body = {}, method = "POST") {
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Patrol-Client-Id": state.clientId,
+    },
+    body: JSON.stringify(body),
+  });
+  return readJson(response);
+}
+
+async function controlPostJson(url, body = {}) {
+  if (state.lease?.can_control) {
+    await renewLease();
+  }
+  return postJson(url, body);
+}
+
+async function sendStopForActiveCommand() {
+  if (!state.device || !state.activeCommand) return;
+  const command = state.activeCommand;
+  state.activeCommand = null;
+  stopActiveRenewal();
+  try {
+    await postJson(`/api/devices/${state.device.id}/ptz/stop`, { command, speed: 5 });
+  } catch (error) {
+    log("紧急停止失败", { command, error: error.message });
+  }
+}
+
+async function renewLeaseForActiveCommand() {
+  if (!state.activeCommand) return;
+  await renewLease();
+}
+
+async function loadLease() {
+  if (!state.device) return;
+  try {
+    state.lease = await getJson(`/api/devices/${state.device.id}/lease`);
+    updateLeaseUi();
+  } catch (error) {
+    log("控制权读取失败", { error: error.message });
+  }
+}
+
+async function loadRobotLease() {
+  if (!state.robotDevice) return;
+  try {
+    state.robotLease = await getJson(`/api/devices/${state.robotDevice.id}/lease`);
+  } catch (error) {
+    log("机器狗控制权读取失败", { error: error.message });
+  }
+}
+
+async function loadStatus() {
+  if (!state.device) return;
+  try {
+    state.status = await getJson(`/api/devices/${state.device.id}/status`);
+    updateStatusUi();
+    scheduleStatusPolling();
+  } catch (error) {
+    state.status = {
+      online: false,
+      video: "unknown",
+      onvif: "unknown",
+      isapi: "unknown",
+      control_mode: state.device?.control?.dry_run ? "dry_run" : "real",
+      last_checked_at: null,
+      last_error: error.message,
+    };
+    updateStatusUi();
+    log("设备状态检测失败", { error: error.message });
+  }
+}
+
+async function loadRobotStatus() {
+  const target = document.getElementById("robotStatus");
+  if (!target || !state.robotDevice) return;
+  if (state.robotStatusInFlight) return;
+  state.robotStatusInFlight = true;
+  try {
+    const status = await getJson(`/api/devices/${state.robotDevice.id}/robot/status`);
+    renderRobotStatus(status);
+    scheduleRobotStatusPolling();
+  } catch (error) {
+    target.textContent = `状态读取失败：${error.message}`;
+  } finally {
+    state.robotStatusInFlight = false;
+  }
+}
+
+function renderRobotStatus(status) {
+  const target = document.getElementById("robotStatus");
+  if (!target) return;
+  state.robotStatus = status;
+  const details = status.details || {};
+  const unknownRobotState = shouldShowUnknownRobotState(status, details);
+  const battery = details.battery || {};
+  const lights = details.lights || {};
+  const cameraPower = details.camera_power || {};
+  const motion = details.motion || {};
+  const m20Motion = toM20AxisIntent(motion);
+  const modeLabel = status.control_mode === "real" ? "真实" : "Dry-run";
+  renderRobotOverlayStatus(status, details, battery, lights, cameraPower, motion, unknownRobotState);
+  renderRobotFaults(details.faults || []);
+  updateRobotControlStates(status, details, lights, unknownRobotState);
+  if (unknownRobotState) {
+    target.textContent = `${modeLabel} / 设备离线或尚未收到机器狗状态上报`;
+    return;
+  }
+  target.textContent = [
+    modeLabel,
+    `模式 ${robotLabel(details.mode)}`,
+    `姿态 ${robotLabel(details.posture)}`,
+    `步态 ${robotLabel(details.gait)}`,
+    `速度 ${(details.speed ?? 0).toFixed(2)}`,
+    `休眠 ${robotLabel(details.sleep)}`,
+    `相机 ${cameraPower.front ? "前开" : "前关"}/${cameraPower.rear ? "后开" : "后关"}`,
+    `电量 ${battery.front ?? "-"}%/${battery.rear ?? "-"}%`,
+    `运动 X:${formatAxis(m20Motion.x)} Y:${formatAxis(m20Motion.y)} Yaw:${formatAxis(m20Motion.yaw)}`,
+  ].join(" / ");
+}
+
+function shouldShowUnknownRobotState(status, details) {
+  if (status.control_mode !== "real") return false;
+  const rawKnown = Boolean(status.online && details.last_received_at);
+  return stableStatus("robot:state-known", rawKnown ? "ok" : "error") !== "ok";
+}
+
+function renderRobotFaults(faults = []) {
+  const faultTarget = document.getElementById("robotFaults");
+  if (faultTarget) {
+    faultTarget.hidden = !faults.length;
+    faultTarget.textContent = faults.length ? `机器狗异常：${JSON.stringify(faults)}` : "";
+  }
+}
+
+function renderRobotOverlayStatus(status, details, battery, lights, cameraPower, motion, unknownRobotState = false) {
+  const target = document.getElementById("robotOverlayStatus");
+  if (!target) return;
+  const actualVelocity = resolveRobotVelocity(details, motion);
+  const batteryText = unknownRobotState ? "未知" : `${battery.front ?? "-"}%/${battery.rear ?? "-"}%`;
+  const rangeText = unknownRobotState ? "未知" : `${Number(details.range_km ?? 0).toFixed(1)} km`;
+  const cameraText = unknownRobotState ? "未知" : robotCameraText(cameraPower);
+  if (!state.robotMove.active) {
+    renderRobotMoveIntent(null, actualVelocity, unknownRobotState);
+  }
+  const chips = unknownRobotState ? [
+    ["休眠", "未知", "unknown"],
+    ["电量", "未知", "unknown"],
+    ["续航", "未知", "unknown"],
+    ["姿态", "未知", "unknown"],
+    ["相机", "未知", "unknown"],
+    ["位置", "未知", "unknown"],
+  ] : [
+    ["休眠", robotLabel(details.sleep), details.sleep === "awake" ? "ok" : "warn"],
+    ["电量", batteryText, "ok"],
+    ["续航", rangeText, "ok"],
+    ["姿态", robotLabel(details.posture), details.posture === "soft_estop" || Boolean(details.hard_estop) ? "error" : "ok"],
+    ["相机", cameraText, cameraText === "未知" ? "unknown" : "ok"],
+    ["位置", formatRobotPosition(details), robotPositionStatus(details)],
+  ];
+  target.innerHTML = chips.map(([label, value, statusValue, kind]) => `
+    <div class="robot-overlay-chip" data-status="${statusValue}" data-kind="${kind || "text"}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${kind === "motion" ? value : escapeHtml(String(value ?? "-"))}</strong>
+    </div>
+  `).join("");
+}
+
+function updateRobotControlStates(status, details, lights, unknownRobotState = false) {
+  const hardEstop = Boolean(details.hard_estop);
+  const standing = isRobotStanding(details.posture);
+  const awake = details.sleep === "awake";
+  setRobotButtonState("soft_estop", !unknownRobotState && (details.posture === "soft_estop" || hardEstop), hardEstop ? "error" : null, hardEstop || details.posture === "soft_estop" ? "急停中" : "软急停");
+  setRobotButtonState("posture_toggle", !unknownRobotState && standing, null);
+  setRobotButtonState("recover_stand", false, null, "恢复站立");
+  setRobotButtonState("sleep_toggle", !unknownRobotState && awake, awake ? null : "warn");
+  state.operatorDirection = details.operator_direction || state.operatorDirection || "front";
+  setRobotButtonState("direction_reverse", !unknownRobotState && state.operatorDirection === "rear", null);
+  updateRobotDirectionToggle(state.operatorDirection);
+  updateRobotLightCycleButton(lights, unknownRobotState);
+  setRobotButtonState("stop_move", isRobotMoving(details.motion || {}), "warn", "停");
+
+  const modeSelect = document.getElementById("robotModeSelect");
+  if (modeSelect) {
+    modeSelect.value = unknownRobotState ? "" : (details.mode || "");
+    modeSelect.disabled = unknownRobotState;
+  }
+  const gaitSelect = document.getElementById("robotGaitSelect");
+  if (gaitSelect) {
+    gaitSelect.value = unknownRobotState ? "" : (details.gait || "");
+    gaitSelect.disabled = unknownRobotState;
+  }
+}
+
+function setRobotButtonState(action, active, status = null, text = null) {
+  document.querySelectorAll(`[data-robot-action="${action}"]`).forEach((button) => {
+    button.dataset.active = String(Boolean(active));
+    button.dataset.status = status || "";
+    if (text && !button.classList.contains("posture-toggle") && !button.classList.contains("state-toggle")) {
+      button.textContent = text;
+    }
+  });
+}
+
+function updateRobotDirectionToggle(direction) {
+  const activeDirection = direction === "rear" ? "rear" : "front";
+  document.querySelectorAll('[data-robot-action="direction_reverse"]').forEach((button) => {
+    button.querySelectorAll("[data-direction-label]").forEach((label) => {
+      label.dataset.active = String(label.dataset.directionLabel === activeDirection);
+    });
+  });
+}
+
+function updateRobotLightCycleButton(lights = {}, unknownRobotState = false) {
+  const frontOn = !unknownRobotState && Boolean(lights.front);
+  const rearOn = !unknownRobotState && Boolean(lights.rear);
+  document.querySelectorAll('[data-robot-action="light_cycle"]').forEach((button) => {
+    button.dataset.active = String(frontOn || rearOn);
+    button.dataset.status = frontOn || rearOn ? "warn" : "";
+    const front = button.querySelector('[data-light-label="front"]');
+    const rear = button.querySelector('[data-light-label="rear"]');
+    if (front) {
+      front.textContent = frontOn ? "前灯开" : "前灯关";
+      front.dataset.active = String(frontOn);
+    }
+    if (rear) {
+      rear.textContent = rearOn ? "后灯开" : "后灯关";
+      rear.dataset.active = String(rearOn);
+    }
+  });
+}
+
+function isRobotStanding(posture) {
+  return posture === "stand" || posture === "rl_control";
+}
+
+function resolveRobotAction(action) {
+  if (action === "posture_toggle") {
+    const posture = state.robotStatus?.details?.posture;
+    return isRobotStanding(posture) ? "lie_down" : "stand";
+  }
+  if (action === "sleep_toggle") {
+    const sleep = state.robotStatus?.details?.sleep;
+    return sleep === "awake" ? "sleep" : "wake";
+  }
+  return action;
+}
+
+function nextRobotLightTarget(lights = {}) {
+  const front = Boolean(lights.front);
+  const rear = Boolean(lights.rear);
+  return front && rear
+    ? { front: false, rear: false }
+    : front
+      ? { front: false, rear: true }
+      : rear
+        ? { front: true, rear: true }
+        : { front: true, rear: false };
+}
+
+function isRobotMoving(motion = {}) {
+  return Math.abs(Number(motion.x || 0)) > 0.01
+    || Math.abs(Number(motion.y || 0)) > 0.01
+    || Math.abs(Number(motion.rotation || 0)) > 0.01;
+}
+
+function isRobotVelocityMoving(velocity = {}) {
+  return Math.abs(Number(velocity.x || 0)) > 0.02
+    || Math.abs(Number(velocity.y || 0)) > 0.02
+    || Math.abs(Number(velocity.yaw || 0)) > 0.02;
+}
+
+function resolveRobotVelocity(details = {}, motion = {}) {
+  const velocity = details.actual_velocity;
+  if (velocity && ["x", "y", "yaw"].some((axis) => velocity[axis] !== undefined && velocity[axis] !== null)) {
+    return {
+      x: Number(velocity.x || 0),
+      y: Number(velocity.y || 0),
+      yaw: Number(velocity.yaw || 0),
+      source: velocity.source || "actual",
+    };
+  }
+  const intent = toM20AxisIntent(motion);
+  return {
+    x: Number(intent.x || 0),
+    y: Number(intent.y || 0),
+    yaw: Number(intent.yaw || 0),
+    source: "intent",
+  };
+}
+
+function resolveRobotMoveIntentVelocity() {
+  const movement = composeRobotMovement();
+  if (!movement) return null;
+  const speed = Math.max(Number(document.getElementById("robotSpeedInput")?.value || state.robotStatus?.details?.speed || 0.3), 0);
+  const scaled = {
+    x: (movement.x || 0) * speed,
+    y: (movement.y || 0) * speed * (movement.y > 0 ? 1.4 : 1),
+    yaw: (movement.rotation || 0) * speed,
+  };
+  const intent = toM20AxisIntent(scaled);
+  return {
+    x: intent.x,
+    y: intent.y,
+    yaw: intent.yaw,
+    source: "command",
+  };
+}
+
+function robotVelocityHtml(velocity) {
+  return `
+    <span class="robot-velocity-row"><em>X</em><b>${formatLinearVelocity(velocity.x)}</b><i>m/s</i></span>
+    <span class="robot-velocity-row"><em>Y</em><b>${formatLinearVelocity(velocity.y)}</b><i>m/s</i></span>
+    <span class="robot-velocity-row"><em>Yaw</em><b>${formatAngularVelocity(velocity.yaw)}</b><i>rad/s</i></span>
+  `;
+}
+
+function robotCameraText(cameraPower = {}) {
+  const frontKnown = Object.prototype.hasOwnProperty.call(cameraPower, "front");
+  const rearKnown = Object.prototype.hasOwnProperty.call(cameraPower, "rear");
+  if (!frontKnown && !rearKnown) return "未知";
+  return `${frontKnown ? (cameraPower.front ? "前开" : "前关") : "前未知"} / ${rearKnown ? (cameraPower.rear ? "后开" : "后关") : "后未知"}`;
+}
+
+function formatAxis(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function formatRobotPosition(details = {}) {
+  const mapPose = details.map_pose || {};
+  const gps = details.gps || {};
+  const parts = [];
+  if (Number.isFinite(Number(mapPose.x)) || Number.isFinite(Number(mapPose.y))) {
+    const loc = Number(mapPose.location);
+    const locText = loc === 0 ? "定位正常" : (loc === 1 ? "定位丢失" : "地图");
+    parts.push(`${locText} X:${Number(mapPose.x || 0).toFixed(2)} Y:${Number(mapPose.y || 0).toFixed(2)} m`);
+  }
+  if (Number.isFinite(Number(gps.latitude)) || Number.isFinite(Number(gps.longitude))) {
+    const sats = gps.num_satellites ?? gps.visible_satellites;
+    parts.push(`GPS ${Number(gps.latitude || 0).toFixed(6)}, ${Number(gps.longitude || 0).toFixed(6)}${sats !== undefined && sats !== null ? ` · ${sats}星` : ""}`);
+  }
+  return parts.length ? parts.join(" | ") : "未知";
+}
+
+function robotPositionStatus(details = {}) {
+  const mapPose = details.map_pose || {};
+  if (Number(mapPose.location) === 1) return "warn";
+  if (Number.isFinite(Number(mapPose.x)) || Number.isFinite(Number(details.gps?.latitude))) return "ok";
+  return "unknown";
+}
+
+function formatLinearVelocity(value) {
+  return Number(value || 0).toFixed(1);
+}
+
+function formatAngularVelocity(value) {
+  return Number(value || 0).toFixed(1);
+}
+
+function toM20AxisIntent(movement = {}) {
+  return {
+    x: movement?.y || 0,
+    y: -(movement?.x || 0),
+    yaw: movement?.rotation || 0,
+  };
+}
+
+function formatLiftDriverStatus(details, status) {
+  const flags = details.status_flags || {};
+  const statusText = details.status_text || "";
+  const alarmText = details.alarm_text || "";
+  const faultText = Array.isArray(details.faults) && details.faults.length ? details.faults.join(",") : "";
+  if (alarmText) return alarmText;
+  if (faultText) return faultText;
+  if (details.motion === "up") {
+    return statusText ? `上升中 · ${statusText}` : "上升中";
+  }
+  if (details.motion === "down") {
+    return statusText ? `下降中 · ${statusText}` : "下降中";
+  }
+  if (flags.bit0 || statusText.includes("位置到达")) return statusText || "到位";
+  if (statusText) return statusText;
+  if (!status.online) return "离线";
+  return "已停止";
+}
+
+async function loadLiftStatus() {
+  const target = document.getElementById("liftStatus");
+  if (!target || !state.liftDevice) return;
+  try {
+    const status = await getJson(`/api/devices/${state.liftDevice.id}/lift/status`);
+    const details = status.details || {};
+    const limits = details.limits || {};
+    const driverStatus = formatLiftDriverStatus(details, status);
+    const motorRpm = details.speed_rpm ?? details.motor_rpm ?? details.rpm ?? null;
+    const hasHeight = details.height !== null && details.height !== undefined && Number.isFinite(Number(details.height));
+    const heightPercent = hasHeight ? Number(details.height) : null;
+    const heightCm = Number.isFinite(Number(details.height_cm))
+      ? Number(details.height_cm)
+      : (heightPercent === null ? null : (heightPercent / 100) * liftTravelCm());
+    // total_height_cm 未配置时为 null；勿用 Number.isFinite(Number(null))（会得到 0）。
+    const totalHeightCm = (
+      details.total_height_cm !== null
+      && details.total_height_cm !== undefined
+      && details.total_height_cm !== ""
+      && Number.isFinite(Number(details.total_height_cm))
+    ) ? Number(details.total_height_cm) : null;
+    if (Object.prototype.hasOwnProperty.call(details, "base_height_cm")) {
+      if (!state.config) state.config = {};
+      const nextBase = details.base_height_cm;
+      if (state.config.lift_base_height_cm !== nextBase) {
+        state.config.lift_base_height_cm = nextBase;
+        applyLiftTravelToControls();
+      } else {
+        state.config.lift_base_height_cm = nextBase;
+      }
+    }
+    const commandSpeed = Number.isFinite(Number(details.command_speed_cm_s))
+      ? Number(details.command_speed_cm_s)
+      : liftCommandSpeedCmS(details.speed);
+    if (Number.isFinite(Number(details.travel_height_cm)) && Number(details.travel_height_cm) > 0) {
+      if (!state.config) state.config = {};
+      const nextTravel = Number(details.travel_height_cm);
+      if (state.config.lift_travel_height !== nextTravel) {
+        state.config.lift_travel_height = nextTravel;
+        applyLiftTravelToControls();
+      } else {
+        state.config.lift_travel_height = nextTravel;
+      }
+    }
+    updateLiftCurrentHeightUi(heightCm, totalHeightCm);
+    syncLiftRemoteControls(details);
+    await loadLiftLease();
+    target.textContent = [
+      status.control_mode === "real" ? "Real" : "Dry-run",
+      formatLiftHeightLabel(heightCm, totalHeightCm),
+      `速度 ${Number(details.speed ?? 0).toFixed(2)} · ${commandSpeed.toFixed(2)} cm/s`,
+      `状态 ${liftMotionLabel(details.motion)}`,
+      `驱动器 ${driverStatus}`,
+      `转速 ${motorRpm === null ? "未知" : `${Number(motorRpm).toFixed(0)} rpm`}`,
+      Number.isFinite(Number(details.zero_pulse)) && Number(details.zero_pulse) !== 0 ? "零点已标定" : "零点未标定",
+      details.position_trusted === false ? "高度计数未可信" : null,
+      limits.min ? "下限位" : null,
+      limits.max ? "上限位" : null,
+    ].filter(Boolean).join(" / ");
+    renderLiftStatusFields(driverStatus, motorRpm, heightCm, totalHeightCm);
+    scheduleLiftStatusPolling();
+  } catch (error) {
+    target.textContent = `状态读取失败：${error.message}`;
+    renderLiftStatusFields("未知", null, null, null);
+    scheduleLiftStatusPolling();
+  }
+}
+
+function scheduleLiftStatusPolling() {
+  if (state.liftStatusTimer) return;
+  state.liftStatusTimer = setInterval(loadLiftStatus, 1000);
+}
+
+function bindLiftDragGuards() {
+  const bind = (ids, flag) => {
+    ids.forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el || el.dataset.dragGuard === "1") return;
+      el.dataset.dragGuard = "1";
+      const start = () => { state[flag] = true; };
+      el.addEventListener("pointerdown", start);
+      el.addEventListener("touchstart", start, { passive: true });
+      el.addEventListener("input", start);
+    });
+  };
+  bind(["roofLiftHeightSlider", "liftHeightSlider"], "liftTargetDragging");
+  bind(["roofLiftSpeedInput", "liftSpeedInput"], "liftSpeedDragging");
+  if (document.documentElement.dataset.liftDragRelease !== "1") {
+    document.documentElement.dataset.liftDragRelease = "1";
+    const end = () => {
+      state.liftTargetDragging = false;
+      state.liftSpeedDragging = false;
+    };
+    document.addEventListener("pointerup", end);
+    document.addEventListener("pointercancel", end);
+    document.addEventListener("touchend", end, { passive: true });
+  }
+}
+
+function syncLiftRemoteControls(details) {
+  if (!details) return;
+  if (!state.liftSpeedDragging) {
+    const speed = Number(details.speed);
+    if (Number.isFinite(speed)) {
+      const clamped = Math.max(0, Math.min(1, speed));
+      if (state.lastRemoteLiftSpeed !== clamped) {
+        state.lastRemoteLiftSpeed = clamped;
+        const roof = document.getElementById("roofLiftSpeedInput");
+        const drawer = document.getElementById("liftSpeedInput");
+        if (roof) roof.value = String(clamped);
+        if (drawer) drawer.value = String(clamped);
+        updateLiftSpeedLabels(clamped);
+      }
+    }
+  }
+  if (state.liftTargetDragging) return;
+  const targetPct = details.target_height;
+  if (targetPct === null || targetPct === undefined || targetPct === "") return;
+  const pct = Number(targetPct);
+  if (!Number.isFinite(pct)) return;
+  if (state.lastRemoteLiftTargetPct === pct) return;
+  state.lastRemoteLiftTargetPct = pct;
+  const sliderVal = String(liftExtensionToSliderValue((pct / 100) * liftTravelCm()));
+  const roofH = document.getElementById("roofLiftHeightSlider");
+  const drawerH = document.getElementById("liftHeightSlider");
+  if (roofH) roofH.value = sliderVal;
+  if (drawerH) drawerH.value = sliderVal;
+  syncLiftTargetLabels();
+}
+
+async function loadLiftLease() {
+  if (!state.liftDevice) return;
+  try {
+    state.liftLease = await getJson(`/api/devices/${state.liftDevice.id}/lease`);
+    updateLiftOccupancyUi();
+  } catch (error) {
+    log("升降杆控制权读取失败", { error: error.message });
+  }
+}
+
+function isCentralHolderName(name) {
+  return String(name || "").trim().toLowerCase().startsWith("central");
+}
+
+function updateLiftOccupancyUi(lease = state.liftLease) {
+  const held = Boolean(lease?.holder_id);
+  const name = lease?.holder_name || "未知";
+  let text = "";
+  if (held && isCentralHolderName(name)) {
+    text = `集中平台占用中（${name}）`;
+  } else if (held && lease?.can_control === false) {
+    text = `占用中（${name}）`;
+  }
+  document.querySelectorAll("[data-lift-occupancy]").forEach((el) => {
+    el.hidden = !text;
+    el.textContent = text;
+  });
+}
+
+function renderLiftStatusFields(driverStatus, motorRpm, heightCm = null, totalHeightCm = null) {
+  document.querySelectorAll('[data-lift-status-field="driver"]').forEach((item) => {
+    item.textContent = String(driverStatus || "未知");
+  });
+  document.querySelectorAll('[data-lift-status-field="rpm"]').forEach((item) => {
+    item.textContent = motorRpm === null || motorRpm === undefined ? "未知" : `${Number(motorRpm).toFixed(0)} rpm`;
+  });
+  document.querySelectorAll('[data-lift-status-field="height"]').forEach((item) => {
+    item.textContent = formatLiftHeightLabel(heightCm, totalHeightCm);
+  });
+}
+
+function liftMotionLabel(value) {
+  const labels = {
+    stopped: "停止",
+    up: "上升",
+    down: "下降",
+  };
+  return labels[value] || value || "未知";
+}
+
+function robotLabel(value) {
+  const labels = {
+    normal: "常规",
+    navigation: "导航",
+    assist: "辅助",
+    stand: "站立",
+    recover_stand: "恢复站立",
+    lie_down: "趴下",
+    idle: "空闲",
+    soft_estop: "软急停",
+    boot_damping: "开机阻尼",
+    rl_control: "站立/运动控制",
+    awake: "未休眠",
+    sleeping: "已休眠",
+    entering_sleep: "进入休眠中",
+    unknown: "未知",
+    basic: "基础",
+    stairs: "楼梯",
+    platform: "高台",
+  };
+  return labels[value] || value || "未知";
+}
+
+async function loadControlLogs() {
+  try {
+    const payload = await getJson("/api/control/logs");
+    state.logs = payload.logs || [];
+    renderControlLogs();
+    const failure = state.logs.find((entry) => !entry.ok);
+    if (failure) {
+      updateLastFailure(failure);
+    }
+  } catch (error) {
+    log("控制日志读取失败", { error: error.message });
+  }
+}
+
+function renderControlLogs() {
+  const target = document.getElementById("controlLogs");
+  if (!target) return;
+  if (!state.logs.length) {
+    target.innerHTML = '<p class="empty-log">暂无控制日志</p>';
+    updateLastFailure(null);
+    return;
+  }
+
+  target.innerHTML = state.logs.slice(0, 30).map((entry) => {
+    const time = new Date(entry.timestamp).toLocaleTimeString();
+    const status = entry.ok ? "成功" : "失败";
+    const detail = entry.ok
+      ? JSON.stringify(entry.payload || {})
+      : `${entry.category || "unknown"} ${entry.error || ""}`;
+    return `
+      <div class="log-item" data-ok="${entry.ok}">
+        <div>
+          <strong>${time} ${entry.action}</strong>
+          <span>${entry.client_id || "unknown"} / ${entry.dry_run ? "dry-run" : "real"}</span>
+        </div>
+        <em>${status}</em>
+        <p>${escapeHtml(detail)}</p>
+      </div>
+    `;
+  }).join("");
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) {
+    return CSS.escape(value);
+  }
+  return String(value).replaceAll('"', '\\"');
+}
+
+function updateLastFailure(entry) {
+  const target = document.getElementById("lastFailure");
+  if (!entry) {
+    target.textContent = "暂无失败";
+    target.dataset.empty = "true";
+    return;
+  }
+  target.dataset.empty = "false";
+  target.textContent = `${entry.action || "control"} / ${entry.category || "unknown"}：${entry.error || "未知错误"}`;
+}
+
+function updateStatusUi() {
+  const status = state.status;
+  if (!status) return;
+  // 紧凑状态圆点（抽屉 + 视频面板）
+  const setDot = (id, value, key = id) => {
+    const dot = document.getElementById(id);
+    if (dot) dot.dataset.status = stableStatus(`dot:${key}`, value || "unknown");
+  };
+  setDot("dotOnline", status.online ? "ok" : "error");
+  // 视频状态优先用 WebRTC 播放器实际连接状态
+  let videoStatus = status.video;
+  const videoDeviceId = state.videoDevice?.id;
+  if (videoDeviceId) {
+    const player = state.videoPlayers.get(videoPlayerKey(VIDEO_ROLE_MAIN, videoDeviceId));
+    if (player?.status === "connected") videoStatus = "ok";
+    else if (player?.status === "connecting") videoStatus = "connecting";
+    else if (player?.status === "error") videoStatus = "error";
+  }
+  setDot("dotVideo", videoStatus, `dog:video:${videoDeviceId || "none"}`);
+  setDot("dotOnvif", status.onvif);
+  setDot("dotIsapi", status.isapi);
+  // 视频面板指示灯（与抽屉同步状态）
+  const videoDots = document.querySelectorAll("#dogPtzVideoDots .status-dot");
+  const map2 = {
+    online: status.online ? "ok" : "error",
+    video: videoStatus,
+    onvif: status.onvif || "unknown",
+    isapi: status.isapi || "unknown",
+  };
+  videoDots.forEach((dot) => {
+    const key = dot.dataset.dot;
+    if (key && map2[key] !== undefined) {
+      dot.dataset.status = stableStatus(`video-dot:dog:${key}`, map2[key]);
+    }
+  });
+}
+
+function setStatusValue(id, status, text) {
+  const target = document.getElementById(id);
+  target.dataset.status = status || "unknown";
+  target.textContent = text;
+}
+
+function statusText(status) {
+  if (status === "ok") return "正常";
+  if (status === "error") return "异常";
+  if (status === "disabled") return "未启用";
+  return "未知";
+}
+
+function scheduleStatusPolling() {
+  if (state.statusTimer) return;
+  state.statusTimer = setInterval(loadStatus, 10000);
+}
+
+function scheduleRobotStatusPolling() {
+  if (state.robotStatusTimer) return;
+  state.robotStatusTimer = setInterval(loadRobotStatus, 1000);
+}
+
+function scheduleRobotStatusBurst() {
+  clearRobotStatusBurst();
+  [250, 750, 1500, 2500].forEach((delayMs) => {
+    const timer = setTimeout(loadRobotStatus, delayMs);
+    state.robotStatusBurstTimers.push(timer);
+  });
+}
+
+function clearRobotStatusBurst() {
+  state.robotStatusBurstTimers.forEach((timer) => clearTimeout(timer));
+  state.robotStatusBurstTimers = [];
+}
+
+async function acquireLease() {
+  if (!state.device) return;
+  const holderName = `操作员 ${state.clientId.slice(-4)}`;
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-ptz-lease]').forEach((btn) => { btn.disabled = true; });
+  try {
+    state.lease = await postJson(`/api/devices/${state.device.id}/lease/acquire`, { holder_name: holderName });
+    updateLeaseUi();
+    log("已获取控制权", state.lease);
+  } catch (error) {
+    log("获取控制权失败", { error: error.message });
+    await loadLease();
+  } finally {
+    updateLeaseUi();
+  }
+}
+
+async function renewLease() {
+  if (!state.device || !state.lease?.can_control) return;
+  try {
+    state.lease = await postJson(`/api/devices/${state.device.id}/lease/renew`);
+    updateLeaseUi();
+  } catch (error) {
+    log("控制权续租失败", { error: error.message });
+    await loadLease();
+  }
+}
+
+async function releaseLease({ quiet = false } = {}) {
+  if (!state.device || !state.lease?.can_control) return;
+  try {
+    state.lease = await postJson(`/api/devices/${state.device.id}/lease/release`);
+    updateLeaseUi();
+    if (!quiet) log("已释放控制权", state.lease);
+  } catch (error) {
+    if (!quiet) log("释放控制权失败", { error: error.message });
+  }
+}
+
+function updateLeaseUi() {
+  const lease = state.lease;
+  let status, disabled;
+  if (!lease || !lease.holder_id) {
+    status = "none"; disabled = false;
+  } else if (lease.can_control) {
+    status = "self"; disabled = false;
+  } else {
+    status = "other"; disabled = true;
+  }
+  // 更新所有租约按钮（抽屉 + 视频面板）
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-ptz-lease]').forEach((btn) => {
+    btn.dataset.status = status;
+    btn.textContent = "权";
+    btn.disabled = disabled;
+  });
+  // 同步视频面板车顶租约按钮
+  document.querySelectorAll('[data-roof-lease]').forEach((btn) => {
+    const rl = state.roofPtzLease;
+    let rs = !rl || !rl.holder_id ? "none" : rl.can_control ? "self" : "other";
+    let rd = !rl || !rl.holder_id ? false : rl.can_control ? false : true;
+    btn.dataset.status = rs;
+    btn.disabled = rd;
+  });
+
+  const canControl = Boolean(lease?.can_control);
+  if (!canControl) sendStopForActiveCommand();
+  setControlButtonsEnabled(canControl);
+  scheduleRenewal();
+  scheduleLeasePolling();
+}
+
+function scheduleRenewal() {
+  if (state.renewTimer) {
+    clearInterval(state.renewTimer);
+    state.renewTimer = null;
+  }
+  if (!state.lease?.can_control) return;
+
+  const intervalMs = Math.max(3000, Math.floor((state.lease.ttl_seconds * 1000) / 2));
+  state.renewTimer = setInterval(renewLease, intervalMs);
+}
+
+function scheduleLeasePolling() {
+  if (state.leasePollTimer) return;
+  state.leasePollTimer = setInterval(loadLease, 3000);
+}
+
+function startActiveRenewal() {
+  stopActiveRenewal();
+  state.activeRenewTimer = setInterval(renewLeaseForActiveCommand, 2000);
+}
+
+function stopActiveRenewal() {
+  if (!state.activeRenewTimer) return;
+  clearInterval(state.activeRenewTimer);
+  state.activeRenewTimer = null;
+}
+
+function setControlButtonsEnabled(enabled) {
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-command], [data-ptz-device="dog_ptz_1"] [data-preset-action], [data-ptz-device="dog_ptz_1"] [data-light-toggle], [data-ptz-device="dog_ptz_1"] [data-preset-goto1]').forEach((button) => {
+    button.disabled = !enabled;
+  });
+  if (enabled) updateLightButtonUI();
+}
+
+function updateLightButtonUI() {
+  // 更新所有狗载云台补光灯按钮（抽屉 + 视频面板）
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-light-toggle]').forEach((button) => {
+    button.dataset.active = String(state.ptzLightOn);
+    button.textContent = state.ptzLightOn ? "灯开" : "灯关";
+  });
+}
+
+// 车顶云台辅助函数（与狗载云台使用同一套 API，仅 device_id 不同）
+const ROOF_PTZ_ID = "roof_ptz_1";
+state.roofPtzStatus = null;
+state.roofPtzLease = null;
+state.roofPtzActiveCommand = null;
+state.roofPtzLightOn = false;
+
+function getRoofPtzSection() {
+  return document.querySelector(`[data-ptz-device="${ROOF_PTZ_ID}"]`);
+}
+
+function roofPtzSectionQuery(selector) {
+  return document.querySelector(`[data-ptz-device="${ROOF_PTZ_ID}"] ${selector}`);
+}
+
+function roofPtzSectionQueryAll(selector) {
+  return document.querySelectorAll(`[data-ptz-device="${ROOF_PTZ_ID}"] ${selector}`);
+}
+
+function updateRoofPtzStatusUi() {
+  const status = state.roofPtzStatus;
+  if (!status) return;
+  // 紧凑状态圆点
+  const values = [
+    status.online ? "ok" : "error",
+    status.video || "unknown",
+    status.onvif || "unknown",
+    status.isapi || "unknown",
+  ];
+  document.querySelectorAll(`[data-ptz-device="${ROOF_PTZ_ID}"]`).forEach((section) => {
+    const dots = section.querySelectorAll(".status-dot");
+    dots.forEach((dot, i) => {
+      if (i < values.length) {
+        dot.dataset.status = stableStatus(`dot:${ROOF_PTZ_ID}:${i}:${section.id || section.tagName}`, values[i]);
+      }
+    });
+  });
+}
+
+async function loadRoofPtzStatus() {
+  try {
+    state.roofPtzStatus = await getJson(`/api/devices/${ROOF_PTZ_ID}/status`);
+    updateRoofPtzStatusUi();
+  } catch (error) {
+    state.roofPtzStatus = { online: false, video: "unknown", onvif: "unknown", isapi: "unknown", control_mode: "dry_run", last_checked_at: null, last_error: error.message };
+    updateRoofPtzStatusUi();
+  }
+}
+
+async function loadRoofPtzLease() {
+  try {
+    state.roofPtzLease = await getJson(`/api/devices/${ROOF_PTZ_ID}/lease`);
+    updateRoofPtzLeaseUi();
+  } catch (error) { /* 静默失败 */ }
+}
+
+function updateRoofPtzLeaseUi() {
+  const lease = state.roofPtzLease;
+
+  roofPtzSectionQueryAll("[data-roof-lease]").forEach((btn) => {
+    if (!lease || !lease.holder_id) {
+      btn.dataset.status = "none";
+      btn.textContent = "权";
+      btn.disabled = false;
+    } else if (lease.can_control) {
+      btn.dataset.status = "self";
+      btn.textContent = "权";
+      btn.disabled = false;
+    } else {
+      btn.dataset.status = "other";
+      btn.textContent = "权";
+      btn.disabled = true;
+    }
+  });
+
+  setRoofPtzButtonsEnabled(!!lease?.can_control);
+}
+
+function setRoofPtzButtonsEnabled(enabled) {
+  document.querySelectorAll(`[data-ptz-device="${ROOF_PTZ_ID}"] [data-command], [data-ptz-device="${ROOF_PTZ_ID}"] [data-preset-action], [data-ptz-device="${ROOF_PTZ_ID}"] [data-light-toggle], [data-ptz-device="${ROOF_PTZ_ID}"] [data-preset-goto1]`).forEach((btn) => {
+    btn.disabled = !enabled;
+  });
+  if (enabled) updateRoofPtzLightButtonUI();
+}
+
+async function acquireRoofPtzLease() {
+  const holderName = `操作员 ${state.clientId.slice(-4)}`;
+  roofPtzSectionQueryAll("[data-roof-lease]").forEach((button) => { button.disabled = true; });
+  try {
+    state.roofPtzLease = await postJson(`/api/devices/${ROOF_PTZ_ID}/lease/acquire`, { holder_name: holderName });
+    updateRoofPtzLeaseUi();
+    log("车顶云台控制权已获取", state.roofPtzLease);
+  } catch (error) {
+    log("车顶云台控制权获取失败", { error: error.message });
+    await loadRoofPtzLease();
+  } finally {
+    updateRoofPtzLeaseUi();
+  }
+}
+
+async function releaseRoofPtzLease({ quiet = false } = {}) {
+  if (!state.roofPtzLease?.can_control) return;
+  try {
+    state.roofPtzLease = await postJson(`/api/devices/${ROOF_PTZ_ID}/lease/release`);
+    updateRoofPtzLeaseUi();
+    if (!quiet) log("车顶云台控制权已释放", state.roofPtzLease);
+  } catch (error) {
+    if (!quiet) log("车顶云台控制权释放失败", { error: error.message });
+  }
+}
+
+async function roofPtzControlPost(url, body = {}) {
+  if (state.roofPtzLease?.can_control) {
+    try { state.roofPtzLease = await postJson(`/api/devices/${ROOF_PTZ_ID}/lease/renew`); } catch {}
+  }
+  return postJson(url, body);
+}
+
+function updateRoofPtzLightButtonUI() {
+  roofPtzSectionQueryAll("[data-light-toggle]").forEach((btn) => {
+    btn.dataset.active = String(state.roofPtzLightOn);
+    btn.textContent = state.roofPtzLightOn ? "灯开" : "灯关";
+  });
+}
+
+// 车顶云台控制事件绑定
+function bindRoofPtzControls() {
+  // 控制权按钮
+  roofPtzSectionQueryAll("[data-roof-lease]").forEach((acquireBtn) => acquireBtn.addEventListener("click", async () => {
+    if (state.roofPtzLease?.can_control) { await releaseRoofPtzLease(); }
+    else { await acquireRoofPtzLease(); }
+  }));
+
+  // 预置位1
+  roofPtzSectionQueryAll("[data-preset-goto1]").forEach((button) => button.addEventListener("click", async () => {
+    try {
+      await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/presets/goto`, { preset: 1 });
+      log("车顶云台调用预置位1");
+    } catch (error) {
+      log("车顶云台预置位1失败", { error: error.message });
+    }
+  }));
+
+  // PTZ 方向/变倍按钮
+  roofPtzSectionQueryAll("[data-command]").forEach((button) => {
+    const command = button.dataset.command;
+    const start = async (event) => {
+      event.preventDefault();
+      if (button.disabled || state.roofPtzActiveCommand) return;
+      try {
+        state.roofPtzActiveCommand = command;
+        await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/ptz/start`, { command, speed: 5 });
+      } catch (error) {
+        state.roofPtzActiveCommand = null;
+        log("车顶云台控制失败", { command, error: error.message });
+      }
+    };
+    const stop = async (event) => {
+      event.preventDefault();
+      if (state.roofPtzActiveCommand !== command) return;
+      state.roofPtzActiveCommand = null;
+      try {
+        await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/ptz/stop`, { command, speed: 5 });
+      } catch (error) {
+        log("车顶云台停止失败", { error: error.message });
+      }
+    };
+    button.addEventListener("mousedown", start);
+    button.addEventListener("touchstart", start, { passive: false });
+    button.addEventListener("mouseup", stop);
+    button.addEventListener("mouseleave", stop);
+    button.addEventListener("touchend", stop, { passive: false });
+    button.addEventListener("touchcancel", stop, { passive: false });
+  });
+
+  // 预置位按钮
+  roofPtzSectionQueryAll("[data-preset-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const input = document.querySelector(`[data-ptz-device="${ROOF_PTZ_ID}"] .ptz-preset-input`);
+      const preset = input ? Number(input.value) : 1;
+      if (!preset) { log("请先选择预置位"); return; }
+      try {
+        await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/presets/${button.dataset.presetAction}`, { preset });
+      } catch (error) {
+        log("车顶预置位操作失败", { error: error.message });
+      }
+    });
+  });
+
+  // 预置位选择
+  roofPtzSectionQueryAll("[data-preset-select]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const active = button.dataset.active === "true";
+      roofPtzSectionQueryAll("[data-preset-select]").forEach((item) => { item.dataset.active = "false"; });
+      const input = document.querySelector(`[data-ptz-device="${ROOF_PTZ_ID}"] .ptz-preset-input`);
+      if (active) { if (input) input.value = ""; return; }
+      button.dataset.active = "true";
+      if (input) input.value = button.dataset.presetSelect;
+    });
+  });
+
+  // 补光灯
+  roofPtzSectionQueryAll("[data-light-toggle]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (button.disabled) return;
+      const enabled = !state.roofPtzLightOn;
+      try {
+        await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/light`, { enabled });
+        state.roofPtzLightOn = enabled;
+        updateRoofPtzLightButtonUI();
+        log("车顶补光灯已" + (enabled ? "打开" : "关闭"));
+      } catch (error) {
+        log("车顶补光灯控制失败", { error: error.message });
+      }
+    });
+  });
+}
+
+// 边缘抽屉
+function toggleEdgeDrawer() {
+  const drawer = document.getElementById("edgeDrawer");
+  if (!drawer) return;
+  drawer.classList.toggle("open");
+}
+
+function bindControls() {
+  bindWorkspaceTabs();
+  document.getElementById("edgeTrigger")?.addEventListener("click", toggleEdgeDrawer);
+  // 点击视频画面时关闭抽屉
+  document.getElementById("videoFrameWrap")?.addEventListener("click", (e) => {
+    const drawer = document.getElementById("edgeDrawer");
+    if (drawer?.classList.contains("open") && !e.target.closest(".video-joystick-zone")) {
+      drawer.classList.remove("open");
+    }
+  });
+  document.getElementById("refreshDevices").addEventListener("click", loadDevices);
+  document.getElementById("refreshLogs").addEventListener("click", loadControlLogs);
+  document.getElementById("toggleVideoFill").addEventListener("click", toggleVideoFill);
+  document.getElementById("reloadVideo").addEventListener("click", reloadVideo);
+  document.getElementById("closeVideo").addEventListener("click", closeCurrentVideo);
+  document.getElementById("captureVideo").addEventListener("click", captureCurrentVideo);
+  document.getElementById("robotInputModeToggle")?.addEventListener("click", async () => {
+    await setRobotInputMode(state.robotInputMode === "keyboard" ? "joystick" : "keyboard");
+  });
+  document.querySelectorAll("[data-overlay-drawer-toggle]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      const name = button.dataset.overlayDrawerToggle;
+      const drawer = document.querySelector(`[data-overlay-drawer="${cssEscape(name)}"]`);
+      if (!drawer) return;
+      drawer.dataset.open = String(drawer.dataset.open !== "true");
+    });
+  });
+  document.getElementById("openAuxVideo")?.addEventListener("click", () => {
+    state.auxVideoPickerOpen = true;
+    renderAuxVideoControls();
+  });
+  document.getElementById("auxVideoSelect")?.addEventListener("change", async (event) => {
+    const deviceId = event.target.value;
+    if (!deviceId) {
+      closeAuxVideo();
+      return;
+    }
+    const next = pickDevice(deviceId);
+    if (next?.video?.player_url) {
+      await activateAuxVideoDevice(next);
+    }
+  });
+  document.getElementById("closeAuxVideo")?.addEventListener("click", () => closeAuxVideo());
+  document.getElementById("swapVideo")?.addEventListener("click", swapMainAndAuxVideo);
+  // 九宫格租约按钮（抽屉 + 视频面板）
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-ptz-lease]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (state.lease?.can_control) { await releaseLease(); }
+      else { await acquireLease(); }
+    });
+  });
+  // 预置位1
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-preset-goto1]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!state.device) return;
+      try {
+        await controlPostJson(`/api/devices/${state.device.id}/presets/goto`, { preset: 1 });
+        log("调用预置位1");
+      } catch (error) {
+        log("预置位1失败", { error: error.message });
+      }
+    });
+  });
+  document.getElementById("videoDeviceList").addEventListener("click", async (event) => {
+    const layoutButton = event.target.closest("[data-video-layout]");
+    if (layoutButton?.dataset.videoLayout === VIDEO_LAYOUT_QUAD) {
+      await activateQuadVideoLayout();
+      return;
+    }
+    const button = event.target.closest("[data-video-device]");
+    if (!button) return;
+    const next = pickDevice(button.dataset.videoDevice);
+    if (!next?.video?.player_url) return;
+    await activateVideoDevice(next);
+  });
+  document.getElementById("settingsPasswordUnlock").addEventListener("click", unlockSettingsPassword);
+  document.getElementById("settingsPasswordInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); unlockSettingsPassword(); }
+  });
+  document.getElementById("deviceConfigForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const config = {
+      dog_ptz_dry_run: document.getElementById("dogPtzDryRunInput").checked,
+      dog_ptz_host: document.getElementById("dogPtzHostInput").value.trim(),
+      dog_ptz_onvif_port: Number(document.getElementById("dogPtzOnvifPortInput").value),
+      dog_ptz_isapi_channel: Number(document.getElementById("dogPtzIsapiChannelInput").value),
+      dog_ptz_aux_light_id: Number(document.getElementById("dogPtzAuxLightIdInput").value),
+      dog_ptz_supplement_light_mode: document.getElementById("dogPtzSupplementLightModeInput").value.trim(),
+      dog_ptz_supplement_light_brightness: Number(document.getElementById("dogPtzSupplementLightBrightnessInput").value),
+      dog_ptz_user: document.getElementById("dogPtzUserInput").value.trim(),
+      dog_ptz_password: document.getElementById("dogPtzPasswordInput").value,
+      dog_ptz_video_enabled: document.getElementById("dogPtzVideoEnabledInput").checked,
+      mediamtx_public_base: document.getElementById("mediaBaseInput").value.trim(),
+      m20_host: document.getElementById("m20HostInput").value.trim(),
+      m20_tcp_port: Number(document.getElementById("m20TcpPortInput").value),
+      m20_udp_port: Number(document.getElementById("m20UdpPortInput").value),
+      m20_dry_run: document.getElementById("m20DryRunInput").checked,
+      m20_front_video_enabled: document.getElementById("m20FrontVideoEnabledInput").checked,
+      m20_rear_video_enabled: document.getElementById("m20RearVideoEnabledInput").checked,
+      m20_front_rtsp: document.getElementById("m20FrontRtspInput").value.trim(),
+      m20_rear_rtsp: document.getElementById("m20RearRtspInput").value.trim(),
+      roof_ptz_dry_run: document.getElementById("roofPtzDryRunInput").checked,
+      roof_ptz_host: document.getElementById("roofPtzHostInput").value.trim(),
+      roof_ptz_onvif_port: Number(document.getElementById("roofPtzOnvifPortInput").value),
+      roof_ptz_isapi_channel: Number(document.getElementById("roofPtzIsapiChannelInput").value),
+      roof_ptz_aux_light_id: Number(document.getElementById("roofPtzAuxLightIdInput").value),
+      roof_ptz_supplement_light_mode: document.getElementById("roofPtzSupplementLightModeInput").value.trim(),
+      roof_ptz_supplement_light_brightness: Number(document.getElementById("roofPtzSupplementLightBrightnessInput").value),
+      roof_ptz_user: document.getElementById("roofPtzUserInput").value.trim(),
+      roof_ptz_password: document.getElementById("roofPtzPasswordInput").value,
+      roof_ptz_video_enabled: document.getElementById("roofPtzVideoEnabledInput").checked,
+      lift_dry_run: document.getElementById("liftDryRunInput").checked,
+      lift_host: document.getElementById("liftHostInput").value.trim(),
+      lift_port: Number(document.getElementById("liftPortInput").value),
+      lift_travel_height: Number(document.getElementById("liftTravelHeightInput")?.value || DEFAULT_LIFT_TRAVEL_CM),
+      lift_base_height_cm: (() => {
+        const raw = document.getElementById("liftBaseHeightInput")?.value?.trim();
+        if (!raw) return null;
+        const value = Number(raw);
+        return Number.isFinite(value) && value >= 0 ? value : null;
+      })(),
+      // 保留未在表单暴露的欧克速度/点动参数，避免保存时被默认值覆盖。
+      lift_slave_id: state.config?.lift_slave_id,
+      lift_timeout_s: state.config?.lift_timeout_s,
+      lift_poll_interval_ms: state.config?.lift_poll_interval_ms,
+      lift_max_pp_speed_pr_s: state.config?.lift_max_pp_speed_pr_s,
+      lift_max_pv_speed_pr_s: state.config?.lift_max_pv_speed_pr_s,
+      lift_min_pp_speed_pr_s: state.config?.lift_min_pp_speed_pr_s,
+      lift_min_pv_speed_pr_s: state.config?.lift_min_pv_speed_pr_s,
+      lift_max_single_move_pulse: state.config?.lift_max_single_move_pulse,
+      lift_position_tolerance_pulse: state.config?.lift_position_tolerance_pulse,
+      lift_min_pulse: state.config?.lift_min_pulse,
+      lift_max_pulse: state.config?.lift_max_pulse,
+      lift_jog_step_pulse: state.config?.lift_jog_step_pulse,
+      lift_jog_interval_ms: state.config?.lift_jog_interval_ms,
+      lift_jog_min_interval_ms: state.config?.lift_jog_min_interval_ms,
+      lift_jog_max_step_pulse: state.config?.lift_jog_max_step_pulse,
+      lift_jog_deadman_s: state.config?.lift_jog_deadman_s,
+      settings_password: state.config?.settings_password || "",
+    };
+
+    try {
+      state.config = await postJson("/api/config/device", config, "PUT");
+      // 保存后重新检查密码门状态
+      initSettingsPasswordGate(state.config.has_settings_password);
+      applyLiftTravelToControls();
+      log("配置已保存", state.config);
+      updateControlMode();
+      await loadStatus();
+      await loadDevices();
+    } catch (error) {
+      log("配置保存失败", { error: error.message });
+    }
+  });
+
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-command]').forEach((button) => {
+    const command = button.dataset.command;
+    const start = async (event) => {
+      event.preventDefault();
+      if (!state.device || button.disabled || state.activeCommand) return;
+      try {
+        state.activeCommand = command;
+        startActiveRenewal();
+        const result = await controlPostJson(`/api/devices/${state.device.id}/ptz/start`, { command, speed: 5 });
+      } catch (error) {
+        state.activeCommand = null;
+        stopActiveRenewal();
+        log("控制失败", { error: error.message });
+      }
+    };
+    const stop = async (event) => {
+      event.preventDefault();
+      if (!state.device || state.activeCommand !== command) return;
+      state.activeCommand = null;
+      stopActiveRenewal();
+      try {
+        await controlPostJson(`/api/devices/${state.device.id}/ptz/stop`, { command, speed: 5 });
+      } catch (error) {
+        log("停止失败", { error: error.message });
+      }
+    };
+
+    button.addEventListener("mousedown", start);
+    button.addEventListener("touchstart", start, { passive: false });
+    button.addEventListener("mouseup", stop);
+    button.addEventListener("mouseleave", stop);
+    button.addEventListener("touchend", stop, { passive: false });
+    button.addEventListener("touchcancel", stop, { passive: false });
+  });
+
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-preset-action]').forEach((button) => {
+    button.addEventListener("click", async () => {
+      
+      if (!state.device) return;
+      const preset = Number(document.querySelector('[data-ptz-device="dog_ptz_1"] .ptz-preset-input')?.value || 0);
+      if (!preset) {
+        log("预置位操作失败", { error: "请先选择 1-5 号预置位" });
+        return;
+      }
+      const action = button.dataset.presetAction;
+      try {
+        await controlPostJson(`/api/devices/${state.device.id}/presets/${action}`, { preset });
+      } catch (error) {
+        log("预置位操作失败", { error: error.message });
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-preset-select]').forEach((button) => {
+    button.addEventListener("click", () => {
+      
+      togglePresetSelection(button);
+    });
+  });
+
+  document.querySelectorAll('[data-ptz-device="dog_ptz_1"] [data-light-toggle]').forEach((button) => {
+    button.addEventListener("click", async () => {
+      
+      if (!state.device || button.disabled) return;
+      const enabled = !state.ptzLightOn;
+      try {
+        await controlPostJson(`/api/devices/${state.device.id}/light`, { enabled });
+        state.ptzLightOn = enabled;
+        updateLightButtonUI();
+        log("补光灯已" + (enabled ? "打开" : "关闭"));
+      } catch (error) {
+        log("补光灯控制失败", { error: error.message });
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-robot-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!state.robotDevice) return;
+      const rawAction = button.dataset.robotAction;
+      const action = resolveRobotAction(rawAction);
+      try {
+        if (action === "light_cycle") {
+          const lights = state.robotStatus?.details?.lights || {};
+          const target = nextRobotLightTarget(lights);
+          await sendRobotCommand({ action: "set_lights", front_light: target.front, rear_light: target.rear });
+        } else {
+          await sendRobotCommand({ action });
+        }
+      } catch (error) {
+        log("机器狗控制失败", { action: rawAction, error: error.message });
+      }
+    });
+  });
+
+  document.getElementById("robotModeSelect").addEventListener("change", (event) => {
+    if (!event.target.value) return;
+    sendRobotCommand({ action: "set_mode", value: event.target.value });
+  });
+
+  document.getElementById("robotGaitSelect").addEventListener("change", (event) => {
+    if (!event.target.value) return;
+    sendRobotCommand({ action: "set_gait", value: event.target.value });
+  });
+
+  bindRobotJoysticks();
+
+  document.getElementById("robotSpeedInput").addEventListener("input", async (event) => {
+    const speed = Number(event.target.value);
+    document.getElementById("robotSpeedValue").textContent = speed.toFixed(2);
+    if (speed <= 0) {
+      log("机器狗速度为 0，无法移动");
+    }
+    await sendRobotCommand({ action: "set_speed", speed });
+  });
+
+  document.querySelectorAll("[data-lift-action]").forEach((button) => {
+    const action = button.dataset.liftAction;
+    const run = () => {
+      if (action === "stop") return sendLiftStopCommand();
+      if (action === "estop") return sendLiftEstopCommand();
+      return sendLiftCommand({ action });
+    };
+    if (action === "stop") {
+      button.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        run();
+      });
+      button.addEventListener("touchstart", (event) => {
+        event.preventDefault();
+        run();
+      }, { passive: false });
+      return;
+    }
+    button.addEventListener("click", run);
+  });
+
+  document.querySelectorAll("[data-lift-hold]").forEach((button) => {
+    bindLiftHoldButton(button, button.dataset.liftHold);
+  });
+
+  document.getElementById("liftSpeedInput").addEventListener("input", (event) => {
+    const speed = Number(event.target.value);
+    const roofSpeed = document.getElementById("roofLiftSpeedInput");
+    if (roofSpeed) roofSpeed.value = String(speed);
+    updateLiftSpeedLabels(speed);
+  });
+  document.getElementById("liftSpeedInput").addEventListener("change", async (event) => {
+    const speed = Number(event.target.value);
+    await sendLiftCommand({ action: "set_speed", speed });
+  });
+
+  const liftHeightSlider = document.getElementById("liftHeightSlider");
+  liftHeightSlider?.addEventListener("input", () => {
+    syncLiftTargetLabels();
+    const roof = document.getElementById("roofLiftHeightSlider");
+    if (roof) roof.value = liftHeightSlider.value;
+  });
+  document.getElementById("liftGoto")?.addEventListener("click", async () => {
+    await sendLiftGotoFromSlider("liftHeightSlider");
+  });
+  document.getElementById("liftSetRetractedZero")?.addEventListener("click", sendLiftSetRetractedZero);
+
+  document.querySelectorAll("[data-robot-input-mode]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await setRobotInputMode(button.dataset.robotInputMode);
+    });
+  });
+
+  window.addEventListener("keydown", (event) => {
+    if (event.repeat || isEditableTarget(event.target)) return;
+    // 机器狗键盘运动
+    const movement = ROBOT_KEY_MOVES[event.code];
+    if (movement) {
+      event.preventDefault();
+      // WASD/QE 在摇杆/键盘两种模式下都可控制机器狗
+      startRobotMoveInput(`key-${event.code}`, movement);
+      return;
+    }
+    // 狗载云台键盘控制
+    const dogPtzCommand = DOG_PTZ_KEY_COMMANDS[event.code];
+    if (dogPtzCommand) {
+      event.preventDefault();
+      if (state.robotInputMode !== "keyboard") return;
+      startPtzKeyboardCommand(dogPtzCommand);
+      return;
+    }
+    // 车顶云台键盘控制
+    const roofPtzCommand = ROOF_PTZ_KEY_COMMANDS[event.code];
+    if (roofPtzCommand) {
+      event.preventDefault();
+      if (state.robotInputMode !== "keyboard") return;
+      startRoofPtzKeyboardCommand(roofPtzCommand);
+      return;
+    }
+  });
+  window.addEventListener("keyup", (event) => {
+    // 机器狗键盘运动
+    const movement = ROBOT_KEY_MOVES[event.code];
+    if (movement) {
+      event.preventDefault();
+      stopRobotMoveInput(`key-${event.code}`, { reason: "key released" });
+      return;
+    }
+    // 狗载云台键盘控制
+    const dogPtzCommand = DOG_PTZ_KEY_COMMANDS[event.code];
+    if (dogPtzCommand) {
+      event.preventDefault();
+      if (state.robotInputMode !== "keyboard") return;
+      stopPtzKeyboardCommand(dogPtzCommand);
+      return;
+    }
+    // 车顶云台键盘控制
+    const roofPtzCommand = ROOF_PTZ_KEY_COMMANDS[event.code];
+    if (roofPtzCommand) {
+      event.preventDefault();
+      if (state.robotInputMode !== "keyboard") return;
+      stopRoofPtzKeyboardCommand(roofPtzCommand);
+      return;
+    }
+  });
+
+  bindRoofPtzControls();
+  bindRoofVideoPanel();
+  loadRoofPtzStatus();
+  loadRoofPtzLease();
+}
+
+// PTZ 键盘命令（与按钮 mousedown/mouseup 逻辑一致）
+async function startPtzKeyboardCommand(command) {
+  if (!state.device || state.activeCommand) return;
+  const button = document.querySelector(`[data-ptz-device="dog_ptz_1"] [data-command="${CSS.escape(command)}"]`);
+  if (!button || button.disabled) return;
+  try {
+    state.activeCommand = command;
+    button.classList.add("key-active");
+    startActiveRenewal();
+    await controlPostJson(`/api/devices/${state.device.id}/ptz/start`, { command, speed: 5 });
+  } catch (error) {
+    state.activeCommand = null;
+    stopActiveRenewal();
+    log("键盘云台控制失败", { command, error: error.message });
+  }
+}
+
+async function stopPtzKeyboardCommand(command) {
+  if (!state.device || state.activeCommand !== command) return;
+  state.activeCommand = null;
+  stopActiveRenewal();
+  document.querySelectorAll(".key-active").forEach((btn) => btn.classList.remove("key-active"));
+  try {
+    await controlPostJson(`/api/devices/${state.device.id}/ptz/stop`, { command, speed: 5 });
+  } catch (error) {
+    log("停止失败", { error: error.message });
+  }
+}
+
+async function startRoofPtzKeyboardCommand(command) {
+  if (state.roofPtzActiveCommand) return;
+  const button = document.querySelector(`[data-ptz-device="roof_ptz_1"] [data-command="${CSS.escape(command)}"]`);
+  if (!button || button.disabled) return;
+  try {
+    state.roofPtzActiveCommand = command;
+    button.classList.add("key-active");
+    await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/ptz/start`, { command, speed: 5 });
+  } catch (error) {
+    state.roofPtzActiveCommand = null;
+    button.classList.remove("key-active");
+    log("车顶云台键盘控制失败", { command, error: error.message });
+  }
+}
+
+async function stopRoofPtzKeyboardCommand(command) {
+  if (state.roofPtzActiveCommand !== command) return;
+  state.roofPtzActiveCommand = null;
+  document.querySelectorAll('[data-ptz-device="roof_ptz_1"] .key-active').forEach((btn) => btn.classList.remove("key-active"));
+  try {
+    await roofPtzControlPost(`/api/devices/${ROOF_PTZ_ID}/ptz/stop`, { command, speed: 5 });
+  } catch (error) {
+    log("车顶云台停止失败", { error: error.message });
+  }
+}
+
+async function setRobotInputMode(mode) {
+  const nextMode = mode === "keyboard" ? "keyboard" : "joystick";
+  if (state.robotInputMode === nextMode) return;
+  state.robotInputMode = nextMode;
+  await stopRobotMove({ reason: `robot input mode ${nextMode}`, quiet: true });
+  renderRobotInputMode();
+  updateVideoJoystickVisibility();
+}
+
+function renderRobotInputMode() {
+  document.querySelectorAll("[data-robot-input-mode]").forEach((button) => {
+    button.dataset.active = String(button.dataset.robotInputMode === state.robotInputMode);
+  });
+  const toggle = document.getElementById("robotInputModeToggle");
+  if (toggle) {
+    toggle.dataset.activeMode = state.robotInputMode;
+    toggle.title = state.robotInputMode === "keyboard" ? "当前为键盘模式，点击切换到摇杆" : "当前为摇杆模式，点击切换到键盘";
+  }
+}
+
+// 视频区悬浮摇杆管理
+const VIDEO_JOYSTICK_HIDE_DELAY = 1500;
+let videoJoystickHideTimer = null;
+let videoJoystickActive = false;
+
+function showVideoJoysticks() {
+  const overlay = document.getElementById("videoJoystickOverlay");
+  if (!overlay) return;
+  videoJoystickActive = true;
+  overlay.classList.add("active");
+  clearVideoJoystickHideTimer();
+}
+
+function scheduleVideoJoystickHide() {
+  clearVideoJoystickHideTimer();
+  videoJoystickHideTimer = setTimeout(() => {
+    if (!state.robotMove.activeInputs.size) {
+      const overlay = document.getElementById("videoJoystickOverlay");
+      if (overlay) overlay.classList.remove("active");
+      videoJoystickActive = false;
+    }
+  }, VIDEO_JOYSTICK_HIDE_DELAY);
+}
+
+function clearVideoJoystickHideTimer() {
+  if (videoJoystickHideTimer) {
+    clearTimeout(videoJoystickHideTimer);
+    videoJoystickHideTimer = null;
+  }
+}
+
+// 键盘模式下强制显示摇杆
+function updateVideoJoystickVisibility() {
+  const overlay = document.getElementById("videoJoystickOverlay");
+  if (!overlay) return;
+  if (state.robotInputMode === "keyboard") {
+    overlay.classList.add("active");
+    videoJoystickActive = true;
+    clearVideoJoystickHideTimer();
+  } else if (!state.robotMove.activeInputs.size) {
+    overlay.classList.remove("active");
+    videoJoystickActive = false;
+  }
+}
+
+function bindRobotJoysticks() {
+  // 视频区悬浮摇杆
+  const overlay = document.getElementById("videoJoystickOverlay");
+  if (overlay) {
+    // 触摸检测：pointermove 在视频区底部时显示摇杆
+    const videoWrap = document.getElementById("videoFrameWrap");
+    if (videoWrap) {
+      videoWrap.addEventListener("pointermove", (event) => {
+        const rect = videoWrap.getBoundingClientRect();
+        const relY = (event.clientY - rect.top) / rect.height;
+        // 手指在底部 35% 区域时显示摇杆
+        if (relY > 0.65) {
+          showVideoJoysticks();
+        } else if (videoJoystickActive && !state.robotMove.activeInputs.size) {
+          scheduleVideoJoystickHide();
+        }
+      });
+      videoWrap.addEventListener("pointerleave", () => {
+        if (!state.robotMove.activeInputs.size) scheduleVideoJoystickHide();
+      });
+    }
+
+    // 为悬浮摇杆绑定 pointer 事件
+    overlay.querySelectorAll(".video-joystick-zone").forEach((zone) => {
+      const joystickType = zone.dataset.zone === "left" ? "translate" : "rotate";
+      const inputId = `joystick-${joystickType}`;
+      const pad = zone.querySelector(".joystick-pad");
+      const knob = zone.querySelector(".joystick-knob");
+
+      const start = (event) => {
+        if (state.robotInputMode !== "joystick") return;
+        event.preventDefault();
+        showVideoJoysticks();
+        zone.setPointerCapture(event.pointerId);
+        updateOverlayJoystickInput(zone, pad, knob, event, inputId, joystickType);
+      };
+      const move = (event) => {
+        if (state.robotInputMode !== "joystick") return;
+        if (!zone.hasPointerCapture(event.pointerId)) return;
+        event.preventDefault();
+        updateOverlayJoystickInput(zone, pad, knob, event, inputId, joystickType);
+      };
+      const stop = (event) => {
+        event.preventDefault();
+        if (zone.hasPointerCapture(event.pointerId)) {
+          zone.releasePointerCapture(event.pointerId);
+        }
+        resetOverlayJoystickKnob(knob);
+        stopRobotMoveInput(inputId, { reason: "joystick released" });
+        scheduleVideoJoystickHide();
+      };
+      zone.addEventListener("pointerdown", start);
+      zone.addEventListener("pointermove", move);
+      zone.addEventListener("pointerup", stop);
+      zone.addEventListener("pointercancel", stop);
+      zone.addEventListener("lostpointercapture", () => {
+        resetOverlayJoystickKnob(knob);
+        stopRobotMoveInput(inputId, { reason: "joystick capture lost" });
+        scheduleVideoJoystickHide();
+      });
+    });
+
+  }
+
+  // 旧的右侧面板摇杆保留兼容（display:none 时不会触发）
+  document.querySelectorAll("[data-robot-joystick]").forEach((joystick) => {
+    const inputId = `joystick-${joystick.dataset.robotJoystick}`;
+    const start = (event) => {
+      if (state.robotInputMode !== "joystick") return;
+      event.preventDefault();
+      joystick.setPointerCapture(event.pointerId);
+      updateRobotJoystickInput(joystick, event, inputId);
+    };
+    const move = (event) => {
+      if (state.robotInputMode !== "joystick") return;
+      if (!joystick.hasPointerCapture(event.pointerId)) return;
+      event.preventDefault();
+      updateRobotJoystickInput(joystick, event, inputId);
+    };
+    const stop = (event) => {
+      event.preventDefault();
+      if (joystick.hasPointerCapture(event.pointerId)) {
+        joystick.releasePointerCapture(event.pointerId);
+      }
+      resetRobotJoystick(joystick);
+      stopRobotMoveInput(inputId, { reason: "joystick released" });
+    };
+    joystick.addEventListener("pointerdown", start);
+    joystick.addEventListener("pointermove", move);
+    joystick.addEventListener("pointerup", stop);
+    joystick.addEventListener("pointercancel", stop);
+    joystick.addEventListener("lostpointercapture", () => {
+      resetRobotJoystick(joystick);
+      stopRobotMoveInput(inputId, { reason: "joystick capture lost" });
+    });
+  });
+}
+
+function updateRobotJoystickInput(joystick, event, inputId) {
+  const pad = joystick.querySelector(".joystick-pad");
+  const knob = joystick.querySelector(".joystick-knob");
+  const rect = pad.getBoundingClientRect();
+  const radius = rect.width / 2;
+  const centerX = rect.left + radius;
+  const centerY = rect.top + radius;
+  let dx = (event.clientX - centerX) / radius;
+  let dy = (event.clientY - centerY) / radius;
+  const length = Math.hypot(dx, dy);
+  if (length > 1) {
+    dx /= length;
+    dy /= length;
+  }
+  setRobotJoystickKnob(joystick, dx, dy);
+
+  // The payload still uses the legacy frontend field names; render and protocol
+  // conversion expose them as M20 X/Y/Yaw so operators see the robot coordinate system.
+  const movement = joystick.dataset.robotJoystick === "rotate"
+    ? { x: 0, y: 0, rotation: applyJoystickDeadzone(dx) }
+    : { x: applyJoystickDeadzone(dx), y: applyJoystickDeadzone(-dy), rotation: 0 };
+  startRobotMoveInput(inputId, movement);
+}
+
+function applyJoystickDeadzone(value) {
+  return Math.abs(value) < 0.08 ? 0 : Number(value.toFixed(2));
+}
+
+// 悬浮摇杆输入处理
+function updateOverlayJoystickInput(zone, pad, knob, event, inputId, joystickType) {
+  const rect = pad.getBoundingClientRect();
+  const radius = rect.width / 2;
+  const centerX = rect.left + radius;
+  const centerY = rect.top + radius;
+  let dx = (event.clientX - centerX) / radius;
+  let dy = (event.clientY - centerY) / radius;
+  const length = Math.hypot(dx, dy);
+  if (length > 1) { dx /= length; dy /= length; }
+  setJoystickKnobByDeltas(knob, dx, dy);
+
+  const movement = joystickType === "rotate"
+    ? { x: 0, y: 0, rotation: applyJoystickDeadzone(dx) }
+    : { x: applyJoystickDeadzone(dx), y: applyJoystickDeadzone(-dy), rotation: 0 };
+  startRobotMoveInput(inputId, movement);
+}
+
+function resetOverlayJoystickKnob(knob) {
+  if (knob) knob.style.transform = "translate(0px, 0px)";
+}
+
+function setJoystickKnobByDeltas(knob, dx, dy) {
+  if (!knob) return;
+  const pad = knob.parentElement;
+  const radius = pad.getBoundingClientRect().width / 2;
+  const knobRange = Math.max(0, radius - knob.offsetWidth / 2 - 4);
+  knob.style.transform = `translate(${clampAxis(dx) * knobRange}px, ${clampAxis(dy) * knobRange}px)`;
+}
+
+function resetRobotJoystick(joystick) {
+  setRobotJoystickKnob(joystick, 0, 0);
+}
+
+function setRobotJoystickKnob(joystick, dx, dy) {
+  const pad = joystick.querySelector(".joystick-pad");
+  const knob = joystick.querySelector(".joystick-knob");
+  if (!pad || !knob) return;
+  const radius = pad.getBoundingClientRect().width / 2;
+  const knobRange = Math.max(0, radius - knob.offsetWidth / 2 - 4);
+  knob.style.transform = `translate(${clampAxis(dx) * knobRange}px, ${clampAxis(dy) * knobRange}px)`;
+}
+
+function isEditableTarget(target) {
+  if (!target) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+}
+
+async function sendRobotCommand(command) {
+  if (!state.robotDevice) return null;
+  if (command.action === "stop_move") {
+    await stopRobotMove({ reason: "manual stop" });
+    return null;
+  }
+  if (command.action !== "move") {
+    await stopRobotMove({ reason: `robot ${command.action}`, quiet: true });
+  }
+  if (command.action !== "soft_estop") {
+    await ensureRobotLease();
+  }
+  const result = await postJson(`/api/devices/${state.robotDevice.id}/robot/control`, command);
+  const operatorDirection = result.payload?.state?.operator_direction;
+  if (command.action === "direction_reverse" && operatorDirection) {
+    state.operatorDirection = operatorDirection;
+    await switchVideoForRobotDirection(operatorDirection);
+    if (state.videoLayout === VIDEO_LAYOUT_QUAD) {
+      quadVideoDeviceIds().forEach((deviceId) => {
+        const video = document.querySelector(`.video-frame[data-video-role="main"][data-video-device="${CSS.escape(deviceId)}"]`);
+        if (video) video.dataset.quadSlot = quadVideoSlot(deviceId);
+      });
+      renderQuadVideoLabels();
+    }
+    renderVideoDeviceList();
+  }
+  scheduleRobotStatusBurst();
+  return result;
+}
+
+async function startRobotMoveInput(inputId, movement) {
+  state.robotMove.activeInputs.set(inputId, movement);
+  await updateRobotMoveFromInputs();
+}
+
+async function stopRobotMoveInput(inputId, { reason = "input released" } = {}) {
+  state.robotMove.activeInputs.delete(inputId);
+  await updateRobotMoveFromInputs({ reason });
+}
+
+async function updateRobotMoveFromInputs({ reason = "inputs changed" } = {}) {
+  const movement = composeRobotMovement();
+  renderRobotMoveIntent(movement);
+  renderRobotJoystickFeedback(movement);
+  if (!movement) {
+    await stopRobotMove({ reason });
+    return;
+  }
+  await startRobotMove(movement);
+}
+
+function composeRobotMovement() {
+  if (!state.robotMove.activeInputs.size) return null;
+  const merged = { x: 0, y: 0, rotation: 0 };
+  state.robotMove.activeInputs.forEach((movement) => {
+    merged.x += movement.x || 0;
+    merged.y += movement.y || 0;
+    merged.rotation += movement.rotation || 0;
+  });
+  merged.x = clampAxis(merged.x);
+  merged.y = clampAxis(merged.y);
+  merged.rotation = clampAxis(merged.rotation);
+  if (!merged.x && !merged.y && !merged.rotation) return null;
+  return merged;
+}
+
+function clampAxis(value) {
+  return Math.max(-1, Math.min(1, value));
+}
+
+function renderRobotMoveIntent(movement, velocity = null, unknownRobotState = false) {
+  const target = document.getElementById("robotMoveIntent");
+  if (!target) return;
+  const actual = velocity || resolveRobotVelocity(state.robotStatus?.details || {}, movement || {});
+  const command = state.robotMove.active ? resolveRobotMoveIntentVelocity() : null;
+  if (unknownRobotState) {
+    target.textContent = "实际 X:未知 Y:未知 Yaw:未知";
+    return;
+  }
+  if (command) {
+    target.textContent = `指令 X:${formatLinearVelocity(command.x)}m/s Y:${formatLinearVelocity(command.y)}m/s Yaw:${formatAngularVelocity(command.yaw)}rad/s · 实际 X:${formatLinearVelocity(actual.x)}m/s Y:${formatLinearVelocity(actual.y)}m/s Yaw:${formatAngularVelocity(actual.yaw)}rad/s`;
+    return;
+  }
+  target.textContent = `实际 X:${formatLinearVelocity(actual.x)}m/s Y:${formatLinearVelocity(actual.y)}m/s Yaw:${formatAngularVelocity(actual.yaw)}rad/s`;
+}
+
+function renderRobotJoystickFeedback(movement) {
+  // 视频区悬浮摇杆
+  const overlay = document.getElementById("videoJoystickOverlay");
+  if (overlay) {
+    const leftZone = overlay.querySelector('[data-zone="left"]');
+    const rightZone = overlay.querySelector('[data-zone="right"]');
+    if (leftZone) {
+      const knob = leftZone.querySelector(".joystick-knob");
+      setJoystickKnobByDeltas(knob, movement?.x || 0, -(movement?.y || 0));
+    }
+    if (rightZone) {
+      const knob = rightZone.querySelector(".joystick-knob");
+      setJoystickKnobByDeltas(knob, movement?.rotation || 0, 0);
+    }
+  }
+  // 旧摇杆兼容（已隐藏但保留逻辑）
+  const translate = document.querySelector('[data-robot-joystick="translate"]');
+  const rotate = document.querySelector('[data-robot-joystick="rotate"]');
+  if (translate) setRobotJoystickKnob(translate, movement?.x || 0, -(movement?.y || 0));
+  if (rotate) setRobotJoystickKnob(rotate, movement?.rotation || 0, 0);
+}
+
+function resetAllRobotJoysticks() {
+  renderRobotJoystickFeedback(null);
+}
+
+async function startRobotMove(movement) {
+  if (!state.robotDevice) return;
+  const speedInput = document.getElementById("robotSpeedInput");
+  const speed = Number(speedInput?.value ?? state.robotStatus?.details?.speed ?? 0.3);
+  if (speed <= 0) {
+    log("机器狗速度为 0，请调高右侧速度滑条后再移动");
+    return;
+  }
+  if (!state.robotMove.active) {
+    try {
+      await ensureRobotLease();
+    } catch (error) {
+      log("机器狗控制权获取失败", { error: error.message });
+      return;
+    }
+
+    state.robotMove.active = true;
+    state.robotMove.timer = setInterval(sendRobotMoveTick, ROBOT_MOVE_INTENT_INTERVAL_MS);
+    state.robotMove.renewTimer = setInterval(() => {
+      ensureRobotLease().catch((error) => {
+        log("机器狗控制权续租失败", { error: error.message });
+        stopRobotMove({ reason: "robot lease renew failed" });
+      });
+    }, 2000);
+  }
+
+  state.robotMove.command = { action: "move", ...movement };
+  await sendRobotMoveTick();
+}
+
+async function sendRobotMoveTick() {
+  if (!state.robotMove.active || !state.robotMove.command || state.robotMove.inFlight || !state.robotDevice) return;
+  state.robotMove.inFlight = true;
+  try {
+    await postJson(`/api/devices/${state.robotDevice.id}/robot/control`, state.robotMove.command);
+    if (state.robotMove.active) {
+      renderRobotMoveIntent(state.robotMove.command, resolveRobotVelocity(state.robotStatus?.details || {}));
+    }
+  } catch (error) {
+    log("机器狗运动控制失败", { error: error.message });
+    await stopRobotMove({ reason: "robot move failed", quiet: true, waitForInFlight: false });
+  } finally {
+    state.robotMove.inFlight = false;
+  }
+}
+
+async function stopRobotMove({ reason = "stop", quiet = false, waitForInFlight = true } = {}) {
+  const wasActive = state.robotMove.active || state.robotMove.command;
+  state.robotMove.activeInputs.clear();
+  resetAllRobotJoysticks();
+  renderRobotMoveIntent(null);
+  clearRobotMoveTimers();
+  state.robotMove.active = false;
+  state.robotMove.command = null;
+  if (!state.robotDevice || state.robotMove.stopInFlight) return;
+  if (!wasActive && quiet) return;
+
+  if (waitForInFlight) {
+    await waitForRobotMoveIdle();
+  }
+
+  state.robotMove.stopInFlight = true;
+  try {
+    await postJson(`/api/devices/${state.robotDevice.id}/robot/control`, { action: "stop_move" });
+    if (!quiet) log("机器狗运动已归零", { reason });
+    scheduleRobotStatusBurst();
+  } catch (error) {
+    if (!quiet) log("机器狗归零失败", { reason, error: error.message });
+  } finally {
+    state.robotMove.stopInFlight = false;
+  }
+}
+
+async function waitForRobotMoveIdle(timeoutMs = 800) {
+  const startedAt = Date.now();
+  while (state.robotMove.inFlight && Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function clearRobotMoveTimers() {
+  if (state.robotMove.timer) {
+    clearInterval(state.robotMove.timer);
+    state.robotMove.timer = null;
+  }
+  if (state.robotMove.renewTimer) {
+    clearInterval(state.robotMove.renewTimer);
+    state.robotMove.renewTimer = null;
+  }
+}
+
+async function switchVideoForRobotDirection(direction) {
+  const targetId = direction === "rear" ? "m20_rear_camera" : "m20_front_camera";
+  const next = pickDevice(targetId);
+  if (!next?.video?.player_url) return;
+  if (state.videoLayout === VIDEO_LAYOUT_QUAD) {
+    setActiveMainVideoElement(next.id);
+    renderQuadVideoLabels();
+    log("机器狗操作视角已切换，四宫格已调整", { direction, device_id: next.id, name: next.name });
+    return;
+  }
+  await activateVideoDevice(next, { logSwitch: false });
+  log("机器狗操作视角已切换，主视频已切换", { direction, device_id: next.id, name: next.name });
+}
+
+async function ensureRobotLease() {
+  const lease = await getJson(`/api/devices/${state.robotDevice.id}/lease`);
+  if (lease.can_control) return lease;
+  return postJson(`/api/devices/${state.robotDevice.id}/lease/acquire`, {
+    holder_name: `操作员 ${state.clientId.slice(-4)}`,
+  });
+}
+
+const liftHoldControllers = new Set();
+
+function registerLiftHoldController(controller) {
+  liftHoldControllers.add(controller);
+}
+
+function resetLiftHoldControllers() {
+  liftHoldControllers.forEach((controller) => {
+    controller.engaged = false;
+    controller.token += 1;
+    if (controller.keepaliveTimer) {
+      clearTimeout(controller.keepaliveTimer);
+      controller.keepaliveTimer = null;
+    }
+  });
+}
+
+function bindLiftHoldButton(button, action) {
+  const controller = { engaged: false, starting: false, token: 0, keepaliveTimer: null };
+  registerLiftHoldController(controller);
+
+  const clearKeepalive = () => {
+    if (controller.keepaliveTimer) {
+      clearTimeout(controller.keepaliveTimer);
+      controller.keepaliveTimer = null;
+    }
+  };
+
+  const release = async (event) => {
+    event?.preventDefault();
+    if (!controller.engaged) return;
+    controller.engaged = false;
+    controller.token += 1;
+    clearKeepalive();
+    // 启动还在写寄存器时不要并发发 stop，否则 256 会插进使能/点动中间，杆几乎不动。
+    if (controller.starting) return;
+    try {
+      await sendLiftCommand({ action: "stop" });
+    } catch (error) {
+      log("升降杆停止失败", { action, error: error.message });
+    }
+  };
+
+  const engage = async (event) => {
+    event.preventDefault();
+    if (controller.engaged) return;
+    if (event.type === "mousedown" && event.button !== 0) return;
+    controller.engaged = true;
+    const token = controller.token;
+    controller.starting = true;
+    try {
+      await sendLiftCommand({ action });
+    } catch (error) {
+      if (token === controller.token) controller.engaged = false;
+      clearKeepalive();
+      log("升降杆点动启动失败", { action, error: error.message });
+      return;
+    } finally {
+      controller.starting = false;
+    }
+    if (!controller.engaged || token !== controller.token) {
+      try {
+        await sendLiftCommand({ action: "stop" });
+      } catch (error) {
+        log("升降杆停止失败", { action, error: error.message });
+      }
+      return;
+    }
+    const tick = async () => {
+      if (!controller.engaged || token !== controller.token) return;
+      try {
+        await sendLiftCommand({ action });
+      } catch (error) {
+        log("升降杆点动保持失败", { action, error: error.message });
+      }
+      if (controller.engaged && token === controller.token) {
+        controller.keepaliveTimer = setTimeout(tick, LIFT_JOG_KEEPALIVE_MS);
+      }
+    };
+    controller.keepaliveTimer = setTimeout(tick, LIFT_JOG_KEEPALIVE_MS);
+  };
+
+  button.addEventListener("mousedown", engage);
+  button.addEventListener("touchstart", engage, { passive: false });
+  button.addEventListener("mouseup", release);
+  button.addEventListener("mouseleave", release);
+  button.addEventListener("touchend", release, { passive: false });
+  button.addEventListener("touchcancel", release, { passive: false });
+}
+
+async function sendLiftStopCommand() {
+  resetLiftHoldControllers();
+  return sendLiftCommand({ action: "stop" });
+}
+
+async function sendLiftEstopCommand() {
+  resetLiftHoldControllers();
+  return sendLiftCommand({ action: "estop" });
+}
+
+async function sendLiftCommand(command) {
+  if (!state.liftDevice) return null;
+  if (command.action !== "stop") {
+    await ensureLiftLease();
+  }
+  const result = await postJson(`/api/devices/${state.liftDevice.id}/lift/control`, command);
+  setTimeout(loadLiftStatus, 150);
+  return result;
+}
+
+async function ensureLiftLease() {
+  const lease = await getJson(`/api/devices/${state.liftDevice.id}/lease`);
+  if (lease.can_control) return lease;
+  return postJson(`/api/devices/${state.liftDevice.id}/lease/acquire`, {
+    holder_name: `操作员 ${state.clientId.slice(-4)}`,
+  });
+}
+
+function toggleVideoFill() {
+  const wrap = document.getElementById("videoFrameWrap");
+  const button = document.getElementById("toggleVideoFill");
+  wrap.classList.toggle("fill");
+  const fill = wrap.classList.contains("fill");
+  button.textContent = fill ? "适应画面" : "填充画面";
+}
+
+function captureCurrentVideo() {
+  const video = document.querySelector(".video-frame[data-active=\"true\"]");
+  if (!video || !video.videoWidth || !video.videoHeight) {
+    log("截图失败", { error: "当前视频尚未输出画面" });
+    return;
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    log("截图失败", { error: "浏览器不支持 Canvas 截图" });
+    return;
+  }
+  try {
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const link = document.createElement("a");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    link.download = `patrol-${state.videoDevice?.id || "video"}-${timestamp}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+    log("截图已下载", { device_id: state.videoDevice?.id, file: link.download });
+  } catch (error) {
+    log("截图失败", { error: error.message });
+  }
+}
+
+function togglePresetSelection(button) {
+  const section = button.closest("[data-ptz-device]");
+  if (!section) return;
+  const active = button.dataset.active === "true";
+  section.querySelectorAll("[data-preset-select]").forEach((item) => {
+    item.dataset.active = "false";
+  });
+  const input = section.querySelector(".ptz-preset-input");
+  if (active) {
+    input.value = "";
+    return;
+  }
+  button.dataset.active = "true";
+  input.value = button.dataset.presetSelect;
+}
+
+function sendRobotStopKeepalive() {
+  if (!state.robotDevice) return;
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Patrol-Client-Id": state.clientId,
+  };
+  fetch(`/api/devices/${state.robotDevice.id}/robot/control`, {
+    method: "POST",
+    keepalive: true,
+    headers,
+    body: JSON.stringify({ action: "stop_move" }),
+  }).catch(() => {});
+  fetch(`/api/devices/${state.robotDevice.id}/lease/release`, {
+    method: "POST",
+    keepalive: true,
+    headers,
+    body: JSON.stringify({}),
+  }).catch(() => {});
+}
+
+try {
+  bindControls();
+} catch (error) {
+  console.error("bindControls error:", error);
+  log("初始化失败: bindControls", { error: error.message });
+}
+renderRobotInputMode();
+connectControlSocket();
+loadDeviceConfig()
+  .then(loadDevices)
+  .then(loadControlLogs)
+  .catch((error) => log("初始化失败", { error: error.message }));
+
+window.addEventListener("beforeunload", () => {
+  sendRobotStopKeepalive();
+  if (!state.device || !state.lease?.can_control) return;
+  fetch(`/api/devices/${state.device.id}/lease/release`, {
+    method: "POST",
+    keepalive: true,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Patrol-Client-Id": state.clientId,
+    },
+    body: JSON.stringify({}),
+  });
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopRobotMove({ reason: "page hidden" });
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  sendRobotStopKeepalive();
+});

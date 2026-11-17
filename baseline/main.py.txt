@@ -1,0 +1,4003 @@
+from __future__ import annotations
+
+import os
+import json
+import asyncio
+import itertools
+import struct
+import contextlib
+import time
+from datetime import datetime, timedelta, timezone
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
+
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from backend.app.lift_modbus import (
+    CM_PER_REV,
+    LiftFollowingError,
+    ModbusRtuError,
+    OukeServoLiftClient,
+    PULSES_PER_REV,
+    decode_pob04_status_word,
+    cm_to_pulse,
+    display_pulse,
+    drive_target_from_cm,
+    format_alarm_code,
+    format_pob04_status_word,
+    height_cm_from_raw,
+    jog_direction_blocked,
+    lift_jog_stall_should_stop,
+    position_reference_should_invalidate,
+    pulse_to_cm,
+)
+from backend.app import bridge as central_bridge
+from backend.app.bridge import is_central_holder_name, lease_role_for_holder
+
+
+ROOT = Path(__file__).resolve().parents[2]
+FRONTEND_DIR = ROOT / "frontend"
+DEFAULT_CONFIG_PATH = ROOT / "config" / "device.jsonc"
+LEGACY_CONFIG_PATH = ROOT / "config" / "device.json"
+CONFIG_PATH = Path(os.getenv("PATROL_CONFIG_PATH") or DEFAULT_CONFIG_PATH)
+
+
+CONFIG_COMMENTS: Dict[str, str] = {
+    "dog_ptz_dry_run": "狗载云台控制是否使用 dry-run 模式；true 表示不连接真实设备。",
+    "dog_ptz_host": "狗载云台 IP 地址。",
+    "dog_ptz_onvif_port": "狗载云台 ONVIF 服务端口。",
+    "dog_ptz_isapi_channel": "狗载云台 ISAPI 通道号。",
+    "dog_ptz_aux_light_id": "狗载云台补光灯/辅助灯编号。",
+    "dog_ptz_supplement_light_mode": "狗载云台补光灯模式。",
+    "dog_ptz_supplement_light_brightness": "狗载云台补光灯亮度，范围 0-100。",
+    "dog_ptz_user": "狗载云台登录用户名。",
+    "dog_ptz_password": "狗载云台登录密码。",
+    "dog_ptz_video_enabled": "是否启用狗载云台视频流。",
+    "mediamtx_public_base": "MediaMTX 对前端暴露的 HTTP 基础地址。",
+    "m20_host": "山猫 M20 机器人 IP 地址。",
+    "m20_tcp_port": "山猫 M20 控制 TCP 端口。",
+    "m20_udp_port": "山猫 M20 状态 UDP 端口。",
+    "m20_dry_run": "山猫 M20 控制是否使用 dry-run 模式。",
+    "m20_front_video_enabled": "是否启用山猫 M20 前视视频。",
+    "m20_rear_video_enabled": "是否启用山猫 M20 后视视频。",
+    "m20_front_rtsp": "山猫 M20 前视 RTSP 地址。",
+    "m20_rear_rtsp": "山猫 M20 后视 RTSP 地址。",
+    "roof_ptz_dry_run": "车顶云台控制是否使用 dry-run 模式。",
+    "roof_ptz_host": "车顶云台 IP 地址。",
+    "roof_ptz_onvif_port": "车顶云台 ONVIF 服务端口。",
+    "roof_ptz_isapi_channel": "车顶云台 ISAPI 通道号。",
+    "roof_ptz_aux_light_id": "车顶云台补光灯/辅助灯编号。",
+    "roof_ptz_supplement_light_mode": "车顶云台补光灯模式。",
+    "roof_ptz_supplement_light_brightness": "车顶云台补光灯亮度，范围 0-100。",
+    "roof_ptz_user": "车顶云台登录用户名。",
+    "roof_ptz_password": "车顶云台登录密码。",
+    "roof_ptz_video_enabled": "是否启用车顶云台视频流。",
+    "lift_dry_run": "升降杆控制是否使用 dry-run 模式；false 时进入真实 RTU-over-TCP 适配层。",
+    "lift_host": "USR-TCP232-306 串口服务器 IP 地址。",
+    "lift_port": "USR-TCP232-306 TCP Server 本地端口，现场配置为 8899。",
+    "lift_slave_id": "欧克伺服驱动 Modbus RTU 站号。",
+    "lift_timeout_s": "升降杆 RTU-over-TCP 单次请求超时时间，单位秒。",
+    "lift_poll_interval_ms": "升降杆真实状态轮询周期，单位毫秒。",
+    "lift_travel_height": "升降杆可伸出行程（cm），现场约 180（1.8m），用于目标高度百分比换算。",
+    "lift_base_height_cm": "皮卡车厢/安装面离地高度（cm）。已填写时界面显示总高=车厢离地+升降伸出；未填写时只显示伸出高度。",
+    "lift_jog_deadman_s": "升降杆点动超时自停（秒）。up/down 后若该时间内未再收到点动指令，车端自行停止；0 表示关闭。goto/max/min/set_speed 不受此约束。",
+    "lift_position_zero_pulse": "升降杆收回零点（驱动器原始脉冲）。仅在杆已完全收到底后由本地「设为零点」写入；显示高度与 goto 均相对该偏移。系统参数页保存配置时会保留此值。",
+    "lift_position_trusted": "升降杆位置计数是否可用于到位。收到底并设为零点后为 true；编码器计数大幅跳变后变为 false。系统参数页保存配置时会保留此值。",
+    "lift_last_raw_pulse": "最近一次可信的驱动器原始脉冲，用于发现断电后计数归零。系统参数页保存配置时会保留此值。",
+    "lift_max_pp_speed_pr_s": "PP 位置模式最大速度（Pr/s）；100000≈600r/min。",
+    "lift_max_pv_speed_pr_s": "PV 点动最大速度（Pr/s）；100000≈600r/min。",
+    "lift_min_pp_speed_pr_s": "PP 位置模式最低速度（Pr/s），防止滑条过低导致不动。",
+    "lift_min_pv_speed_pr_s": "PV 速度模式最低速度（Pr/s），防止滑条过低导致不动。",
+    "lift_max_single_move_pulse": "单次 PP 相对位移脉冲上限，防止一次写入过大。",
+    "lift_position_tolerance_pulse": "位置反馈变化小于该阈值时视为停止。",
+    "lift_min_pulse": "已废弃，保留兼容；高度由 POB-07 反馈位置与行程公式换算。",
+    "lift_max_pulse": "已废弃，保留兼容。",
+    "lift_jog_step_pulse": "已废弃，保留兼容；点动改用 PV 速度模式。",
+    "lift_jog_interval_ms": "已废弃，保留兼容。",
+    "lift_jog_min_interval_ms": "已废弃，保留兼容。",
+    "lift_jog_max_step_pulse": "已废弃，保留兼容。",
+    "settings_password": "配置页面密码；空字符串表示不启用密码保护。",
+    "bridge_enabled": "是否启用集中监控平台 Bridge API（/api/bridge/v1）。",
+    "bridge_token": "Bridge 鉴权令牌；请求头 X-Patrol-Bridge-Token 或 Bearer。生产环境必填。",
+    "bridge_rtsp_public_base": "对外广告的 RTSP 基址，如 rtsp://vpn-host:8554；空则从 mediamtx_public_base 推导。",
+    "bridge_mqtt_enabled": "是否向 MQTT 周期发布机器狗/升降状态。",
+    "bridge_mqtt_host": "MQTT broker 主机。",
+    "bridge_mqtt_port": "MQTT broker 端口。",
+    "bridge_mqtt_topic_prefix": "MQTT 主题前缀，如 patrol/vehicle1。",
+    "bridge_mqtt_username": "MQTT 用户名，可空。",
+    "bridge_mqtt_password": "MQTT 密码，可空。",
+    "bridge_mqtt_interval_s": "MQTT 发布周期（秒）。",
+}
+
+
+def strip_json_comments(text: str) -> str:
+    result: List[str] = []
+    in_string = False
+    escaped = False
+    in_line_comment = False
+    in_block_comment = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+
+        if in_line_comment:
+            if char in "\r\n":
+                in_line_comment = False
+                result.append(char)
+            index += 1
+            continue
+
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                index += 2
+            else:
+                if char in "\r\n":
+                    result.append(char)
+                index += 1
+            continue
+
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            in_line_comment = True
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            in_block_comment = True
+            index += 2
+            continue
+
+        result.append(char)
+        index += 1
+
+    return "".join(result)
+
+
+def read_config_file(path: Path) -> Dict[str, Any]:
+    raw = path.read_text(encoding="utf-8")
+    return json.loads(strip_json_comments(raw))
+
+
+def render_jsonc_config(payload: Dict[str, Any]) -> str:
+    lines = ["{"]
+    items = list(payload.items())
+    for index, (key, value) in enumerate(items):
+        comment = CONFIG_COMMENTS.get(key)
+        if comment:
+            lines.append(f"  // {comment}")
+        suffix = "," if index < len(items) - 1 else ""
+        encoded_key = json.dumps(key, ensure_ascii=False)
+        encoded_value = json.dumps(value, ensure_ascii=False)
+        lines.append(f"  {encoded_key}: {encoded_value}{suffix}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+class Settings(BaseModel):
+    dog_ptz_dry_run: bool = Field(default=True)
+    dog_ptz_host: str = Field(default="10.21.31.64")
+    dog_ptz_onvif_port: int = Field(default=80, ge=1, le=65535)
+    dog_ptz_isapi_channel: int = Field(default=1, ge=1)
+    dog_ptz_aux_light_id: int = Field(default=1, ge=1)
+    dog_ptz_supplement_light_mode: str = Field(default="colorVuWhiteLight")
+    dog_ptz_supplement_light_brightness: int = Field(default=100, ge=0, le=100)
+    dog_ptz_user: str = Field(default="admin")
+    dog_ptz_password: str = Field(default="okwy1234")
+    dog_ptz_video_enabled: bool = Field(default=True)
+    mediamtx_public_base: str = Field(default="http://localhost:8889")
+    m20_host: str = Field(default="10.21.31.103")
+    m20_tcp_port: int = Field(default=30001, ge=1, le=65535)
+    m20_udp_port: int = Field(default=30000, ge=1, le=65535)
+    m20_dry_run: bool = Field(default=True)
+    m20_front_video_enabled: bool = Field(default=True)
+    m20_rear_video_enabled: bool = Field(default=True)
+    m20_front_rtsp: str = Field(default="rtsp://10.21.31.103:8554/video1")
+    m20_rear_rtsp: str = Field(default="rtsp://10.21.31.103:8554/video2")
+    # 车顶云台（默认值与狗载云台相同，IP 可独立配置）
+    roof_ptz_dry_run: bool = Field(default=True)
+    roof_ptz_host: str = Field(default="10.21.31.64")
+    roof_ptz_onvif_port: int = Field(default=80, ge=1, le=65535)
+    roof_ptz_isapi_channel: int = Field(default=1, ge=1)
+    roof_ptz_aux_light_id: int = Field(default=1, ge=1)
+    roof_ptz_supplement_light_mode: str = Field(default="colorVuWhiteLight")
+    roof_ptz_supplement_light_brightness: int = Field(default=100, ge=0, le=100)
+    roof_ptz_user: str = Field(default="admin")
+    roof_ptz_password: str = Field(default="okwy1234")
+    roof_ptz_video_enabled: bool = Field(default=False)
+    # 升降杆
+    lift_dry_run: bool = Field(default=True)
+    lift_host: str = Field(default="10.21.31.15")
+    lift_port: int = Field(default=8899, ge=1, le=65535)
+    lift_slave_id: int = Field(default=1, ge=1, le=247)
+    lift_timeout_s: float = Field(default=1.0, gt=0, le=10)
+    lift_poll_interval_ms: int = Field(default=1000, ge=200, le=10000)
+    lift_travel_height: float = Field(default=180.0, gt=0)
+    lift_base_height_cm: Optional[float] = Field(default=None, ge=0)
+    lift_jog_deadman_s: float = Field(default=1.0, ge=0, le=10)
+    lift_position_zero_pulse: int = Field(default=0)
+    lift_position_trusted: bool = Field(default=False)
+    lift_last_raw_pulse: Optional[int] = Field(default=None)
+    lift_max_pp_speed_pr_s: int = Field(default=100_000, ge=1)
+    lift_max_pv_speed_pr_s: int = Field(default=100_000, ge=1)
+    lift_min_pp_speed_pr_s: int = Field(default=3000, ge=1)
+    lift_min_pv_speed_pr_s: int = Field(default=3000, ge=1)
+    lift_max_single_move_pulse: int = Field(default=2_860_000, ge=1)
+    lift_position_tolerance_pulse: int = Field(default=20, ge=0)
+    lift_min_pulse: Optional[int] = Field(default=None)
+    lift_max_pulse: Optional[int] = Field(default=None)
+    lift_jog_step_pulse: int = Field(default=200, ge=1)
+    lift_jog_interval_ms: int = Field(default=200, ge=1)
+    lift_jog_min_interval_ms: int = Field(default=80, ge=20, le=1000)
+    lift_jog_max_step_pulse: int = Field(default=2000, ge=1)
+    # 系统
+    settings_password: str = Field(default="")
+    # 集中监控平台桥
+    bridge_enabled: bool = Field(default=False)
+    bridge_token: str = Field(default="")
+    bridge_rtsp_public_base: str = Field(default="")
+    bridge_mqtt_enabled: bool = Field(default=False)
+    bridge_mqtt_host: str = Field(default="127.0.0.1")
+    bridge_mqtt_port: int = Field(default=1883, ge=1, le=65535)
+    bridge_mqtt_topic_prefix: str = Field(default="patrol/vehicle1")
+    bridge_mqtt_username: str = Field(default="")
+    bridge_mqtt_password: str = Field(default="")
+    bridge_mqtt_interval_s: float = Field(default=5.0, ge=1.0, le=300.0)
+
+    @classmethod
+    def load(cls) -> "Settings":
+        values: Dict[str, Any] = {}
+        read_path = CONFIG_PATH
+        if not read_path.exists() and os.getenv("PATROL_CONFIG_PATH") is None and LEGACY_CONFIG_PATH.exists():
+            read_path = LEGACY_CONFIG_PATH
+
+        if read_path.exists():
+            try:
+                values.update(read_config_file(read_path))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid config file: {read_path}") from exc
+
+        cls._migrate_legacy_values(values)
+
+        env_values = {
+            "dog_ptz_dry_run": os.getenv("PATROL_DOG_PTZ_DRY_RUN") or os.getenv("PATROL_DRY_RUN"),
+            "dog_ptz_host": os.getenv("PATROL_DOG_PTZ_HOST") or os.getenv("PATROL_DEVICE_HOST"),
+            "dog_ptz_onvif_port": os.getenv("PATROL_DOG_PTZ_ONVIF_PORT") or os.getenv("PATROL_ONVIF_PORT"),
+            "dog_ptz_isapi_channel": os.getenv("PATROL_DOG_PTZ_ISAPI_CHANNEL") or os.getenv("PATROL_ISAPI_CHANNEL"),
+            "dog_ptz_aux_light_id": os.getenv("PATROL_DOG_PTZ_AUX_LIGHT_ID") or os.getenv("PATROL_PTZ_AUX_LIGHT_ID"),
+            "dog_ptz_supplement_light_mode": os.getenv("PATROL_DOG_PTZ_SUPPLEMENT_LIGHT_MODE") or os.getenv("PATROL_SUPPLEMENT_LIGHT_MODE"),
+            "dog_ptz_supplement_light_brightness": os.getenv("PATROL_DOG_PTZ_SUPPLEMENT_LIGHT_BRIGHTNESS") or os.getenv("PATROL_SUPPLEMENT_LIGHT_BRIGHTNESS"),
+            "dog_ptz_user": os.getenv("PATROL_DOG_PTZ_USER") or os.getenv("PATROL_DEVICE_USER"),
+            "dog_ptz_password": os.getenv("PATROL_DOG_PTZ_PASSWORD") or os.getenv("PATROL_DEVICE_PASSWORD"),
+            "dog_ptz_video_enabled": os.getenv("PATROL_DOG_PTZ_VIDEO_ENABLED"),
+            "mediamtx_public_base": os.getenv("PATROL_MEDIAMTX_PUBLIC_BASE"),
+            "m20_host": os.getenv("PATROL_M20_HOST"),
+            "m20_tcp_port": os.getenv("PATROL_M20_TCP_PORT"),
+            "m20_udp_port": os.getenv("PATROL_M20_UDP_PORT"),
+            "m20_dry_run": os.getenv("PATROL_M20_DRY_RUN"),
+            "m20_front_video_enabled": os.getenv("PATROL_M20_FRONT_VIDEO_ENABLED"),
+            "m20_rear_video_enabled": os.getenv("PATROL_M20_REAR_VIDEO_ENABLED"),
+            "m20_front_rtsp": os.getenv("PATROL_M20_FRONT_RTSP"),
+            "m20_rear_rtsp": os.getenv("PATROL_M20_REAR_RTSP"),
+            "roof_ptz_dry_run": os.getenv("PATROL_ROOF_PTZ_DRY_RUN"),
+            "roof_ptz_host": os.getenv("PATROL_ROOF_PTZ_HOST"),
+            "roof_ptz_onvif_port": os.getenv("PATROL_ROOF_PTZ_ONVIF_PORT"),
+            "roof_ptz_isapi_channel": os.getenv("PATROL_ROOF_PTZ_ISAPI_CHANNEL"),
+            "roof_ptz_aux_light_id": os.getenv("PATROL_ROOF_PTZ_AUX_LIGHT_ID"),
+            "roof_ptz_supplement_light_mode": os.getenv("PATROL_ROOF_PTZ_SUPPLEMENT_LIGHT_MODE"),
+            "roof_ptz_supplement_light_brightness": os.getenv("PATROL_ROOF_PTZ_SUPPLEMENT_LIGHT_BRIGHTNESS"),
+            "roof_ptz_user": os.getenv("PATROL_ROOF_PTZ_USER"),
+            "roof_ptz_password": os.getenv("PATROL_ROOF_PTZ_PASSWORD"),
+            "roof_ptz_video_enabled": os.getenv("PATROL_ROOF_PTZ_VIDEO_ENABLED"),
+            "lift_dry_run": os.getenv("PATROL_LIFT_DRY_RUN"),
+            "lift_host": os.getenv("PATROL_LIFT_HOST"),
+            "lift_port": os.getenv("PATROL_LIFT_PORT"),
+            "lift_slave_id": os.getenv("PATROL_LIFT_SLAVE_ID"),
+            "lift_timeout_s": os.getenv("PATROL_LIFT_TIMEOUT_S"),
+            "lift_poll_interval_ms": os.getenv("PATROL_LIFT_POLL_INTERVAL_MS"),
+            "lift_travel_height": os.getenv("PATROL_LIFT_TRAVEL_HEIGHT"),
+            "lift_base_height_cm": os.getenv("PATROL_LIFT_BASE_HEIGHT_CM"),
+            "lift_jog_deadman_s": os.getenv("PATROL_LIFT_JOG_DEADMAN_S"),
+            "lift_position_zero_pulse": os.getenv("PATROL_LIFT_POSITION_ZERO_PULSE"),
+            "lift_position_trusted": os.getenv("PATROL_LIFT_POSITION_TRUSTED"),
+            "lift_last_raw_pulse": os.getenv("PATROL_LIFT_LAST_RAW_PULSE"),
+            "lift_max_pp_speed_pr_s": os.getenv("PATROL_LIFT_MAX_PP_SPEED_PR_S"),
+            "lift_max_pv_speed_pr_s": os.getenv("PATROL_LIFT_MAX_PV_SPEED_PR_S"),
+            "lift_min_pp_speed_pr_s": os.getenv("PATROL_LIFT_MIN_PP_SPEED_PR_S"),
+            "lift_min_pv_speed_pr_s": os.getenv("PATROL_LIFT_MIN_PV_SPEED_PR_S"),
+            "lift_max_single_move_pulse": os.getenv("PATROL_LIFT_MAX_SINGLE_MOVE_PULSE"),
+            "lift_position_tolerance_pulse": os.getenv("PATROL_LIFT_POSITION_TOLERANCE_PULSE"),
+            "lift_min_pulse": os.getenv("PATROL_LIFT_MIN_PULSE"),
+            "lift_max_pulse": os.getenv("PATROL_LIFT_MAX_PULSE"),
+            "lift_jog_step_pulse": os.getenv("PATROL_LIFT_JOG_STEP_PULSE"),
+            "lift_jog_interval_ms": os.getenv("PATROL_LIFT_JOG_INTERVAL_MS"),
+            "lift_jog_min_interval_ms": os.getenv("PATROL_LIFT_JOG_MIN_INTERVAL_MS"),
+            "lift_jog_max_step_pulse": os.getenv("PATROL_LIFT_JOG_MAX_STEP_PULSE"),
+            "settings_password": os.getenv("PATROL_SETTINGS_PASSWORD"),
+            "bridge_enabled": os.getenv("PATROL_BRIDGE_ENABLED"),
+            "bridge_token": os.getenv("PATROL_BRIDGE_TOKEN"),
+            "bridge_rtsp_public_base": os.getenv("PATROL_BRIDGE_RTSP_PUBLIC_BASE"),
+            "bridge_mqtt_enabled": os.getenv("PATROL_BRIDGE_MQTT_ENABLED"),
+            "bridge_mqtt_host": os.getenv("PATROL_BRIDGE_MQTT_HOST"),
+            "bridge_mqtt_port": os.getenv("PATROL_BRIDGE_MQTT_PORT"),
+            "bridge_mqtt_topic_prefix": os.getenv("PATROL_BRIDGE_MQTT_TOPIC_PREFIX"),
+            "bridge_mqtt_username": os.getenv("PATROL_BRIDGE_MQTT_USERNAME"),
+            "bridge_mqtt_password": os.getenv("PATROL_BRIDGE_MQTT_PASSWORD"),
+            "bridge_mqtt_interval_s": os.getenv("PATROL_BRIDGE_MQTT_INTERVAL_S"),
+        }
+        for key, value in env_values.items():
+            if value is not None:
+                values[key] = value
+
+        for bool_key in (
+            "dog_ptz_dry_run",
+            "dog_ptz_video_enabled",
+            "m20_dry_run",
+            "m20_front_video_enabled",
+            "m20_rear_video_enabled",
+            "roof_ptz_dry_run",
+            "roof_ptz_video_enabled",
+            "lift_dry_run",
+            "lift_position_trusted",
+            "bridge_enabled",
+            "bridge_mqtt_enabled",
+        ):
+            if bool_key in values and isinstance(values[bool_key], str):
+                values[bool_key] = values[bool_key].lower() != "false"
+        if "lift_base_height_cm" in values:
+            raw_base = values.get("lift_base_height_cm")
+            if raw_base is None or (isinstance(raw_base, str) and not raw_base.strip()):
+                values["lift_base_height_cm"] = None
+
+        settings = cls(**values)
+        if not settings.lift_host.strip():
+            settings.lift_host = "10.21.31.15"
+        if not CONFIG_PATH.exists():
+            write_config_file(settings)
+        else:
+            # 补齐新增字段到配置文件
+            current = read_config_file(CONFIG_PATH)
+            current.pop("_comments", None)
+            defaults = settings.public_payload()
+            missing = {k: v for k, v in defaults.items() if k not in current}
+            if missing:
+                current.update(missing)
+                CONFIG_PATH.write_text(render_config_text(current), encoding="utf-8")
+        return settings
+
+    def public_payload(self) -> Dict[str, Any]:
+        return {
+            "dog_ptz_dry_run": self.dog_ptz_dry_run,
+            "dog_ptz_host": self.dog_ptz_host,
+            "dog_ptz_onvif_port": self.dog_ptz_onvif_port,
+            "dog_ptz_isapi_channel": self.dog_ptz_isapi_channel,
+            "dog_ptz_aux_light_id": self.dog_ptz_aux_light_id,
+            "dog_ptz_supplement_light_mode": self.dog_ptz_supplement_light_mode,
+            "dog_ptz_supplement_light_brightness": self.dog_ptz_supplement_light_brightness,
+            "dog_ptz_user": self.dog_ptz_user,
+            "dog_ptz_password": self.dog_ptz_password,
+            "dog_ptz_video_enabled": self.dog_ptz_video_enabled,
+            "mediamtx_public_base": self.mediamtx_public_base,
+            "m20_host": self.m20_host,
+            "m20_tcp_port": self.m20_tcp_port,
+            "m20_udp_port": self.m20_udp_port,
+            "m20_dry_run": self.m20_dry_run,
+            "m20_front_video_enabled": self.m20_front_video_enabled,
+            "m20_rear_video_enabled": self.m20_rear_video_enabled,
+            "m20_front_rtsp": self.m20_front_rtsp,
+            "m20_rear_rtsp": self.m20_rear_rtsp,
+            "roof_ptz_dry_run": self.roof_ptz_dry_run,
+            "roof_ptz_host": self.roof_ptz_host,
+            "roof_ptz_onvif_port": self.roof_ptz_onvif_port,
+            "roof_ptz_isapi_channel": self.roof_ptz_isapi_channel,
+            "roof_ptz_aux_light_id": self.roof_ptz_aux_light_id,
+            "roof_ptz_supplement_light_mode": self.roof_ptz_supplement_light_mode,
+            "roof_ptz_supplement_light_brightness": self.roof_ptz_supplement_light_brightness,
+            "roof_ptz_user": self.roof_ptz_user,
+            "roof_ptz_password": self.roof_ptz_password,
+            "roof_ptz_video_enabled": self.roof_ptz_video_enabled,
+            "lift_dry_run": self.lift_dry_run,
+            "lift_host": self.lift_host,
+            "lift_port": self.lift_port,
+            "lift_slave_id": self.lift_slave_id,
+            "lift_timeout_s": self.lift_timeout_s,
+            "lift_poll_interval_ms": self.lift_poll_interval_ms,
+            "lift_travel_height": self.lift_travel_height,
+            "lift_base_height_cm": self.lift_base_height_cm,
+            "lift_jog_deadman_s": self.lift_jog_deadman_s,
+            "lift_position_zero_pulse": self.lift_position_zero_pulse,
+            "lift_position_trusted": self.lift_position_trusted,
+            "lift_last_raw_pulse": self.lift_last_raw_pulse,
+            "lift_max_pp_speed_pr_s": self.lift_max_pp_speed_pr_s,
+            "lift_max_pv_speed_pr_s": self.lift_max_pv_speed_pr_s,
+            "lift_min_pp_speed_pr_s": self.lift_min_pp_speed_pr_s,
+            "lift_min_pv_speed_pr_s": self.lift_min_pv_speed_pr_s,
+            "lift_max_single_move_pulse": self.lift_max_single_move_pulse,
+            "lift_position_tolerance_pulse": self.lift_position_tolerance_pulse,
+            "lift_min_pulse": self.lift_min_pulse,
+            "lift_max_pulse": self.lift_max_pulse,
+            "lift_jog_step_pulse": self.lift_jog_step_pulse,
+            "lift_jog_interval_ms": self.lift_jog_interval_ms,
+            "lift_jog_min_interval_ms": self.lift_jog_min_interval_ms,
+            "lift_jog_max_step_pulse": self.lift_jog_max_step_pulse,
+            "settings_password": self.settings_password,
+            "bridge_enabled": self.bridge_enabled,
+            "bridge_token": self.bridge_token,
+            "bridge_rtsp_public_base": self.bridge_rtsp_public_base,
+            "bridge_mqtt_enabled": self.bridge_mqtt_enabled,
+            "bridge_mqtt_host": self.bridge_mqtt_host,
+            "bridge_mqtt_port": self.bridge_mqtt_port,
+            "bridge_mqtt_topic_prefix": self.bridge_mqtt_topic_prefix,
+            "bridge_mqtt_username": self.bridge_mqtt_username,
+            "bridge_mqtt_password": self.bridge_mqtt_password,
+            "bridge_mqtt_interval_s": self.bridge_mqtt_interval_s,
+        }
+
+    def save(self) -> None:
+        write_config_file(self)
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        # Backward-compatible alias for older scripts/imports.
+        return cls.load()
+
+    @staticmethod
+    def _migrate_legacy_values(values: Dict[str, Any]) -> None:
+        legacy_map = {
+            "dry_run": "dog_ptz_dry_run",
+            "device_host": "dog_ptz_host",
+            "onvif_port": "dog_ptz_onvif_port",
+            "isapi_channel": "dog_ptz_isapi_channel",
+            "ptz_aux_light_id": "dog_ptz_aux_light_id",
+            "supplement_light_mode": "dog_ptz_supplement_light_mode",
+            "supplement_light_brightness": "dog_ptz_supplement_light_brightness",
+            "device_user": "dog_ptz_user",
+            "device_password": "dog_ptz_password",
+        }
+        for legacy_key, current_key in legacy_map.items():
+            if current_key not in values and legacy_key in values:
+                values[current_key] = values[legacy_key]
+        if "lift_position_trusted" not in values:
+            values["lift_position_trusted"] = bool(int(values.get("lift_position_zero_pulse") or 0))
+
+    @property
+    def dry_run(self) -> bool:
+        return self.dog_ptz_dry_run
+
+    @property
+    def device_host(self) -> str:
+        return self.dog_ptz_host
+
+    @property
+    def onvif_port(self) -> int:
+        return self.dog_ptz_onvif_port
+
+    @property
+    def isapi_channel(self) -> int:
+        return self.dog_ptz_isapi_channel
+
+    @property
+    def ptz_aux_light_id(self) -> int:
+        return self.dog_ptz_aux_light_id
+
+    @property
+    def supplement_light_mode(self) -> str:
+        return self.dog_ptz_supplement_light_mode
+
+    @property
+    def supplement_light_brightness(self) -> int:
+        return self.dog_ptz_supplement_light_brightness
+
+    @property
+    def device_user(self) -> str:
+        return self.dog_ptz_user
+
+    @property
+    def device_password(self) -> str:
+        return self.dog_ptz_password
+
+
+class DeviceConfigUpdate(BaseModel):
+    dog_ptz_dry_run: bool = Field(default=True)
+    dog_ptz_host: str = Field(min_length=1)
+    dog_ptz_onvif_port: int = Field(default=80, ge=1, le=65535)
+    dog_ptz_isapi_channel: int = Field(default=1, ge=1)
+    dog_ptz_aux_light_id: int = Field(default=1, ge=1)
+    dog_ptz_supplement_light_mode: str = Field(default="colorVuWhiteLight", min_length=1)
+    dog_ptz_supplement_light_brightness: int = Field(default=100, ge=0, le=100)
+    dog_ptz_user: str = Field(min_length=1)
+    dog_ptz_password: str = Field(min_length=1)
+    dog_ptz_video_enabled: bool = Field(default=True)
+    mediamtx_public_base: str = Field(min_length=1)
+    m20_host: str = Field(default="10.21.31.103", min_length=1)
+    m20_tcp_port: int = Field(default=30001, ge=1, le=65535)
+    m20_udp_port: int = Field(default=30000, ge=1, le=65535)
+    m20_dry_run: bool = Field(default=True)
+    m20_front_video_enabled: bool = Field(default=True)
+    m20_rear_video_enabled: bool = Field(default=True)
+    m20_front_rtsp: str = Field(default="rtsp://10.21.31.103:8554/video1", min_length=1)
+    m20_rear_rtsp: str = Field(default="rtsp://10.21.31.103:8554/video2", min_length=1)
+    roof_ptz_dry_run: bool = Field(default=True)
+    roof_ptz_host: str = Field(default="10.21.31.64")
+    roof_ptz_onvif_port: int = Field(default=80, ge=1, le=65535)
+    roof_ptz_isapi_channel: int = Field(default=1, ge=1)
+    roof_ptz_aux_light_id: int = Field(default=1, ge=1)
+    roof_ptz_supplement_light_mode: str = Field(default="colorVuWhiteLight", min_length=1)
+    roof_ptz_supplement_light_brightness: int = Field(default=100, ge=0, le=100)
+    roof_ptz_user: str = Field(default="admin")
+    roof_ptz_password: str = Field(default="okwy1234")
+    roof_ptz_video_enabled: bool = Field(default=False)
+    lift_dry_run: bool = Field(default=True)
+    lift_host: str = Field(default="10.21.31.15")
+    lift_port: int = Field(default=8899, ge=1, le=65535)
+    lift_slave_id: int = Field(default=1, ge=1, le=247)
+    lift_timeout_s: float = Field(default=1.0, gt=0, le=10)
+    lift_poll_interval_ms: int = Field(default=1000, ge=200, le=10000)
+    lift_travel_height: float = Field(default=180.0, gt=0)
+    lift_base_height_cm: Optional[float] = Field(default=None, ge=0)
+    lift_jog_deadman_s: float = Field(default=1.0, ge=0, le=10)
+    lift_max_pp_speed_pr_s: int = Field(default=100_000, ge=1)
+    lift_max_pv_speed_pr_s: int = Field(default=100_000, ge=1)
+    lift_min_pp_speed_pr_s: int = Field(default=3000, ge=1)
+    lift_min_pv_speed_pr_s: int = Field(default=3000, ge=1)
+    lift_max_single_move_pulse: int = Field(default=2_860_000, ge=1)
+    lift_position_tolerance_pulse: int = Field(default=20, ge=0)
+    lift_min_pulse: Optional[int] = Field(default=None)
+    lift_max_pulse: Optional[int] = Field(default=None)
+    lift_jog_step_pulse: int = Field(default=200, ge=1)
+    lift_jog_interval_ms: int = Field(default=200, ge=1)
+    lift_jog_min_interval_ms: int = Field(default=80, ge=20, le=1000)
+    lift_jog_max_step_pulse: int = Field(default=2000, ge=1)
+    settings_password: str = Field(default="")
+
+    def to_settings(self) -> Settings:
+        return Settings(
+            dog_ptz_dry_run=self.dog_ptz_dry_run,
+            dog_ptz_host=self.dog_ptz_host.strip(),
+            dog_ptz_onvif_port=self.dog_ptz_onvif_port,
+            dog_ptz_isapi_channel=self.dog_ptz_isapi_channel,
+            dog_ptz_aux_light_id=self.dog_ptz_aux_light_id,
+            dog_ptz_supplement_light_mode=self.dog_ptz_supplement_light_mode.strip(),
+            dog_ptz_supplement_light_brightness=self.dog_ptz_supplement_light_brightness,
+            dog_ptz_user=self.dog_ptz_user.strip(),
+            dog_ptz_password=self.dog_ptz_password,
+            dog_ptz_video_enabled=self.dog_ptz_video_enabled,
+            mediamtx_public_base=self.mediamtx_public_base.strip(),
+            m20_host=self.m20_host.strip(),
+            m20_tcp_port=self.m20_tcp_port,
+            m20_udp_port=self.m20_udp_port,
+            m20_dry_run=self.m20_dry_run,
+            m20_front_video_enabled=self.m20_front_video_enabled,
+            m20_rear_video_enabled=self.m20_rear_video_enabled,
+            m20_front_rtsp=self.m20_front_rtsp.strip(),
+            m20_rear_rtsp=self.m20_rear_rtsp.strip(),
+            roof_ptz_dry_run=self.roof_ptz_dry_run,
+            roof_ptz_host=self.roof_ptz_host.strip(),
+            roof_ptz_onvif_port=self.roof_ptz_onvif_port,
+            roof_ptz_isapi_channel=self.roof_ptz_isapi_channel,
+            roof_ptz_aux_light_id=self.roof_ptz_aux_light_id,
+            roof_ptz_supplement_light_mode=self.roof_ptz_supplement_light_mode.strip(),
+            roof_ptz_supplement_light_brightness=self.roof_ptz_supplement_light_brightness,
+            roof_ptz_user=self.roof_ptz_user.strip(),
+            roof_ptz_password=self.roof_ptz_password,
+            roof_ptz_video_enabled=self.roof_ptz_video_enabled,
+            lift_dry_run=self.lift_dry_run,
+            lift_host=self.lift_host.strip() or "10.21.31.15",
+            lift_port=self.lift_port,
+            lift_slave_id=self.lift_slave_id,
+            lift_timeout_s=self.lift_timeout_s,
+            lift_poll_interval_ms=self.lift_poll_interval_ms,
+            lift_travel_height=self.lift_travel_height,
+            lift_base_height_cm=self.lift_base_height_cm,
+            lift_jog_deadman_s=self.lift_jog_deadman_s,
+            lift_max_pp_speed_pr_s=self.lift_max_pp_speed_pr_s,
+            lift_max_pv_speed_pr_s=self.lift_max_pv_speed_pr_s,
+            lift_min_pp_speed_pr_s=self.lift_min_pp_speed_pr_s,
+            lift_min_pv_speed_pr_s=self.lift_min_pv_speed_pr_s,
+            lift_max_single_move_pulse=self.lift_max_single_move_pulse,
+            lift_position_tolerance_pulse=self.lift_position_tolerance_pulse,
+            lift_min_pulse=self.lift_min_pulse,
+            lift_max_pulse=self.lift_max_pulse,
+            lift_jog_step_pulse=self.lift_jog_step_pulse,
+            lift_jog_interval_ms=self.lift_jog_interval_ms,
+            lift_jog_min_interval_ms=self.lift_jog_min_interval_ms,
+            lift_jog_max_step_pulse=self.lift_jog_max_step_pulse,
+            settings_password=self.settings_password,
+        )
+
+
+def write_config_file(current_settings: Settings) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(render_config_text(current_settings.public_payload()), encoding="utf-8")
+
+
+def render_config_text(payload: Dict[str, Any]) -> str:
+    if CONFIG_PATH.suffix.lower() == ".jsonc":
+        return render_jsonc_config(payload)
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+class PTZCommand(BaseModel):
+    command: str
+    speed: int = Field(default=5, ge=1, le=15)
+
+
+class PresetCommand(BaseModel):
+    preset: int = Field(ge=1, le=10)
+
+
+class LightCommand(BaseModel):
+    enabled: bool
+
+
+class RobotCommand(BaseModel):
+    action: str
+    value: Optional[str] = None
+    speed: Optional[float] = Field(default=None, ge=0, le=1)
+    x: Optional[float] = Field(default=None, ge=-1, le=1)
+    y: Optional[float] = Field(default=None, ge=-1, le=1)
+    rotation: Optional[float] = Field(default=None, ge=-1, le=1)
+    front_light: Optional[bool] = None
+    rear_light: Optional[bool] = None
+
+
+class LiftCommand(BaseModel):
+    action: str
+    speed: Optional[float] = Field(default=None, ge=0, le=1)
+    height: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class LeaseRequest(BaseModel):
+    holder_name: str = Field(default="操作员", min_length=1)
+
+
+class DeviceStatus(BaseModel):
+    online: bool
+    video: str
+    onvif: str
+    isapi: str
+    control_mode: str
+    last_checked_at: str
+    last_error: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ControlEvent(BaseModel):
+    device_id: str
+    type: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ControlLogEntry(BaseModel):
+    id: str
+    timestamp: str
+    device_id: str
+    client_id: Optional[str] = None
+    action: str
+    ok: bool
+    dry_run: bool
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+    category: Optional[str] = None
+
+
+settings = Settings.load()
+app = FastAPI(title="Patrol Platform", version="0.1.0")
+app.include_router(central_bridge.router)
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
+def video_url(stream_path: str) -> str:
+    return f"{settings.mediamtx_public_base.rstrip('/')}/{stream_path}"
+
+
+def make_video(stream_path: str, *, source: Optional[str] = None, enabled: bool = True) -> Dict[str, Any]:
+    payload = {
+        "protocol": "webrtc",
+        "path": stream_path,
+        "player_url": video_url(stream_path),
+        "enabled": enabled,
+    }
+    if source:
+        payload["source"] = source
+    return payload
+
+
+def device_payloads() -> List[Dict[str, Any]]:
+    return [
+        dog_ptz_payload(),
+        legacy_ptz_payload(),
+        {
+            "id": "m20_front_camera",
+            "name": "M20Pro 前广角",
+            "kind": "m20pro_camera",
+            "status": "configured",
+            "capabilities": ["video"],
+            "video": make_video("m20-front", source=settings.m20_front_rtsp, enabled=settings.m20_front_video_enabled),
+            "control": {"dry_run": True, "adapter": "video_only"},
+        },
+        {
+            "id": "m20_rear_camera",
+            "name": "M20Pro 后广角",
+            "kind": "m20pro_camera",
+            "status": "configured",
+            "capabilities": ["video"],
+            "video": make_video("m20-rear", source=settings.m20_rear_rtsp, enabled=settings.m20_rear_video_enabled),
+            "control": {"dry_run": True, "adapter": "video_only"},
+        },
+        {
+            "id": "m20_robot_1",
+            "name": "M20Pro 机器狗",
+            "kind": "m20pro_robot",
+            "status": "dry_run" if settings.m20_dry_run else "configured",
+            "capabilities": ["status", "robot_control", "light", "estop"],
+            "control": {"dry_run": settings.m20_dry_run, "adapter": "dry_run" if settings.m20_dry_run else "m20_apdu"},
+        },
+        {
+            "id": "roof_ptz_1",
+            "name": "车顶云台 1",
+            "kind": "hikvision_ptz_camera",
+            "status": "dry_run" if settings.roof_ptz_dry_run else "configured",
+            "capabilities": ["video", "ptz", "zoom", "light", "presets"],
+            "video": make_video(
+                "roof-ptz-1",
+                enabled=settings.roof_ptz_video_enabled,
+                source=f"rtsp://{settings.roof_ptz_user}:{settings.roof_ptz_password}@{settings.roof_ptz_host}:554/Streaming/Channels/102",
+            ),
+            "control": {
+                "dry_run": settings.roof_ptz_dry_run,
+                "adapter": "dry_run" if settings.roof_ptz_dry_run else "onvif_isapi",
+            },
+        },
+        {
+            "id": "lift_pole_1",
+            "name": "电动升降杆",
+            "kind": "lift_pole",
+            "status": "dry_run" if settings.lift_dry_run else "configured",
+            "capabilities": ["status", "lift_control"],
+            "control": {
+                "dry_run": settings.lift_dry_run,
+                "adapter": "dry_run" if settings.lift_dry_run else "modbus",
+            },
+        },
+    ]
+
+
+def dog_ptz_payload() -> Dict[str, Any]:
+    stream_path = "dog-ptz-1"
+    return {
+        "id": "dog_ptz_1",
+        "name": "狗载云台",
+        "kind": "hikvision_ptz_camera",
+        "status": "configured",
+        "capabilities": ["video", "ptz", "zoom", "light", "presets"],
+        "video": make_video(stream_path, enabled=settings.dog_ptz_video_enabled,
+                           source=f"rtsp://{settings.dog_ptz_user}:{settings.dog_ptz_password}@{settings.dog_ptz_host}:554/Streaming/Channels/102"),
+        "control": {
+            "dry_run": settings.dry_run,
+            "adapter": "dry_run" if settings.dry_run else "onvif_isapi",
+        },
+    }
+
+
+def legacy_ptz_payload() -> Dict[str, Any]:
+    payload = dog_ptz_payload()
+    payload["id"] = "hikvision_ptz_1"
+    payload["name"] = "Hikvision PTZ 1（兼容）"
+    payload["video"] = make_video("cam-ptz-1", enabled=settings.dog_ptz_video_enabled)
+    payload["legacy"] = True
+    return payload
+
+
+def get_device(device_id: str) -> Dict[str, Any]:
+    for device in device_payloads():
+        if device["id"] == device_id:
+            return device
+    raise HTTPException(status_code=404, detail="Unknown device")
+
+
+def is_ptz_device(device_id: str) -> bool:
+    return device_id in {"dog_ptz_1", "hikvision_ptz_1", "roof_ptz_1"}
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.active: Dict[WebSocket, str] = {}
+
+    async def connect(self, websocket: WebSocket, client_id: str) -> None:
+        await websocket.accept()
+        self.active[websocket] = client_id
+
+    def disconnect(self, websocket: WebSocket) -> Optional[str]:
+        return self.active.pop(websocket, None)
+
+    async def broadcast(self, event: ControlEvent) -> None:
+        dead: List[WebSocket] = []
+        for websocket in self.active:
+            try:
+                await websocket.send_json(event.model_dump())
+            except RuntimeError:
+                dead.append(websocket)
+        for websocket in dead:
+            self.disconnect(websocket)
+
+
+manager = ConnectionManager()
+
+
+@dataclass
+class DeviceLease:
+    device_id: str
+    holder_id: str
+    holder_name: str
+    expires_at: datetime
+
+
+class LeaseManager:
+    def __init__(self, ttl_seconds: int = 180) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._leases: Dict[str, DeviceLease] = {}
+
+    def payload(self, device_id: str, client_id: Optional[str] = None) -> Dict[str, Any]:
+        lease, _ = self.current(device_id)
+        can_control = bool(lease and client_id and lease.holder_id == client_id)
+        return {
+            "device_id": device_id,
+            "holder_id": lease.holder_id if lease else None,
+            "holder_name": lease.holder_name if lease else None,
+            "expires_at": lease.expires_at.isoformat() if lease else None,
+            "ttl_seconds": self.ttl_seconds,
+            "can_control": can_control,
+        }
+
+    def acquire(self, device_id: str, client_id: str, holder_name: str, *, role: Optional[str] = None) -> Dict[str, Any]:
+        lease, _ = self.current(device_id)
+        resolved_role = role or lease_role_for_holder(holder_name)
+        if lease and lease.holder_id != client_id:
+            held_by_central = is_central_holder_name(lease.holder_name)
+            if resolved_role == "local" and held_by_central:
+                # Local operator preempts central bridge lease.
+                pass
+            elif resolved_role == "central" and not held_by_central:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Local operator holds device control lease (local priority)",
+                        "lease": self.payload(device_id, client_id),
+                    },
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Device control lease is held by another client",
+                        "lease": self.payload(device_id, client_id),
+                    },
+                )
+
+        self._leases[device_id] = DeviceLease(
+            device_id=device_id,
+            holder_id=client_id,
+            holder_name=holder_name,
+            expires_at=self._new_expiry(),
+        )
+        return self.payload(device_id, client_id)
+
+    def renew(self, device_id: str, client_id: str) -> Dict[str, Any]:
+        lease, _ = self.current(device_id)
+        if not lease or lease.holder_id != client_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Device control lease is not held by this client",
+                    "lease": self.payload(device_id, client_id),
+                },
+            )
+
+        lease.expires_at = self._new_expiry()
+        return self.payload(device_id, client_id)
+
+    def release(self, device_id: str, client_id: str) -> Dict[str, Any]:
+        lease, _ = self.current(device_id)
+        if lease and lease.holder_id == client_id:
+            self._leases.pop(device_id, None)
+        return self.payload(device_id, client_id)
+
+    def release_by_holder(self, client_id: str) -> List[Dict[str, Any]]:
+        released: List[Dict[str, Any]] = []
+        for device_id, lease in list(self._leases.items()):
+            if lease.holder_id == client_id:
+                self._leases.pop(device_id, None)
+                released.append(self.payload(device_id, client_id))
+        return released
+
+    def require_control(self, device_id: str, client_id: str) -> None:
+        lease, _ = self.current(device_id)
+        if lease and lease.holder_id == client_id:
+            lease.expires_at = self._new_expiry()
+            return
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Acquire the device control lease before sending control commands",
+                "lease": self.payload(device_id, client_id),
+            },
+        )
+
+    def expire(self, device_id: str) -> Optional[Dict[str, Any]]:
+        _, expired = self.current(device_id)
+        if not expired:
+            return None
+        return {
+            "device_id": device_id,
+            "holder_id": expired.holder_id,
+            "holder_name": expired.holder_name,
+            "expires_at": expired.expires_at.isoformat(),
+            "ttl_seconds": self.ttl_seconds,
+            "can_control": False,
+        }
+
+    def current(self, device_id: str) -> tuple[Optional[DeviceLease], Optional[DeviceLease]]:
+        lease = self._leases.get(device_id)
+        if lease and lease.expires_at <= datetime.now(timezone.utc):
+            self._leases.pop(device_id, None)
+            return None, lease
+        return lease, None
+
+    def _new_expiry(self) -> datetime:
+        return datetime.now(timezone.utc) + timedelta(seconds=self.ttl_seconds)
+
+
+lease_manager = LeaseManager()
+
+
+class ControlLog:
+    def __init__(self, limit: int = 200) -> None:
+        self._entries: deque[ControlLogEntry] = deque(maxlen=limit)
+        self._counter = itertools.count(1)
+
+    def add(
+        self,
+        *,
+        device_id: str,
+        client_id: Optional[str],
+        action: str,
+        ok: bool,
+        payload: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        category: Optional[str] = None,
+        dry_run: Optional[bool] = None,
+    ) -> ControlLogEntry:
+        entry = ControlLogEntry(
+            id=str(next(self._counter)),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            device_id=device_id,
+            client_id=client_id,
+            action=action,
+            ok=ok,
+            dry_run=settings.dry_run if dry_run is None else dry_run,
+            payload=payload or {},
+            error=error,
+            category=category,
+        )
+        self._entries.appendleft(entry)
+        return entry
+
+    def list(self) -> List[Dict[str, Any]]:
+        return [entry.model_dump() for entry in self._entries]
+
+
+control_log = ControlLog()
+
+
+robot_state: Dict[str, Any] = {
+    "lights": {"front": False, "rear": False},
+    "range_km": 0,
+    "battery": {"front": 100, "rear": 100},
+    "temperatures": [],
+    "faults": [],
+    "mode": "normal",
+    "posture": "unknown",
+    "gait": "basic",
+    "direction": "front",
+    "operator_direction": "front",
+    "sleep": "awake",
+    "speed": 0.3,
+    "motion": {"x": 0, "y": 0, "rotation": 0},
+}
+
+lift_state: Dict[str, Any] = {
+    "online": True,
+    "height": 0.0,
+    "speed": 0.3,
+    "motion": "stopped",
+    "target_height": None,
+    "faults": [],
+    "limits": {"min": False, "max": False},
+}
+
+_lift_dry_run_jog_at: Optional[float] = None
+_lift_deadman_task: Optional[asyncio.Task[None]] = None
+
+# Keep servo ON after jog stop so the pole does not drop a section.
+LIFT_ENABLE_HOLD_S = 5.0
+
+
+def lift_jog_deadman_should_stop(
+    last_command_at: Optional[float],
+    now: float,
+    timeout_s: float,
+    motion: Optional[str],
+) -> bool:
+    """True when a PV jog should be halted because keepalive timed out."""
+    if timeout_s <= 0 or last_command_at is None:
+        return False
+    if motion not in {"up", "down"}:
+        return False
+    return (now - last_command_at) >= timeout_s
+
+
+def apply_lift_dry_run_deadman(now: Optional[float] = None) -> bool:
+    """Stop dry-run up/down if the jog keepalive expired. Returns True if stopped."""
+    global _lift_dry_run_jog_at
+    stopped = lift_jog_deadman_should_stop(
+        _lift_dry_run_jog_at,
+        time.monotonic() if now is None else now,
+        float(getattr(settings, "lift_jog_deadman_s", 1.0) or 0),
+        lift_state.get("motion"),
+    )
+    if not stopped:
+        return False
+    lift_state["motion"] = "stopped"
+    lift_state["target_height"] = None
+    _lift_dry_run_jog_at = None
+    return True
+
+
+async def _lift_dry_run_deadman_loop() -> None:
+    while True:
+        await asyncio.sleep(0.1)
+        if settings.lift_dry_run:
+            apply_lift_dry_run_deadman()
+
+
+class LiftRealAdapter:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._client = self._build_client(settings)
+        self._status_task: Optional[asyncio.Task[None]] = None
+        self._poll_wakeup = asyncio.Event()
+        self._command_lock = asyncio.Lock()
+        self._control_active = 0
+        self._pv_active = False
+        self._pv_direction: Optional[str] = None
+        self._pv_last_command_at: Optional[float] = None
+        self._pv_started_at: Optional[float] = None
+        self._stall_since: Optional[float] = None
+        self._stall_seen_motion = False
+        self._jog_blocked_until_stop = False
+        self._enable_release_task: Optional[asyncio.Task[None]] = None
+        self._last_position_pulse: Optional[int] = None
+        self._last_raw_sample: Optional[int] = settings.lift_last_raw_pulse
+        self._position_jump_latched = False
+        self._last_refresh_at: Optional[str] = None
+        lift_state["position_trusted"] = bool(settings.lift_position_trusted)
+
+    def reset(self, settings: Settings) -> None:
+        self.settings = settings
+        self._client = self._build_client(settings)
+        self._pv_active = False
+        self._pv_direction = None
+        self._pv_last_command_at = None
+        self._pv_started_at = None
+        self._stall_since = None
+        self._stall_seen_motion = False
+        self._jog_blocked_until_stop = False
+        self._enable_release_task = None
+        self._last_raw_sample = settings.lift_last_raw_pulse
+        self._position_jump_latched = False
+        self._last_refresh_at = None
+        lift_state["position_trusted"] = bool(settings.lift_position_trusted)
+        self._clear_real_status()
+        if settings.lift_dry_run:
+            lift_state.update(
+                {
+                    "online": True,
+                    "height": 0.0 if lift_state.get("height") is None else lift_state.get("height", 0.0),
+                    "motion": "stopped",
+                    "target_height": None,
+                    "faults": [],
+                    "limits": {"min": False, "max": False},
+                }
+            )
+
+    async def restart(self, settings: Settings) -> None:
+        await self.stop()
+        self.reset(settings)
+        await self.start_status_monitor()
+
+    async def start_status_monitor(self) -> None:
+        if self.settings.lift_dry_run or self._status_task:
+            return
+        self._status_task = asyncio.create_task(self._status_loop())
+
+    async def stop_status_monitor(self) -> None:
+        if self._status_task:
+            self._status_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_task
+            self._status_task = None
+
+    async def stop(self) -> None:
+        await self.stop_status_monitor()
+        self._cancel_enable_release()
+        if self._pv_active:
+            with contextlib.suppress(Exception):
+                await self._client.run_pv_stop()
+        with contextlib.suppress(Exception):
+            await self._client.run_disable()
+        self._pv_active = False
+        self._pv_direction = None
+        self._pv_last_command_at = None
+        self._pv_started_at = None
+        self._stall_since = None
+        self._stall_seen_motion = False
+        self._jog_blocked_until_stop = False
+        await self._client.close()
+
+    async def status_payload(self) -> Dict[str, Any]:
+        """Return cached lift_state. Modbus is refreshed only by _status_loop.
+
+        Browser tabs must not each trigger a full 485 read, or status/control queue up.
+        """
+        checked_at = self._last_refresh_at or datetime.now(timezone.utc).isoformat()
+        if self.settings.lift_dry_run:
+            return lift_status_payload()
+        return {
+            "online": bool(lift_state["online"]),
+            "video": "unknown",
+            "onvif": "unknown",
+            "isapi": "unknown",
+            "control_mode": "real",
+            "last_checked_at": checked_at,
+            "last_error": None if not lift_state["faults"] else str(lift_state["faults"][0]),
+            "details": {"probe": self._probe_details(), **json.loads(json.dumps(lift_state))},
+        }
+
+    async def control(self, command: LiftCommand) -> Dict[str, Any]:
+        async with self._command_lock:
+            self._control_active += 1
+            self._poll_wakeup.set()
+            try:
+                action = command.action
+                if action == "stop":
+                    await self.command_stop()
+                elif action == "estop":
+                    await self.command_estop()
+                elif action == "set_speed":
+                    await self.command_set_speed(command)
+                elif action == "goto":
+                    if command.height is None:
+                        raise HTTPException(status_code=400, detail="Missing target height")
+                    await self.command_goto(command.height)
+                elif action == "max":
+                    await self.command_position_bound("max")
+                elif action == "min":
+                    await self.command_position_bound("min")
+                elif action in {"up", "down"}:
+                    await self.command_jog(action)
+                elif action == "set_retracted_zero":
+                    await self.command_set_retracted_zero()
+                else:
+                    raise HTTPException(status_code=400, detail="Unsupported lift action")
+                return self._state_snapshot()
+            finally:
+                self._control_active = max(0, self._control_active - 1)
+                self._poll_wakeup.set()
+
+    async def command_stop(self, *, release_enable: bool = True) -> None:
+        try:
+            self._cancel_enable_release()
+            # Jog stop: POD-08=256 only. Keep enable so the motor holds the pole.
+            await self._client.run_pv_stop()
+            self._pv_active = False
+            self._pv_direction = None
+            self._pv_last_command_at = None
+            self._pv_started_at = None
+            self._stall_since = None
+            self._stall_seen_motion = False
+            self._jog_blocked_until_stop = False
+            lift_state["motion"] = "stopped"
+            lift_state["target_height"] = None
+            raw = lift_state.get("position_pulse_raw")
+            if raw is None:
+                raw = self._last_raw_sample
+            if raw is not None:
+                self._remember_raw_pulse(int(raw))
+            if release_enable:
+                self._schedule_enable_release()
+        except Exception as exc:
+            self._mark_error(exc)
+            raise self._http_error(exc)
+
+    async def command_estop(self) -> None:
+        try:
+            self._cancel_enable_release()
+            await self._client.soft_estop()
+            self._pv_active = False
+            self._pv_direction = None
+            self._pv_last_command_at = None
+            self._pv_started_at = None
+            self._stall_since = None
+            self._stall_seen_motion = False
+            self._jog_blocked_until_stop = False
+            lift_state["motion"] = "stopped"
+            lift_state["target_height"] = None
+        except Exception as exc:
+            self._mark_error(exc)
+            raise self._http_error(exc)
+
+    async def command_set_speed(self, command: LiftCommand) -> None:
+        if command.speed is None:
+            raise HTTPException(status_code=400, detail="Missing lift speed")
+        lift_state["speed"] = float(command.speed)
+        lift_state["command_speed_cm_s"] = self._command_speed_cm_s()
+        lift_state["travel_height_cm"] = float(self.settings.lift_travel_height)
+
+    async def command_goto(self, height: float) -> None:
+        self._require_trusted_position()
+        await self.command_stop(release_enable=False)
+        target_cm = self._percent_to_cm(height)
+        current_cm = float(lift_state.get("height_cm") or 0.0)
+        # Show direction immediately; Modbus PP setup can take several seconds.
+        lift_state["target_height"] = height
+        if abs(target_cm - current_cm) > pulse_to_cm(self.settings.lift_position_tolerance_pulse):
+            lift_state["motion"] = "up" if target_cm > current_cm else "down"
+        try:
+            self._cancel_enable_release()
+            await self._pp_move_to_height_cm(target_cm)
+            lift_state["target_height"] = height
+        except Exception as exc:
+            self._record_motion_failure(exc)
+            raise self._http_error(exc)
+
+    async def command_position_bound(self, bound: str) -> None:
+        self._require_trusted_position()
+        target_cm = self.settings.lift_travel_height if bound == "max" else 0.0
+        await self.command_stop(release_enable=False)
+        try:
+            self._cancel_enable_release()
+            await self._pp_move_to_height_cm(target_cm)
+            lift_state["target_height"] = 100.0 if bound == "max" else 0.0
+            lift_state["motion"] = "up" if bound == "max" else "down"
+        except Exception as exc:
+            self._record_motion_failure(exc)
+            raise self._http_error(exc)
+
+    def _zero_pulse(self) -> int:
+        return int(getattr(self.settings, "lift_position_zero_pulse", 0) or 0)
+
+    def _require_trusted_position(self) -> None:
+        if self.settings.lift_position_trusted:
+            return
+        raise HTTPException(
+            status_code=409,
+            detail="升降杆位置计数未标定或已失效，请收到底后重新设为零点，再使用到位",
+        )
+
+    def _persist_position_fields(self) -> None:
+        lift_state["position_trusted"] = bool(self.settings.lift_position_trusted)
+        try:
+            settings.save()
+        except OSError:
+            pass
+
+    def _persist_zero_pulse(self, zero: int) -> None:
+        zero = int(zero)
+        self.settings.lift_position_zero_pulse = zero
+        settings.lift_position_zero_pulse = zero
+        self.settings.lift_position_trusted = True
+        settings.lift_position_trusted = True
+        self.settings.lift_last_raw_pulse = zero
+        settings.lift_last_raw_pulse = zero
+        self._last_raw_sample = zero
+        self._position_jump_latched = False
+        self._persist_position_fields()
+
+    def _remember_raw_pulse(self, raw: int) -> None:
+        if not self.settings.lift_position_trusted or self._position_jump_latched:
+            return
+        raw = int(raw)
+        self._last_raw_sample = raw
+        saved = self.settings.lift_last_raw_pulse
+        if saved is not None and abs(raw - int(saved)) < cm_to_pulse(1):
+            return
+        self.settings.lift_last_raw_pulse = raw
+        settings.lift_last_raw_pulse = raw
+        self._persist_position_fields()
+
+    def _note_position_sample(self, raw: int) -> None:
+        raw = int(raw)
+        if self._position_jump_latched or not self.settings.lift_position_trusted:
+            return
+        previous = self._last_raw_sample
+        if previous is None:
+            previous = self.settings.lift_last_raw_pulse
+        if position_reference_should_invalidate(previous, raw):
+            self._position_jump_latched = True
+            self.settings.lift_position_trusted = False
+            settings.lift_position_trusted = False
+            self._persist_position_fields()
+            return
+        self._last_raw_sample = raw
+        if self.settings.lift_last_raw_pulse is None:
+            self._remember_raw_pulse(raw)
+
+    async def command_set_retracted_zero(self) -> None:
+        # 只把当前编码器记为软件零点，不写驱动器 P0B-07。须在杆已到底后使用。
+        with contextlib.suppress(Exception):
+            await self.command_stop()
+        try:
+            raw = await self._client.read_position_feedback()
+        except Exception as exc:
+            self._mark_error(exc)
+            raise self._http_error(exc)
+        self._persist_zero_pulse(raw)
+        try:
+            await self.refresh_status()
+        except HTTPException:
+            lift_state["zero_pulse"] = self._zero_pulse()
+            lift_state["position_pulse_raw"] = int(raw)
+            lift_state["position_pulse"] = 0
+            lift_state["height_cm"] = 0.0
+            lift_state["height"] = 0.0
+        lift_state["target_height"] = 0.0
+        lift_state["motion"] = "stopped"
+
+    def _jog_direction_blocked(self, direction: Optional[str]) -> bool:
+        if direction not in {"up", "down"}:
+            return False
+        monitor = lift_state.get("di_monitor")
+        return jog_direction_blocked(
+            direction,
+            int(lift_state.get("alarm_code") or 0),
+            None if monitor is None else int(monitor),
+            di4_function=int(lift_state.get("di4_function") or 0),
+            di4_logic=int(lift_state.get("di4_logic") or 0),
+            di5_function=int(lift_state.get("di5_function") or 0),
+            di5_logic=int(lift_state.get("di5_logic") or 0),
+        )
+
+    async def command_jog(self, direction: str) -> None:
+        if self._jog_blocked_until_stop:
+            return
+        if self._jog_direction_blocked(direction):
+            if self._pv_active:
+                await self.command_stop()
+            return
+        # 按住保活只刷新时间戳。重复跑完整 PV 启动会复位控制字，杆刚转就被掐掉。
+        if self._pv_active and self._pv_direction == direction:
+            if await self.maybe_stall_stop():
+                return
+            self._pv_last_command_at = time.monotonic()
+            lift_state["motion"] = direction
+            lift_state["target_height"] = None
+            return
+        if self._pv_active and self._pv_direction != direction:
+            await self.command_stop(release_enable=False)
+        speed_pr_s = self._pv_speed_pr_s()
+        lift_state["motion"] = direction
+        lift_state["target_height"] = None
+        try:
+            self._cancel_enable_release()
+            await self._client.run_pv_start(direction, speed_pr_s)
+            now = time.monotonic()
+            self._pv_active = True
+            self._pv_direction = direction
+            self._pv_last_command_at = now
+            self._pv_started_at = now
+            self._stall_since = None
+            self._stall_seen_motion = False
+        except Exception as exc:
+            self._clear_jog_runtime()
+            lift_state["motion"] = "stopped"
+            self._record_motion_failure(exc)
+            raise self._http_error(exc)
+
+    async def maybe_deadman_stop(self) -> bool:
+        if not self._pv_active:
+            return False
+        if not lift_jog_deadman_should_stop(
+            self._pv_last_command_at,
+            time.monotonic(),
+            float(self.settings.lift_jog_deadman_s or 0),
+            self._pv_direction,
+        ):
+            return False
+        try:
+            await self.command_stop()
+        except Exception:
+            self._clear_jog_runtime()
+            lift_state["motion"] = "stopped"
+            lift_state["target_height"] = None
+        return True
+
+    async def maybe_stall_stop(self) -> bool:
+        if not self._pv_active:
+            self._stall_since = None
+            self._stall_seen_motion = False
+            return False
+        rpm = abs(float(lift_state.get("speed_rpm") or 0))
+        should_stop, self._stall_since, self._stall_seen_motion = lift_jog_stall_should_stop(
+            pv_active=True,
+            abs_rpm=rpm,
+            started_at=self._pv_started_at,
+            stall_since=self._stall_since,
+            seen_motion=self._stall_seen_motion,
+            now=time.monotonic(),
+        )
+        if not should_stop:
+            return False
+        self._jog_blocked_until_stop = True
+        try:
+            await self.command_stop()
+        except Exception:
+            self._clear_jog_runtime()
+            lift_state["motion"] = "stopped"
+            lift_state["target_height"] = None
+        else:
+            self._jog_blocked_until_stop = True
+        return True
+
+    async def maybe_alarm_stop(self) -> bool:
+        if not self._pv_active or not self._pv_direction:
+            return False
+        if not self._jog_direction_blocked(self._pv_direction):
+            return False
+        try:
+            await self.command_stop()
+        except Exception:
+            self._clear_jog_runtime()
+            lift_state["motion"] = "stopped"
+            lift_state["target_height"] = None
+        return True
+
+    def _clear_jog_runtime(self) -> None:
+        self._pv_active = False
+        self._pv_direction = None
+        self._pv_last_command_at = None
+        self._pv_started_at = None
+        self._stall_since = None
+        self._stall_seen_motion = False
+
+    def _cancel_enable_release(self) -> None:
+        task = self._enable_release_task
+        self._enable_release_task = None
+        if task is not None:
+            task.cancel()
+
+    def _schedule_enable_release(self) -> None:
+        self._cancel_enable_release()
+        self._enable_release_task = asyncio.create_task(self._release_enable_after_hold())
+
+    async def _release_enable_after_hold(self) -> None:
+        try:
+            await asyncio.sleep(LIFT_ENABLE_HOLD_S)
+            if self._pv_active or self._control_active:
+                return
+            await self._client.run_disable()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _record_motion_failure(self, exc: Exception) -> None:
+        if isinstance(exc, LiftFollowingError):
+            lift_state["faults"] = [str(exc)]
+            lift_state["alarm_text"] = format_alarm_code(0x0B00) or str(exc)
+            lift_state["motion"] = "stopped"
+            lift_state["target_height"] = None
+            return
+        self._mark_error(exc)
+
+    async def refresh_status(self) -> Dict[str, Any]:
+        try:
+            status = await self._client.read_status()
+            raw = status.position_feedback
+            zero = self._zero_pulse()
+            position = display_pulse(raw, zero)
+            height_cm = height_cm_from_raw(raw, zero)
+            height_pct = self._cm_to_percent(height_cm)
+            status_flags = decode_pob04_status_word(status.status_word)
+            status_text = format_pob04_status_word(status.status_word)
+            alarm_text = format_alarm_code(status.alarm_code)
+            self._note_position_sample(raw)
+            lift_state.update(
+                {
+                    "online": True,
+                    "height": height_pct,
+                    "height_cm": height_cm,
+                    "position_pulse": position,
+                    "position_pulse_raw": raw,
+                    "zero_pulse": zero,
+                    "travel_height_cm": float(self.settings.lift_travel_height),
+                    "base_height_cm": self.settings.lift_base_height_cm,
+                    "total_height_cm": (
+                        None
+                        if self.settings.lift_base_height_cm is None
+                        else round(float(self.settings.lift_base_height_cm) + float(height_cm), 2)
+                    ),
+                    "speed_rpm": status.speed_rpm,
+                    "load_percent": status.load_percent,
+                    "status_word": status.status_word,
+                    "status_flags": status_flags,
+                    "status_text": status_text,
+                    "alarm_code": status.alarm_code,
+                    "alarm_text": alarm_text,
+                    "di_monitor": status.di_monitor,
+                    "di4_function": status.di4_function,
+                    "di4_logic": status.di4_logic,
+                    "di5_function": status.di5_function,
+                    "di5_logic": status.di5_logic,
+                    "position_trusted": bool(self.settings.lift_position_trusted),
+                    "command_speed_cm_s": self._command_speed_cm_s(),
+                    "faults": [alarm_text] if alarm_text else [],
+                    "limits": self._limits_for_height_cm(height_cm),
+                }
+            )
+            self._last_refresh_at = datetime.now(timezone.utc).isoformat()
+            if self._pv_active:
+                # Keep PV jog direction; still track last raw pulse for later PP inference.
+                self._last_position_pulse = raw
+                if not await self.maybe_alarm_stop():
+                    await self.maybe_stall_stop()
+            else:
+                lift_state["motion"] = self._infer_motion_from_position(raw)
+            return self._state_snapshot()
+        except Exception as exc:
+            self._mark_error(exc)
+            raise self._http_error(exc)
+
+    async def _status_loop(self) -> None:
+        read_failures = 0
+        while True:
+            if not self._control_active:
+                await self.maybe_deadman_stop()
+            if self._control_active:
+                await self._wait_for_poll_interval(0.05)
+                continue
+            try:
+                await self.refresh_status()
+                read_failures = 0
+            except HTTPException:
+                read_failures += 1
+                if self._pv_active and read_failures >= 3:
+                    with contextlib.suppress(Exception):
+                        await self._client.run_pv_stop()
+                    self._clear_jog_runtime()
+                    read_failures = 0
+            interval = self.settings.lift_poll_interval_ms / 1000
+            if self._pv_active:
+                interval = min(interval, 0.1)
+            await self._wait_for_poll_interval(interval)
+
+    async def _wait_for_poll_interval(self, seconds: float) -> None:
+        self._poll_wakeup.clear()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._poll_wakeup.wait(), timeout=seconds)
+
+    async def _pp_move_to_height_cm(self, target_cm: float) -> None:
+        target_cm = max(0.0, min(float(self.settings.lift_travel_height), float(target_cm)))
+        current_pulse = await self._client.read_position_feedback()
+        target_pulse = drive_target_from_cm(target_cm, self._zero_pulse())
+        delta = target_pulse - current_pulse
+        if abs(delta) <= self.settings.lift_position_tolerance_pulse:
+            lift_state["motion"] = "stopped"
+            return
+        speed_pr_s = self._pp_speed_pr_s()
+        await self._client.run_pp_move_absolute(target_pulse, speed_pr_s)
+        lift_state["motion"] = "up" if delta > 0 else "down"
+
+    def _build_client(self, current_settings: Settings) -> OukeServoLiftClient:
+        return OukeServoLiftClient(
+            current_settings.lift_host or "10.21.31.15",
+            current_settings.lift_port,
+            slave_id=current_settings.lift_slave_id,
+            timeout=current_settings.lift_timeout_s,
+        )
+
+    def _pp_speed_pr_s(self) -> int:
+        speed = float(lift_state.get("speed") or 0.3)
+        scaled = int(round(speed * self.settings.lift_max_pp_speed_pr_s))
+        return max(self.settings.lift_min_pp_speed_pr_s, min(self.settings.lift_max_pp_speed_pr_s, scaled))
+
+    def _pv_speed_pr_s(self) -> int:
+        speed = float(lift_state.get("speed") or 0.3)
+        scaled = int(round(speed * self.settings.lift_max_pv_speed_pr_s))
+        return max(self.settings.lift_min_pv_speed_pr_s, min(self.settings.lift_max_pv_speed_pr_s, scaled))
+
+    def _command_speed_cm_s(self) -> float:
+        """UI speed ratio -> approximate linear cm/s using configured Pr/s and lead."""
+        pr_s = self._pv_speed_pr_s() if self._pv_active else self._pp_speed_pr_s()
+        return round((pr_s / float(PULSES_PER_REV)) * float(CM_PER_REV), 3)
+
+    def _percent_to_cm(self, height_percent: float) -> float:
+        ratio = max(0.0, min(float(height_percent) / 100.0, 1.0))
+        return ratio * float(self.settings.lift_travel_height)
+
+    def _cm_to_percent(self, height_cm: float) -> float:
+        travel = float(self.settings.lift_travel_height)
+        if travel <= 0:
+            return 0.0
+        return round(max(0.0, min(height_cm / travel, 1.0)) * 100.0, 2)
+
+    def _infer_motion_from_position(self, position: int) -> str:
+        if self._last_position_pulse is None:
+            self._last_position_pulse = position
+            return "stopped"
+        tolerance = self.settings.lift_position_tolerance_pulse
+        delta = position - self._last_position_pulse
+        self._last_position_pulse = position
+        if abs(delta) <= tolerance:
+            return "stopped"
+        return "up" if delta > 0 else "down"
+
+    def _limits_for_height_cm(self, height_cm: float) -> Dict[str, bool]:
+        tolerance_cm = pulse_to_cm(self.settings.lift_position_tolerance_pulse)
+        travel = float(self.settings.lift_travel_height)
+        return {
+            "min": height_cm <= tolerance_cm,
+            "max": height_cm >= max(0.0, travel - tolerance_cm),
+        }
+
+    def _probe_details(self) -> Dict[str, Any]:
+        return {
+            "status": "ok" if lift_state.get("online") else "error",
+            "dry_run": False,
+            "adapter": "ouke_servo_pp_pv",
+            "target": f"{self.settings.lift_host or '10.21.31.15'}:{self.settings.lift_port}",
+            "slave_id": self.settings.lift_slave_id,
+        }
+
+    @staticmethod
+    def _clear_real_status() -> None:
+        for key in (
+            "position_pulse",
+            "position_pulse_raw",
+            "zero_pulse",
+            "height_cm",
+            "speed_rpm",
+            "load_percent",
+            "status_word",
+            "status_flags",
+            "status_text",
+            "alarm_code",
+            "alarm_text",
+            "di_monitor",
+            "di4_function",
+            "di4_logic",
+            "di5_function",
+            "di5_logic",
+        ):
+            lift_state.pop(key, None)
+
+    @staticmethod
+    def _state_snapshot() -> Dict[str, Any]:
+        return json.loads(json.dumps(lift_state))
+
+    @staticmethod
+    def _mark_error(exc: Exception) -> None:
+        LiftRealAdapter._clear_real_status()
+        lift_state["online"] = False
+        lift_state["height"] = None
+        lift_state["faults"] = [str(exc)]
+        lift_state["limits"] = {"min": False, "max": False}
+        lift_state["motion"] = "stopped"
+        lift_state["target_height"] = None
+
+    @staticmethod
+    def _http_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, HTTPException):
+            return exc
+        if isinstance(exc, LiftFollowingError):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, (ModbusRtuError, asyncio.TimeoutError, OSError)):
+            return HTTPException(status_code=502, detail=f"Lift Modbus RTU communication failed: {exc}")
+        return HTTPException(status_code=500, detail=str(exc))
+
+
+class HikvisionControlClient:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._camera: Any = None
+        self._ptz: Any = None
+        self._profile_token: str | None = None
+
+    async def ptz_start(self, command: str, speed: int) -> Dict[str, Any]:
+        payload = {"command": command, "speed": speed}
+        if self.settings.dry_run:
+            return await self._operation("ptz_start", payload)
+
+        await self._run_blocking(self._continuous_move, command, speed)
+        return {"ok": True, "dry_run": False, "operation": "ptz_start", "payload": payload}
+
+    async def ptz_stop(self, command: str) -> Dict[str, Any]:
+        payload = {"command": command}
+        if self.settings.dry_run:
+            return await self._operation("ptz_stop", payload)
+
+        await self._run_blocking(self._stop, command)
+        return {"ok": True, "dry_run": False, "operation": "ptz_stop", "payload": payload}
+
+    async def ptz_home(self) -> Dict[str, Any]:
+        if self.settings.dry_run:
+            return await self._operation("ptz_home", {})
+        await self._run_blocking(self._home)
+        return {"ok": True, "dry_run": False, "operation": "ptz_home"}
+
+    async def preset(self, action: str, preset: int) -> Dict[str, Any]:
+        payload = {"preset": preset}
+        if self.settings.dry_run:
+            return await self._operation(f"preset_{action}", payload)
+
+        token = await self._run_blocking(self._preset, action, preset)
+        payload["token"] = token
+        return {"ok": True, "dry_run": False, "operation": f"preset_{action}", "payload": payload}
+
+    async def light(self, enabled: bool) -> Dict[str, Any]:
+        payload = {"enabled": enabled}
+        if self.settings.dry_run:
+            return await self._operation("light", payload)
+
+        result = await self._run_blocking(self._set_supplement_light, enabled)
+        payload.update(result)
+        return {"ok": True, "dry_run": False, "operation": "light", "payload": payload}
+
+    async def _operation(self, name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True, "dry_run": True, "operation": name, "payload": payload}
+
+    @staticmethod
+    async def _run_blocking(func: Any, *args: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func, *args)
+
+    def reset(self, settings: Settings) -> None:
+        self.settings = settings
+        self._camera = None
+        self._ptz = None
+        self._profile_token = None
+
+    def _ensure_onvif(self) -> None:
+        if self._ptz and self._profile_token:
+            return
+
+        try:
+            from onvif import ONVIFCamera
+            from requests import Session
+            from zeep.transports import Transport
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Missing dependency onvif-zeep. Run: python -m pip install -r requirements.txt",
+            ) from exc
+
+        try:
+            session = Session()
+            session.trust_env = False
+            transport = Transport(session=session, timeout=8, operation_timeout=8)
+            self._camera = ONVIFCamera(
+                self.settings.device_host,
+                self.settings.onvif_port,
+                self.settings.device_user,
+                self.settings.device_password,
+                transport=transport,
+            )
+            media = self._camera.create_media_service()
+            profiles = media.GetProfiles()
+            if not profiles:
+                raise RuntimeError("No ONVIF media profiles returned by camera")
+
+            self._profile_token = profiles[0].token
+            self._ptz = self._camera.create_ptz_service()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"ONVIF connection failed: {exc}") from exc
+
+    def _continuous_move(self, command: str, speed: int) -> None:
+        self._ensure_onvif()
+        assert self._ptz is not None
+        assert self._profile_token is not None
+
+        pan, tilt, zoom = self._velocity(command, speed)
+        try:
+            request = self._ptz.create_type("ContinuousMove")
+            request.ProfileToken = self._profile_token
+            request.Velocity = {
+                "PanTilt": {"x": pan, "y": tilt},
+                "Zoom": {"x": zoom},
+            }
+            self._ptz.ContinuousMove(request)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"ONVIF PTZ move failed: {exc}") from exc
+
+    def _stop(self, command: str) -> None:
+        self._ensure_onvif()
+        assert self._ptz is not None
+        assert self._profile_token is not None
+
+        try:
+            request = self._ptz.create_type("Stop")
+            request.ProfileToken = self._profile_token
+            request.PanTilt = command in {"up", "down", "left", "right"}
+            request.Zoom = command in {"zoom_in", "zoom_out"}
+            self._ptz.Stop(request)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"ONVIF PTZ stop failed: {exc}") from exc
+
+    def _home(self) -> None:
+        self._ensure_onvif()
+        assert self._ptz is not None
+        assert self._profile_token is not None
+        try:
+            request = self._ptz.create_type("GotoHomePosition")
+            request.ProfileToken = self._profile_token
+            self._ptz.GotoHomePosition(request)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"ONVIF PTZ home failed: {exc}") from exc
+
+    def _preset(self, action: str, preset: int) -> str:
+        self._ensure_onvif()
+        assert self._ptz is not None
+        assert self._profile_token is not None
+
+        token = str(preset)
+        try:
+            if action == "save":
+                return self._set_preset(token, preset)
+            if action == "goto":
+                request = self._ptz.create_type("GotoPreset")
+                request.ProfileToken = self._profile_token
+                request.PresetToken = token
+                self._ptz.GotoPreset(request)
+                return token
+            if action == "delete":
+                request = self._ptz.create_type("RemovePreset")
+                request.ProfileToken = self._profile_token
+                request.PresetToken = token
+                self._ptz.RemovePreset(request)
+                return token
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"ONVIF preset {action} failed: {exc}") from exc
+
+        raise HTTPException(status_code=400, detail="Unsupported preset action")
+
+    def _set_preset(self, token: str, preset: int) -> str:
+        assert self._ptz is not None
+        assert self._profile_token is not None
+
+        request = self._ptz.create_type("SetPreset")
+        request.ProfileToken = self._profile_token
+        request.PresetName = f"Preset {preset}"
+        request.PresetToken = token
+        try:
+            returned_token = self._ptz.SetPreset(request)
+            return str(returned_token or token)
+        except Exception:
+            request = self._ptz.create_type("SetPreset")
+            request.ProfileToken = self._profile_token
+            request.PresetName = f"Preset {preset}"
+            returned_token = self._ptz.SetPreset(request)
+            return str(returned_token or token)
+
+    def _set_supplement_light(self, enabled: bool) -> Dict[str, Any]:
+        try:
+            import httpx
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Missing dependency httpx. Run: python -m pip install -r requirements.txt",
+            ) from exc
+
+        headers = {"Content-Type": "application/xml"}
+        try:
+            with httpx.Client(
+                auth=httpx.DigestAuth(self.settings.device_user, self.settings.device_password),
+                trust_env=False,
+                timeout=8,
+            ) as client:
+                attempts = self._light_requests(enabled)
+                responses = []
+                for path, xml in attempts:
+                    response = client.put(
+                        f"http://{self.settings.device_host}{path}",
+                        content=xml,
+                        headers=headers,
+                    )
+                    if response.status_code < 400:
+                        return {
+                            "isapi_path": path,
+                            "mode": self._light_mode(enabled),
+                            "brightness": self.settings.supplement_light_brightness if enabled else 0,
+                        }
+                    responses.append((path, response.status_code, response.text.strip()))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"ISAPI supplement light request failed: {exc}") from exc
+
+        details = "; ".join(
+            f"{path} -> HTTP {status} {body[:180]}" for path, status, body in responses
+        )
+        raise HTTPException(status_code=502, detail=f"ISAPI light control failed: {details}")
+
+    def _light_requests(self, enabled: bool) -> List[tuple[str, str]]:
+        channel = self.settings.isapi_channel
+        aux_id = self.settings.ptz_aux_light_id
+        supplement_xml = self._supplement_light_xml(enabled)
+        aux_xml = self._ptz_aux_xml(enabled)
+        aux_list_xml = f"<PTZAuxList>{aux_xml}</PTZAuxList>"
+        return [
+            (f"/ISAPI/Image/channels/{channel}/supplementLight", supplement_xml),
+            (f"/ISAPI/Image/channels/{channel}/SupplementLight", supplement_xml),
+            (f"/ISAPI/PTZCtrl/channels/{channel}/auxcontrols/{aux_id}", aux_xml),
+            (f"/ISAPI/PTZCtrl/channels/{channel}/auxcontrols", aux_list_xml),
+        ]
+
+    def _light_mode(self, enabled: bool) -> str:
+        return self.settings.supplement_light_mode if enabled else "close"
+
+    def _supplement_light_xml(self, enabled: bool) -> str:
+        if not enabled:
+            return "<SupplementLight><supplementLightMode>close</supplementLightMode></SupplementLight>"
+
+        mode = self.settings.supplement_light_mode
+        brightness = self.settings.supplement_light_brightness
+        return (
+            "<SupplementLight>"
+            f"<supplementLightMode>{mode}</supplementLightMode>"
+            "<mixedLightBrightnessRegulatMode>manual</mixedLightBrightnessRegulatMode>"
+            f"<whiteLightBrightness>{brightness}</whiteLightBrightness>"
+            "</SupplementLight>"
+        )
+
+    def _ptz_aux_xml(self, enabled: bool) -> str:
+        status = "on" if enabled else "off"
+        return (
+            "<PTZAux>"
+            f"<id>{self.settings.ptz_aux_light_id}</id>"
+            "<type>LIGHT</type>"
+            f"<status>{status}</status>"
+            "</PTZAux>"
+        )
+
+    @staticmethod
+    def _velocity(command: str, speed: int) -> tuple[float, float, float]:
+        value = min(max(speed, 1), 15) / 15
+        if command == "up":
+            return 0, value, 0
+        if command == "down":
+            return 0, -value, 0
+        if command == "left":
+            return -value, 0, 0
+        if command == "right":
+            return value, 0, 0
+        if command == "zoom_in":
+            return 0, 0, value
+        if command == "zoom_out":
+            return 0, 0, -value
+        raise HTTPException(status_code=400, detail="Unsupported PTZ command")
+
+
+def ptz_settings_for_device(device_id: str) -> Settings:
+    """按设备生成云台控制配置，避免车顶云台误用狗载云台地址。"""
+    if device_id != "roof_ptz_1":
+        return settings
+
+    return settings.model_copy(
+        update={
+            "dog_ptz_dry_run": settings.roof_ptz_dry_run,
+            "dog_ptz_host": settings.roof_ptz_host,
+            "dog_ptz_onvif_port": settings.roof_ptz_onvif_port,
+            "dog_ptz_isapi_channel": settings.roof_ptz_isapi_channel,
+            "dog_ptz_aux_light_id": settings.roof_ptz_aux_light_id,
+            "dog_ptz_supplement_light_mode": settings.roof_ptz_supplement_light_mode,
+            "dog_ptz_supplement_light_brightness": settings.roof_ptz_supplement_light_brightness,
+            "dog_ptz_user": settings.roof_ptz_user,
+            "dog_ptz_password": settings.roof_ptz_password,
+            "dog_ptz_video_enabled": settings.roof_ptz_video_enabled,
+        }
+    )
+
+
+control_client = HikvisionControlClient(settings)
+
+
+def ptz_control_client(device_id: str) -> HikvisionControlClient:
+    if device_id == "roof_ptz_1":
+        return HikvisionControlClient(ptz_settings_for_device(device_id))
+    return control_client
+
+
+class M20Protocol:
+    SYNC = b"\xeb\x91\xeb\x90"
+    HEADER_SIZE = 16
+    ASDU_JSON = 0x01
+
+    @classmethod
+    def build_frame(cls, message_id: int, payload: Dict[str, Any]) -> bytes:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(body) > 65535:
+            raise HTTPException(status_code=400, detail="M20 ASDU payload is too large")
+        header = cls.SYNC + struct.pack("<H", len(body)) + struct.pack("<H", message_id & 0xFFFF)
+        header += bytes([cls.ASDU_JSON]) + b"\x00" * 7
+        return header + body
+
+    @classmethod
+    def parse_frame(cls, frame: bytes) -> Dict[str, Any]:
+        if len(frame) < cls.HEADER_SIZE:
+            raise ValueError("M20 APDU frame is shorter than header")
+        if frame[:4] != cls.SYNC:
+            raise ValueError("M20 APDU sync bytes mismatch")
+        length = struct.unpack("<H", frame[4:6])[0]
+        message_id = struct.unpack("<H", frame[6:8])[0]
+        asdu_format = frame[8]
+        body = frame[cls.HEADER_SIZE : cls.HEADER_SIZE + length]
+        if len(body) != length:
+            raise ValueError("M20 APDU body length mismatch")
+        if asdu_format != cls.ASDU_JSON:
+            return {"message_id": message_id, "asdu_format": asdu_format, "raw": body.decode("utf-8", errors="replace")}
+        return {"message_id": message_id, "asdu_format": asdu_format, "payload": json.loads(body.decode("utf-8"))}
+
+    @staticmethod
+    def patrol_payload(message_type: int, command: int, items: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {
+            "PatrolDevice": {
+                "Type": message_type,
+                "Command": command,
+                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Items": items or {},
+            }
+        }
+
+
+class M20RobotClient:
+    MODE_VALUES = {"normal": 0, "navigation": 1, "assist": 2}
+    MOTION_VALUES = {"stand": 1, "soft_estop": 2, "lie_down": 4}
+    GAIT_VALUES = {"basic": 0x1001, "platform": 0x1002, "stairs": 0x1003}
+    RL_CONTROL_VALUE = 17
+    MOTION_INTERVAL_SECONDS = 0.05
+    MOTION_INTENT_TTL_SECONDS = 5.0
+    MOTION_ZERO_BURST_COUNT = 4
+    MOTION_STOP_WAIT_SECONDS = 2.0
+    TCP_PROBE_CACHE_SECONDS = 30.0
+    FORWARD_AXIS_GAIN = 1.4
+    YAW_AXIS_SIGN = -1.0
+    STATUS_STALE_SECONDS = 10.0
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._message_ids = itertools.count(1)
+        self._last_status: Dict[str, Any] = {}
+        self._last_received_at: Optional[str] = None
+        self._last_heartbeat_at: Optional[str] = None
+        self._last_error: Optional[str] = None
+        self._heartbeat_count = 0
+        self._status_transport: Any = None
+        self._heartbeat_task: Optional[asyncio.Task[Any]] = None
+        self._motion_task: Optional[asyncio.Task[Any]] = None
+        self._motion_lock = asyncio.Lock()
+        self._motion_command: Optional[RobotCommand] = None
+        self._motion_client_id: Optional[str] = None
+        self._motion_expires_at: Optional[datetime] = None
+        self._tcp_probe_cache: Optional[Dict[str, Any]] = None
+        self._tcp_probe_cached_at: Optional[float] = None
+        self._control_reader: Optional[asyncio.StreamReader] = None
+        self._control_writer: Optional[asyncio.StreamWriter] = None
+        self._control_io_lock = asyncio.Lock()
+        self._rl_control_ready = False
+        self._last_map_pose: Optional[Dict[str, Any]] = None
+        self._last_map_pose_at: float = 0.0
+        self._map_pose_min_interval_s = 2.0
+
+    def reset(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def restart_status_monitor(self) -> None:
+        await self.stop_status_monitor()
+        await self.start_status_monitor()
+
+    async def start_status_monitor(self) -> None:
+        if self.settings.m20_dry_run or self._heartbeat_task:
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            self._status_transport, _protocol = await loop.create_datagram_endpoint(
+                lambda: M20StatusProtocol(self),
+                local_addr=("0.0.0.0", 0),
+            )
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = f"M20 status monitor failed to start: {exc}"
+
+    async def stop_status_monitor(self) -> None:
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+        if self._status_transport:
+            self._status_transport.close()
+            self._status_transport = None
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            try:
+                self.send_heartbeat()
+            except Exception as exc:
+                self._last_error = f"M20 heartbeat failed: {exc}"
+            await asyncio.sleep(1)
+
+    def send_heartbeat(self) -> None:
+        if not self._status_transport:
+            raise RuntimeError("M20 status transport is not ready")
+        message_id = next(self._message_ids) & 0xFFFF
+        frame = M20Protocol.build_frame(message_id, M20Protocol.patrol_payload(100, 100, {}))
+        self._status_transport.sendto(frame, (self.settings.m20_host, self.settings.m20_udp_port))
+        self._heartbeat_count += 1
+        self._last_heartbeat_at = datetime.now(timezone.utc).isoformat()
+
+    def ingest_datagram(self, data: bytes, addr: Any) -> None:
+        try:
+            parsed = M20Protocol.parse_frame(data)
+            self._remember_status(parsed)
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = f"M20 status datagram parse failed from {addr}: {exc}"
+
+    async def status_payload(self) -> Dict[str, Any]:
+        if self.settings.m20_dry_run:
+            return robot_status_payload()
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        status_age = self._status_age_seconds()
+        last_known_sleeping = self._last_status.get("sleep") in {"sleeping", "entering_sleep"}
+        status_fresh = status_age is not None and (
+            status_age <= self.STATUS_STALE_SECONDS or last_known_sleeping
+        )
+        status_channel_ok = self._heartbeat_task is not None and not self._heartbeat_task.done()
+        # Online follows UDP heartbeat/status only. Never probe TCP :30001 here because
+        # opening that port resets M20 axis-command client identity and triggers 0xE006.
+        online = status_fresh and status_channel_ok
+        tcp_target = f"{self.settings.m20_host}:{self.settings.m20_tcp_port}"
+        tcp = {
+            "status": "ok" if online else "unknown",
+            "target": tcp_target,
+            "note": "udp_status_only",
+            "motion_loop_active": self._motion_loop_active(),
+        }
+        details = {
+            "online": tcp,
+            "status_channel": {
+                "running": status_channel_ok,
+                "target": f"{self.settings.m20_host}:{self.settings.m20_udp_port}",
+                "heartbeat_count": self._heartbeat_count,
+                "last_heartbeat_at": self._last_heartbeat_at,
+                "last_received_at": self._last_received_at,
+                "last_status_age_seconds": status_age,
+                "status_fresh": status_fresh,
+                "stale_after_seconds": self.STATUS_STALE_SECONDS,
+                "motion_loop_active": self._motion_loop_active(),
+                "last_error": self._last_error,
+            },
+            "last_received_at": self._last_received_at,
+            "speed": robot_state.get("speed"),
+            "motion": robot_state.get("motion"),
+            "operator_direction": robot_state.get("operator_direction"),
+            **(self._last_status if self._last_status else {}),
+        }
+        map_pose = await self.refresh_map_pose()
+        if map_pose:
+            details["map_pose"] = map_pose
+        return DeviceStatus(
+            online=online,
+            video="unknown",
+            onvif="unknown",
+            isapi="unknown",
+            control_mode="real",
+            last_checked_at=checked_at,
+            last_error=self._last_error or tcp.get("error"),
+            details=details,
+        ).model_dump()
+
+    async def refresh_map_pose(self) -> Optional[Dict[str, Any]]:
+        """Query map-frame pose via Type=1007 Command=2. Throttled; skipped while motion loop active."""
+        if self.settings.m20_dry_run:
+            return self._last_map_pose
+        if self._motion_loop_active():
+            return self._last_map_pose
+        now = time.monotonic()
+        if self._last_map_pose is not None and (now - self._last_map_pose_at) < self._map_pose_min_interval_s:
+            return self._last_map_pose
+        try:
+            response = await self._send_payload(M20Protocol.patrol_payload(1007, 2, {}), response_timeout=1.5)
+            payload = response.get("payload") if isinstance(response, dict) else None
+            patrol = payload.get("PatrolDevice") if isinstance(payload, dict) else None
+            items = patrol.get("Items") if isinstance(patrol, dict) else None
+            if not isinstance(items, dict):
+                return self._last_map_pose
+            pose = {
+                "location": items.get("Location"),
+                "x": items.get("PosX"),
+                "y": items.get("PosY"),
+                "z": items.get("PosZ"),
+                "roll": items.get("Roll"),
+                "pitch": items.get("Pitch"),
+                "yaw": items.get("Yaw"),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._last_map_pose = pose
+            self._last_map_pose_at = now
+            self._last_status["map_pose"] = pose
+            return pose
+        except Exception as exc:
+            self._last_error = f"M20 map pose query failed: {exc}"
+            return self._last_map_pose
+
+    def _motion_loop_active(self) -> bool:
+        return self._motion_task is not None and not self._motion_task.done()
+
+    async def _control_port_probe(self) -> Dict[str, Any]:
+        target = f"{self.settings.m20_host}:{self.settings.m20_tcp_port}"
+        if self._motion_loop_active():
+            return {"status": "ok", "target": target, "note": "motion_loop_active"}
+        now = time.monotonic()
+        if (
+            self._tcp_probe_cache is not None
+            and self._tcp_probe_cached_at is not None
+            and now - self._tcp_probe_cached_at < self.TCP_PROBE_CACHE_SECONDS
+        ):
+            return {**self._tcp_probe_cache, "cached": True}
+        self._tcp_probe_cache = await probe_tcp(self.settings.m20_host, self.settings.m20_tcp_port)
+        self._tcp_probe_cached_at = now
+        return self._tcp_probe_cache
+
+    async def control(self, command: RobotCommand, client_id: Optional[str] = None) -> Dict[str, Any]:
+        if self.settings.m20_dry_run:
+            state_payload = apply_robot_dry_run_command(command)
+            return {
+                "ok": True,
+                "dry_run": True,
+                "operation": f"robot_{command.action}",
+                "payload": {**command.model_dump(exclude_none=True), "state": state_payload},
+            }
+
+        if command.action == "set_speed":
+            if command.speed is None:
+                raise HTTPException(status_code=400, detail="Missing robot speed")
+            robot_state["speed"] = command.speed
+            return {
+                "ok": True,
+                "dry_run": False,
+                "operation": f"robot_{command.action}",
+                "payload": {
+                    **command.model_dump(exclude_none=True),
+                    "protocol": {"local_only": True, "reason": "speed slider limits subsequent normalized axis commands"},
+                    "state": self._state_snapshot(),
+                },
+            }
+
+        if command.action == "move":
+            return await self.update_motion_intent(command, client_id)
+
+        if command.action == "stop_move":
+            return await self.stop_motion(reason="explicit_stop")
+
+        if command.action == "direction_reverse":
+            await self.stop_motion(reason="before_operator_direction_reverse")
+            robot_state["operator_direction"] = "rear" if robot_state.get("operator_direction") == "front" else "front"
+            return {
+                "ok": True,
+                "dry_run": False,
+                "operation": "robot_direction_reverse",
+                "payload": {
+                    **command.model_dump(exclude_none=True),
+                    "protocol": {"local_only": True, "reason": "operator_direction maps controls and video only"},
+                    "state": self._state_snapshot(),
+                },
+            }
+
+        if command.action in {"sleep", "wake"}:
+            if command.action == "sleep":
+                await self.stop_motion(reason="before_sleep")
+            payload = M20Protocol.patrol_payload(1101, 6, {"Sleep": command.action == "sleep"})
+            response = await self._send_payload(payload)
+            self._last_status["sleep"] = "sleeping" if command.action == "sleep" else "awake"
+            return {
+                "ok": True,
+                "dry_run": False,
+                "operation": f"robot_{command.action}",
+                "payload": {
+                    **command.model_dump(exclude_none=True),
+                    "protocol": self._protocol_summary(payload),
+                    "response": response,
+                    "state": self._state_snapshot(),
+                },
+            }
+
+        if command.action in {"stand", "recover_stand"}:
+            await self.stop_motion(reason=f"before_{command.action}")
+            responses = await self._stand_then_rl_control()
+            return {
+                "ok": True,
+                "dry_run": False,
+                "operation": f"robot_{command.action}",
+                "payload": {
+                    **command.model_dump(exclude_none=True),
+                    "protocol": [
+                        {"type": payload["PatrolDevice"]["Type"], "command": payload["PatrolDevice"]["Command"], "items": payload["PatrolDevice"]["Items"]}
+                        for payload, _response in responses
+                    ],
+                    "response": [response for _payload, response in responses],
+                    "state": self._state_snapshot(),
+                },
+            }
+
+        await self.stop_motion(reason=f"before_{command.action}")
+        payload = self._command_payload(command)
+        response = await self._send_payload(payload)
+        self._apply_local_command_state(command)
+        return {
+            "ok": True,
+            "dry_run": False,
+            "operation": f"robot_{command.action}",
+            "payload": {
+                **command.model_dump(exclude_none=True),
+                "protocol": self._protocol_summary(payload),
+                "response": response,
+                "state": self._state_snapshot(),
+            },
+        }
+
+    async def update_motion_intent(self, command: RobotCommand, client_id: Optional[str]) -> Dict[str, Any]:
+        self._apply_local_command_state(command)
+        async with self._motion_lock:
+            self._motion_command = command
+            self._motion_client_id = client_id
+            self._motion_expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.MOTION_INTENT_TTL_SECONDS)
+            if not self._motion_task or self._motion_task.done():
+                self._motion_task = asyncio.create_task(self._motion_loop())
+        payload = self._command_payload(command)
+        return {
+            "ok": True,
+            "dry_run": False,
+            "operation": f"robot_{command.action}",
+            "payload": {
+                **command.model_dump(exclude_none=True),
+                "protocol": self._protocol_summary(payload),
+                "motion_loop": {
+                    "interval_seconds": self.MOTION_INTERVAL_SECONDS,
+                    "intent_ttl_seconds": self.MOTION_INTENT_TTL_SECONDS,
+                    "client_id": client_id,
+                },
+                "state": self._state_snapshot(),
+            },
+        }
+
+    async def stop_motion(self, reason: str = "stop") -> Dict[str, Any]:
+        async with self._motion_lock:
+            had_intent = self._motion_command is not None
+            self._motion_command = None
+            self._motion_client_id = None
+            self._motion_expires_at = None
+        should_send_zero = had_intent or not reason.startswith("before_")
+        if should_send_zero:
+            try:
+                await self._send_zero_burst()
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"M20 motion stop failed: {exc}") from exc
+        self._apply_local_command_state(RobotCommand(action="stop_move"))
+        payload = self._command_payload(RobotCommand(action="stop_move"))
+        return {
+            "ok": True,
+            "dry_run": False,
+            "operation": "robot_stop_move",
+            "payload": {
+                "reason": reason,
+                "protocol": self._protocol_summary(payload),
+                "zero_burst_count": self.MOTION_ZERO_BURST_COUNT if should_send_zero else 0,
+                "state": self._state_snapshot(),
+            },
+        }
+
+    async def _motion_loop(self) -> None:
+        rl_prepared = False
+        try:
+            while True:
+                command = await self._current_motion_command()
+                if not command:
+                    try:
+                        async with self._control_io_lock:
+                            _reader, writer = await self._ensure_control_connection_unlocked()
+                            await self._send_zero_burst_unlocked(writer)
+                            await self._close_control_connection_unlocked()
+                    except Exception as exc:
+                        self._last_error = f"M20 motion zero burst failed: {exc or type(exc).__name__}"
+                    return
+                try:
+                    if not rl_prepared:
+                        await self._ensure_rl_control()
+                        rl_prepared = True
+                    async with self._control_io_lock:
+                        reader, writer = await self._ensure_control_connection_unlocked()
+                        await self._write_payload_no_response(writer, self._command_payload(command))
+                        error_code = await self._read_motion_error_code(reader)
+                    if error_code not in (None, 0):
+                        error_hex = f"0x{error_code:04X}" if isinstance(error_code, int) else str(error_code)
+                        self._last_error = f"M20 axis command rejected: ErrorCode={error_hex}"
+                        rl_prepared = False
+                        async with self._control_io_lock:
+                            await self._close_control_connection_unlocked()
+                        if error_code == 0xE006 and await self._has_motion_command():
+                            await asyncio.sleep(self.MOTION_INTERVAL_SECONDS)
+                            continue
+                        if not await self._has_motion_command():
+                            return
+                        await asyncio.sleep(self.MOTION_INTERVAL_SECONDS)
+                        continue
+                    self._last_error = None
+                except Exception as exc:
+                    self._last_error = f"M20 motion loop failed: {exc or type(exc).__name__}"
+                    rl_prepared = False
+                    async with self._control_io_lock:
+                        await self._close_control_connection_unlocked()
+                    if not await self._has_motion_command():
+                        return
+                await asyncio.sleep(self.MOTION_INTERVAL_SECONDS)
+        finally:
+            async with self._control_io_lock:
+                await self._close_control_connection_unlocked()
+
+    async def _ensure_control_connection_unlocked(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self._control_writer is None or self._control_writer.is_closing():
+            self._control_reader, self._control_writer = await self._open_motion_connection()
+        return self._control_reader, self._control_writer
+
+    async def _close_control_connection_unlocked(self) -> None:
+        writer = self._control_writer
+        self._control_reader = None
+        self._control_writer = None
+        if writer is not None and not writer.is_closing():
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _ensure_rl_control_unlocked(self, writer: asyncio.StreamWriter) -> None:
+        if self._rl_control_ready:
+            return
+        motion_state = self._last_status.get("motion_state_code")
+        if motion_state == self.RL_CONTROL_VALUE:
+            self._rl_control_ready = True
+            robot_state["posture"] = "rl_control"
+            return
+        posture = self._last_status.get("posture")
+        if posture in {"lie_down", "unknown", "idle"} or motion_state in {0, 4, None}:
+            stand_payload = M20Protocol.patrol_payload(2, 22, {"MotionParam": self.MOTION_VALUES["stand"]})
+            await self._write_payload_no_response(writer, stand_payload)
+            await asyncio.sleep(0.5)
+        rl_payload = M20Protocol.patrol_payload(2, 22, {"MotionParam": self.RL_CONTROL_VALUE})
+        await self._write_payload_no_response(writer, rl_payload)
+        await asyncio.sleep(0.5)
+        self._rl_control_ready = True
+        self._last_status["posture"] = "rl_control"
+        self._last_status["motion_state_code"] = self.RL_CONTROL_VALUE
+        robot_state["posture"] = "rl_control"
+
+    async def _ensure_rl_control(self) -> None:
+        if self._rl_control_ready:
+            return
+        motion_state = self._last_status.get("motion_state_code")
+        if motion_state == self.RL_CONTROL_VALUE:
+            self._rl_control_ready = True
+            robot_state["posture"] = "rl_control"
+            return
+        posture = self._last_status.get("posture")
+        if posture in {"lie_down", "unknown", "idle"} or motion_state in {0, 4, None}:
+            stand_payload = M20Protocol.patrol_payload(2, 22, {"MotionParam": self.MOTION_VALUES["stand"]})
+            async with self._control_io_lock:
+                _reader, writer = await self._ensure_control_connection_unlocked()
+                await self._write_payload_no_response(writer, stand_payload)
+            await asyncio.sleep(0.5)
+        rl_payload = M20Protocol.patrol_payload(2, 22, {"MotionParam": self.RL_CONTROL_VALUE})
+        async with self._control_io_lock:
+            _reader, writer = await self._ensure_control_connection_unlocked()
+            await self._write_payload_no_response(writer, rl_payload)
+        await asyncio.sleep(0.5)
+        self._rl_control_ready = True
+        self._last_status["posture"] = "rl_control"
+        self._last_status["motion_state_code"] = self.RL_CONTROL_VALUE
+        robot_state["posture"] = "rl_control"
+
+    def _sync_rl_ready_from_status(self, mapped: Dict[str, Any]) -> None:
+        motion_state = mapped.get("motion_state_code")
+        if motion_state is None:
+            return
+        self._rl_control_ready = motion_state == self.RL_CONTROL_VALUE
+
+    def _invalidate_rl_ready_from_payload(self, payload: Dict[str, Any]) -> None:
+        patrol = payload.get("PatrolDevice") or {}
+        if patrol.get("Type") == 2 and patrol.get("Command") == 22:
+            motion_param = (patrol.get("Items") or {}).get("MotionParam")
+            if motion_param != self.RL_CONTROL_VALUE:
+                self._rl_control_ready = False
+
+    async def _has_motion_command(self) -> bool:
+        return (await self._current_motion_command()) is not None
+
+    async def _current_motion_command(self) -> Optional[RobotCommand]:
+        async with self._motion_lock:
+            if not self._motion_command or not self._motion_expires_at:
+                return None
+            if datetime.now(timezone.utc) >= self._motion_expires_at:
+                self._motion_command = None
+                self._motion_client_id = None
+                self._motion_expires_at = None
+                self._apply_local_command_state(RobotCommand(action="stop_move"))
+                return None
+            return self._motion_command
+
+    async def _open_motion_connection(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.wait_for(
+            asyncio.open_connection(self.settings.m20_host, self.settings.m20_tcp_port),
+            timeout=1,
+        )
+
+    async def _send_zero_burst(self, writer: Optional[asyncio.StreamWriter] = None) -> None:
+        if writer is None:
+            async with self._control_io_lock:
+                _reader, active_writer = await self._ensure_control_connection_unlocked()
+                await self._send_zero_burst_unlocked(active_writer)
+                await self._close_control_connection_unlocked()
+            return
+        await self._send_zero_burst_unlocked(writer)
+
+    async def _send_zero_burst_unlocked(self, writer: asyncio.StreamWriter) -> None:
+        payload = self._command_payload(RobotCommand(action="stop_move"))
+        for _index in range(self.MOTION_ZERO_BURST_COUNT):
+            await self._write_payload_no_response(writer, payload)
+            await asyncio.sleep(self.MOTION_INTERVAL_SECONDS)
+
+    async def _write_payload_no_response(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> int:
+        message_id = next(self._message_ids) & 0xFFFF
+        writer.write(M20Protocol.build_frame(message_id, payload))
+        await writer.drain()
+        return message_id
+
+    async def _read_motion_error_code(self, reader: asyncio.StreamReader) -> Optional[int]:
+        try:
+            parsed = await self._read_optional_response(reader, timeout=0.02)
+        except Exception:
+            return None
+        if not parsed:
+            return None
+        items = ((parsed.get("payload") or {}).get("PatrolDevice") or {}).get("Items") or {}
+        error_code = items.get("ErrorCode")
+        return int(error_code) if error_code is not None else None
+
+    async def _stand_then_rl_control(self) -> List[tuple[Dict[str, Any], Dict[str, Any]]]:
+        stand_payload = M20Protocol.patrol_payload(2, 22, {"MotionParam": self.MOTION_VALUES["stand"]})
+        stand_response = await self._send_payload(stand_payload)
+        await asyncio.sleep(0.5)
+        rl_payload = M20Protocol.patrol_payload(2, 22, {"MotionParam": self.RL_CONTROL_VALUE})
+        rl_response = await self._send_payload(rl_payload)
+        self._rl_control_ready = True
+        robot_state["posture"] = "rl_control"
+        return [(stand_payload, stand_response), (rl_payload, rl_response)]
+
+    async def _send_payload(self, payload: Dict[str, Any], response_timeout: float = 1.0) -> Dict[str, Any]:
+        self._invalidate_rl_ready_from_payload(payload)
+        message_id = next(self._message_ids) & 0xFFFF
+        frame = M20Protocol.build_frame(message_id, payload)
+        try:
+            async with self._control_io_lock:
+                reader, writer = await self._ensure_control_connection_unlocked()
+                writer.write(frame)
+                await writer.drain()
+                response = await self._read_optional_response(reader, timeout=response_timeout)
+            patrol = payload.get("PatrolDevice") or {}
+            if patrol.get("Type") == 2 and patrol.get("Command") == 22:
+                motion_param = (patrol.get("Items") or {}).get("MotionParam")
+                if motion_param == self.RL_CONTROL_VALUE:
+                    self._rl_control_ready = True
+                    robot_state["posture"] = "rl_control"
+            return {"message_id": message_id, "response": response}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            async with self._control_io_lock:
+                await self._close_control_connection_unlocked()
+            raise HTTPException(status_code=502, detail=f"M20 protocol request failed: {exc}") from exc
+
+    async def _read_optional_response(self, reader: asyncio.StreamReader, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        if timeout <= 0:
+            return None
+        try:
+            header = await asyncio.wait_for(reader.readexactly(M20Protocol.HEADER_SIZE), timeout=timeout)
+            length = struct.unpack("<H", header[4:6])[0]
+            body = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+            parsed = M20Protocol.parse_frame(header + body)
+            self._remember_status(parsed)
+            return parsed
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.IncompleteReadError:
+            return None
+
+    def _remember_status(self, parsed: Dict[str, Any]) -> None:
+        payload = parsed.get("payload")
+        if not isinstance(payload, dict):
+            return
+        patrol = payload.get("PatrolDevice")
+        if not isinstance(patrol, dict):
+            return
+        items = patrol.get("Items")
+        if isinstance(items, dict):
+            mapped = self._map_status_items(items)
+            self._last_status.update(mapped)
+            self._sync_rl_ready_from_status(mapped)
+            self._last_received_at = datetime.now(timezone.utc).isoformat()
+
+    def _status_age_seconds(self) -> Optional[float]:
+        if not self._last_received_at:
+            return None
+        try:
+            received = datetime.fromisoformat(self._last_received_at)
+        except ValueError:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - received).total_seconds())
+
+    def _map_status_items(self, items: Dict[str, Any]) -> Dict[str, Any]:
+        mapped: Dict[str, Any] = {}
+        basic = items.get("BasicStatus") or {}
+        motion = items.get("MotionStatus") or {}
+        device = items
+        if isinstance(basic, dict) and basic:
+            mapped.update(
+                {
+                    "mode": self._mode_label(basic.get("ControlUsageMode")),
+                    "posture": self._posture_label(basic.get("MotionState")),
+                    "gait": self._gait_label(basic.get("Gait")),
+                    "direction": "rear" if basic.get("Direction") == 1 else "front",
+                    "hard_estop": bool(basic.get("HES")),
+                    "sleep": self._sleep_label(basic.get("Sleep")),
+                    "sleep_code": basic.get("Sleep"),
+                    "raw_basic_status": basic,
+                    "motion_state_code": basic.get("MotionState"),
+                    "gait_code": basic.get("Gait"),
+                }
+            )
+        if isinstance(motion, dict) and motion:
+            mapped["range_km"] = motion.get("RemainMile", robot_state["range_km"])
+            mapped["motion_status"] = motion
+            mapped["actual_velocity"] = {
+                "x": motion.get("LinearX", 0.0),
+                "y": motion.get("LinearY", 0.0),
+                "yaw": motion.get("OmegaZ", 0.0),
+                "source": "motion_status",
+            }
+        battery = device.get("BatteryStatus") if isinstance(device, dict) else None
+        if isinstance(battery, dict):
+            mapped["battery"] = {
+                "front": battery.get("BatteryLevelLeft", robot_state["battery"]["front"]),
+                "rear": battery.get("BatteryLevelRight", robot_state["battery"]["rear"]),
+            }
+        temperatures = device.get("DeviceTemperature") if isinstance(device, dict) else None
+        if isinstance(temperatures, dict):
+            mapped["temperatures"] = self._temperature_list(temperatures)
+        led = device.get("Led") if isinstance(device, dict) else None
+        if isinstance(led, dict):
+            fill = led.get("Fill") or {}
+            mapped["lights"] = {"front": bool(fill.get("Front")), "rear": bool(fill.get("Back"))}
+            mapped["raw_led"] = led
+        dev_enable = device.get("DevEnable") if isinstance(device, dict) else None
+        if isinstance(dev_enable, dict):
+            video = dev_enable.get("Video") or {}
+            mapped["dev_enable"] = dev_enable
+            if isinstance(video, dict):
+                mapped["camera_power"] = {
+                    "front": bool(video.get("Front")),
+                    "rear": bool(video.get("Back")),
+                }
+        error_list = device.get("ErrorList") if isinstance(device, dict) else None
+        if isinstance(error_list, list):
+            mapped["faults"] = error_list
+        gps = device.get("GPS") if isinstance(device, dict) else None
+        if isinstance(gps, dict) and gps:
+            mapped["gps"] = {
+                "latitude": gps.get("Latitude"),
+                "longitude": gps.get("Longitude"),
+                "speed_kmh": gps.get("Speed"),
+                "course_deg": gps.get("Course"),
+                "fix_quality": gps.get("FixQuality"),
+                "num_satellites": gps.get("NumSatellites"),
+                "altitude_m": gps.get("Altitude"),
+                "hdop": gps.get("HDOP"),
+                "vdop": gps.get("VDOP"),
+                "pdop": gps.get("PDOP"),
+                "visible_satellites": gps.get("VisibleSatellites"),
+            }
+        return mapped
+
+    def _command_payload(self, command: RobotCommand) -> Dict[str, Any]:
+        action = command.action
+        if action == "set_mode":
+            if command.value not in self.MODE_VALUES:
+                raise HTTPException(status_code=400, detail="Unsupported robot mode")
+            return M20Protocol.patrol_payload(1101, 5, {"Mode": self.MODE_VALUES[command.value]})
+        if action in self.MOTION_VALUES:
+            return M20Protocol.patrol_payload(2, 22, {"MotionParam": self.MOTION_VALUES[action]})
+        if action == "set_gait":
+            if command.value not in self.GAIT_VALUES:
+                raise HTTPException(status_code=400, detail="Unsupported robot gait")
+            return M20Protocol.patrol_payload(2, 23, {"GaitParam": self.GAIT_VALUES[command.value]})
+        if action in {"light_front", "light_rear"}:
+            lights = self._current_lights()
+            return M20Protocol.patrol_payload(
+                1101,
+                2,
+                {
+                    "Front": int((not lights["front"]) if action == "light_front" else lights["front"]),
+                    "Back": int((not lights["rear"]) if action == "light_rear" else lights["rear"]),
+                },
+            )
+        if action == "set_lights":
+            if command.front_light is None or command.rear_light is None:
+                raise HTTPException(status_code=400, detail="Missing robot light target")
+            return M20Protocol.patrol_payload(
+                1101,
+                2,
+                {"Front": int(command.front_light), "Back": int(command.rear_light)},
+            )
+        if action == "move":
+            axes = self._scaled_motion_axes(command)
+            # 前端平移输入以屏幕向右为正，M20 协议 Y 轴以向左为正，因此 Y 轴发送时取反。
+            return M20Protocol.patrol_payload(
+                2,
+                21,
+                {
+                    "X": axes["y"],
+                    "Y": -axes["x"],
+                    "Z": 0.0,
+                    "Roll": 0.0,
+                    "Pitch": 0.0,
+                    "Yaw": axes["rotation"] * self.YAW_AXIS_SIGN,
+                },
+            )
+        if action == "stop_move":
+            return M20Protocol.patrol_payload(
+                2,
+                21,
+                {"X": 0.0, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0},
+            )
+        if action == "direction_reverse":
+            return M20Protocol.patrol_payload(
+                2,
+                21,
+                {"X": 0.0, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0},
+            )
+        raise HTTPException(status_code=400, detail="Unsupported robot action")
+
+    def _current_lights(self) -> Dict[str, bool]:
+        latest = self._last_status.get("lights")
+        if isinstance(latest, dict):
+            return {
+                "front": bool(latest.get("front")),
+                "rear": bool(latest.get("rear")),
+            }
+        return {
+            "front": bool(robot_state["lights"].get("front")),
+            "rear": bool(robot_state["lights"].get("rear")),
+        }
+
+    def _state_snapshot(self) -> Dict[str, Any]:
+        return json.loads(json.dumps({**robot_state, **self._last_status}))
+
+    @staticmethod
+    def _apply_local_command_state(command: RobotCommand) -> None:
+        if command.action == "move":
+            robot_state["motion"] = M20RobotClient._scaled_motion_axes(command)
+        elif command.action == "stop_move":
+            robot_state["motion"] = {"x": 0, "y": 0, "rotation": 0}
+        elif command.action == "set_lights":
+            if command.front_light is not None:
+                robot_state["lights"]["front"] = command.front_light
+            if command.rear_light is not None:
+                robot_state["lights"]["rear"] = command.rear_light
+
+    @classmethod
+    def _scaled_motion_axes(cls, command: RobotCommand) -> Dict[str, float]:
+        speed = float(robot_state.get("speed") or 0.0)
+        x = (command.x or 0.0) * speed
+        y = (command.y or 0.0) * speed
+        rotation = (command.rotation or 0.0) * speed
+        if y > 0:
+            y *= cls.FORWARD_AXIS_GAIN
+        # operator_direction is a platform-side viewing/control frame. It does
+        # not change the robot-reported BasicStatus.Direction; it only maps the
+        # same operator input to opposite physical translation axes.
+        if robot_state.get("operator_direction") == "rear":
+            x = -x
+            y = -y
+        return {
+            "x": cls._clamp_axis(x),
+            "y": cls._clamp_axis(y),
+            "rotation": cls._clamp_axis(rotation),
+        }
+
+    @staticmethod
+    def _clamp_axis(value: float) -> float:
+        return max(-1.0, min(1.0, value))
+
+    @staticmethod
+    def _protocol_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+        patrol = payload["PatrolDevice"]
+        return {"type": patrol["Type"], "command": patrol["Command"], "items": patrol["Items"]}
+
+    @staticmethod
+    def _mode_label(value: Any) -> str:
+        return {0: "normal", 1: "navigation", 2: "assist"}.get(value, robot_state["mode"])
+
+    @staticmethod
+    def _posture_label(value: Any) -> str:
+        return {0: "idle", 1: "stand", 2: "soft_estop", 3: "boot_damping", 4: "lie_down", 17: "rl_control"}.get(
+            value, robot_state["posture"]
+        )
+
+    @staticmethod
+    def _gait_label(value: Any) -> str:
+        return {0x1001: "basic", 0x1002: "platform", 0x1003: "stairs", 0x3002: "agile_flat", 0x3003: "agile_stairs"}.get(
+            value, robot_state["gait"]
+        )
+
+    @staticmethod
+    def _sleep_label(value: Any) -> str:
+        return {0: "awake", 1: "sleeping", 2: "entering_sleep"}.get(value, "unknown")
+
+    @staticmethod
+    def _temperature_list(temperatures: Dict[str, Any]) -> List[Dict[str, Any]]:
+        motor = temperatures.get("Motor") or []
+        driver = temperatures.get("Driver") or []
+        names = [
+            "LeftFrontHipX",
+            "LeftFrontHipY",
+            "LeftFrontKnee",
+            "LeftFrontWheel",
+            "RightFrontHipX",
+            "RightFrontHipY",
+            "RightFrontKnee",
+            "RightFrontWheel",
+            "LeftBackHipX",
+            "LeftBackHipY",
+            "LeftBackKnee",
+            "LeftBackWheel",
+            "RightBackHipX",
+            "RightBackHipY",
+            "RightBackKnee",
+            "RightBackWheel",
+        ]
+        result = []
+        for index, name in enumerate(names):
+            result.append(
+                {
+                    "joint": name,
+                    "motor": motor[index] if index < len(motor) else temperatures.get(f"{name}Motor"),
+                    "driver": driver[index] if index < len(driver) else temperatures.get(f"{name}Driver"),
+                }
+            )
+        return result
+
+
+class M20StatusProtocol(asyncio.DatagramProtocol):
+    def __init__(self, client: M20RobotClient) -> None:
+        self.client = client
+
+    def datagram_received(self, data: bytes, addr: Any) -> None:
+        self.client.ingest_datagram(data, addr)
+
+    def error_received(self, exc: Exception) -> None:
+        self.client._last_error = f"M20 status transport error: {exc}"
+
+
+m20_robot_client = M20RobotClient(settings)
+lift_real_adapter = LiftRealAdapter(settings)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global _lift_deadman_task
+    bind_central_bridge()
+    await m20_robot_client.start_status_monitor()
+    await lift_real_adapter.start_status_monitor()
+    await central_bridge.start_bridge_mqtt()
+    if _lift_deadman_task is None or _lift_deadman_task.done():
+        _lift_deadman_task = asyncio.create_task(_lift_dry_run_deadman_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await central_bridge.stop_bridge_mqtt()
+    await m20_robot_client.stop_status_monitor()
+    await lift_real_adapter.stop()
+    if _lift_deadman_task:
+        _lift_deadman_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _lift_deadman_task
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "index.html")
+
+
+@app.get("/favicon.ico")
+async def favicon() -> Response:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<rect width="64" height="64" rx="12" fill="#17212b"/>'
+        '<path d="M14 39h36v8H14z" fill="#f7fafc"/>'
+        '<path d="M22 17h20l8 22H14z" fill="#6aa37a"/>'
+        '<circle cx="25" cy="47" r="5" fill="#9fb0bf"/>'
+        '<circle cx="43" cy="47" r="5" fill="#9fb0bf"/>'
+        '<path d="M31 23h8l3 9H31z" fill="#eef8f1"/>'
+        '</svg>'
+    )
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+@app.get("/api/health")
+async def health() -> Dict[str, Any]:
+    return {"ok": True, "dry_run": settings.dry_run}
+
+
+@app.post("/api/config/verify-password")
+async def verify_settings_password(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    given = str(payload.get("password", ""))
+    if not settings.settings_password:
+        return {"ok": True, "has_password": False}
+    if given == settings.settings_password:
+        return {"ok": True, "has_password": True}
+    return JSONResponse(status_code=403, content={"ok": False, "has_password": True, "detail": "密码错误"})
+
+
+@app.get("/api/config/device")
+async def get_device_config() -> Dict[str, Any]:
+    payload = settings.public_payload()
+    payload["has_settings_password"] = bool(settings.settings_password)
+    payload["settings_password"] = ""  # 不向前端暴露密码原文
+    payload["has_bridge_token"] = bool(settings.bridge_token)
+    payload["bridge_token"] = ""
+    payload["bridge_mqtt_password"] = ""
+    return payload
+
+
+@app.put("/api/config/device")
+async def update_device_config(config: DeviceConfigUpdate) -> Dict[str, Any]:
+    global settings
+
+    old_password = settings.settings_password
+    old_zero_pulse = settings.lift_position_zero_pulse
+    old_position_trusted = settings.lift_position_trusted
+    old_last_raw_pulse = settings.lift_last_raw_pulse
+    old_bridge = {
+        "bridge_enabled": settings.bridge_enabled,
+        "bridge_token": settings.bridge_token,
+        "bridge_rtsp_public_base": settings.bridge_rtsp_public_base,
+        "bridge_mqtt_enabled": settings.bridge_mqtt_enabled,
+        "bridge_mqtt_host": settings.bridge_mqtt_host,
+        "bridge_mqtt_port": settings.bridge_mqtt_port,
+        "bridge_mqtt_topic_prefix": settings.bridge_mqtt_topic_prefix,
+        "bridge_mqtt_username": settings.bridge_mqtt_username,
+        "bridge_mqtt_password": settings.bridge_mqtt_password,
+        "bridge_mqtt_interval_s": settings.bridge_mqtt_interval_s,
+    }
+    settings = config.to_settings()
+    # 页面不传密码时保留已有密码（仅通过配置文件修改）
+    if not config.settings_password:
+        settings.settings_password = old_password
+    # 零点只由「设为零点」写入，系统参数页保存不得清掉。
+    settings.lift_position_zero_pulse = old_zero_pulse
+    settings.lift_position_trusted = old_position_trusted
+    settings.lift_last_raw_pulse = old_last_raw_pulse
+    for key, value in old_bridge.items():
+        setattr(settings, key, value)
+    persisted = True
+    warning = None
+    try:
+        settings.save()
+    except OSError as exc:
+        persisted = False
+        warning = f"Config applied in memory but not saved to disk: {exc}"
+
+    control_client.reset(settings)
+    m20_robot_client.reset(settings)
+    await lift_real_adapter.restart(settings)
+    await m20_robot_client.restart_status_monitor()
+    await manager.broadcast(ControlEvent(device_id="system", type="config_updated", payload=settings.public_payload()))
+    payload = settings.public_payload()
+    payload["persisted"] = persisted
+    payload["has_bridge_token"] = bool(settings.bridge_token)
+    payload["bridge_token"] = ""
+    payload["bridge_mqtt_password"] = ""
+    if warning:
+        payload["warning"] = warning
+    return payload
+
+
+@app.get("/api/devices")
+async def list_devices() -> Dict[str, Any]:
+    return {"devices": device_payloads()}
+
+
+@app.get("/api/control/logs")
+async def get_control_logs() -> Dict[str, Any]:
+    return {"logs": control_log.list()}
+
+
+@app.get("/api/devices/{device_id}/status")
+async def get_device_status(device_id: str) -> Dict[str, Any]:
+    ensure_device(device_id)
+    payload = await probe_device_status(device_id)
+    await manager.broadcast(ControlEvent(device_id=device_id, type="device_status_updated", payload=payload))
+    return payload
+
+
+@app.get("/api/devices/{device_id}/robot/status")
+async def get_robot_status(device_id: str) -> Dict[str, Any]:
+    ensure_robot_device(device_id)
+    payload = await m20_robot_client.status_payload()
+    await manager.broadcast(ControlEvent(device_id=device_id, type="device_status_updated", payload=payload))
+    return payload
+
+
+@app.post("/api/devices/{device_id}/robot/control")
+async def robot_control(device_id: str, request: Request, command: RobotCommand) -> Dict[str, Any]:
+    ensure_robot_device(device_id)
+    client_id = require_client_id(request)
+    payload = command.model_dump(exclude_none=True)
+    try:
+        await handle_expired_lease(device_id)
+        if command.action not in {"soft_estop", "stop_move"}:
+            lease_manager.require_control(device_id, client_id)
+        result = await m20_robot_client.control(command, client_id=client_id)
+        if command.action != "move":
+            control_log.add(
+                device_id=device_id,
+                client_id=client_id,
+                action=f"robot_{command.action}",
+                ok=True,
+                payload=payload,
+                dry_run=bool(result["dry_run"]),
+            )
+            await manager.broadcast(ControlEvent(device_id=device_id, type=f"robot_{command.action}", payload=result))
+        return result
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, f"robot_{command.action}", payload, exc)
+        raise
+
+
+@app.get("/api/devices/{device_id}/lift/status")
+async def get_lift_status(device_id: str) -> Dict[str, Any]:
+    ensure_lift_device(device_id)
+    payload = await lift_real_adapter.status_payload() if not settings.lift_dry_run else lift_status_payload()
+    await manager.broadcast(ControlEvent(device_id=device_id, type="device_status_updated", payload=payload))
+    return payload
+
+
+@app.post("/api/devices/{device_id}/lift/control")
+async def lift_control(device_id: str, request: Request, command: LiftCommand) -> Dict[str, Any]:
+    ensure_lift_device(device_id)
+    client_id = require_client_id(request)
+    payload = command.model_dump(exclude_none=True)
+    try:
+        await handle_expired_lease(device_id)
+        if command.action != "stop":
+            lease_manager.require_control(device_id, client_id)
+        return await execute_lift_control(device_id, client_id, command)
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, f"lift_{command.action}", payload, exc)
+        raise
+
+
+async def execute_lift_control(device_id: str, client_id: str, command: LiftCommand) -> Dict[str, Any]:
+    payload = command.model_dump(exclude_none=True)
+    if settings.lift_dry_run:
+        state_payload = apply_lift_dry_run_command(command)
+    else:
+        state_payload = await lift_real_adapter.control(command)
+    result = {
+        "ok": True,
+        "dry_run": settings.lift_dry_run,
+        "operation": f"lift_{command.action}",
+        "payload": {**payload, "state": state_payload},
+    }
+    control_log.add(
+        device_id=device_id,
+        client_id=client_id,
+        action=f"lift_{command.action}",
+        ok=True,
+        payload=payload,
+        dry_run=settings.lift_dry_run,
+    )
+    await manager.broadcast(ControlEvent(device_id=device_id, type=f"lift_{command.action}", payload=result))
+    return result
+
+
+@app.get("/api/devices/{device_id}/lease")
+async def get_lease(device_id: str, request: Request) -> Dict[str, Any]:
+    ensure_device(device_id)
+    await handle_expired_lease(device_id)
+    return lease_manager.payload(device_id, optional_client_id(request))
+
+
+@app.post("/api/devices/{device_id}/lease/acquire")
+async def acquire_lease(device_id: str, request: Request, lease_request: LeaseRequest) -> Dict[str, Any]:
+    ensure_device(device_id)
+    await handle_expired_lease(device_id)
+    client_id = require_client_id(request)
+    holder_name = lease_request.holder_name.strip()
+    role = lease_role_for_holder(holder_name)
+    existing, _ = lease_manager.current(device_id)
+    preempting = bool(
+        existing
+        and existing.holder_id != client_id
+        and role == "local"
+        and is_central_holder_name(existing.holder_name)
+    )
+    if preempting:
+        await emergency_stop_device(device_id, "local_preempt_central")
+    payload = lease_manager.acquire(device_id, client_id, holder_name, role=role)
+    await manager.broadcast(ControlEvent(device_id=device_id, type="lease_acquired", payload=payload))
+    return payload
+
+
+@app.post("/api/devices/{device_id}/lease/renew")
+async def renew_lease(device_id: str, request: Request) -> Dict[str, Any]:
+    ensure_device(device_id)
+    payload = lease_manager.renew(device_id, require_client_id(request))
+    await manager.broadcast(ControlEvent(device_id=device_id, type="lease_renewed", payload=payload))
+    return payload
+
+
+@app.post("/api/devices/{device_id}/lease/release")
+async def release_lease(device_id: str, request: Request) -> Dict[str, Any]:
+    ensure_device(device_id)
+    client_id = require_client_id(request)
+    held_before_release = lease_manager.payload(device_id, client_id).get("can_control")
+    payload = lease_manager.release(device_id, client_id)
+    if held_before_release:
+        await emergency_stop_device(device_id, "lease_released")
+    await manager.broadcast(ControlEvent(device_id=device_id, type="lease_released", payload=payload))
+    return payload
+
+
+def ptz_device_dry_run(device_id: str) -> bool:
+    """返回指定 PTZ 设备是否处于 dry-run 模式"""
+    if device_id == "roof_ptz_1":
+        return settings.roof_ptz_dry_run
+    return settings.dog_ptz_dry_run
+
+
+@app.post("/api/devices/{device_id}/ptz/start")
+async def ptz_start(device_id: str, request: Request, command: PTZCommand) -> Dict[str, Any]:
+    ensure_ptz_device(device_id)
+    client_id = require_client_id(request)
+    payload = command.model_dump()
+    try:
+        await handle_expired_lease(device_id)
+        lease_manager.require_control(device_id, client_id)
+        return await execute_ptz_start(device_id, client_id, command)
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, "ptz_start", payload, exc)
+        raise
+
+
+async def execute_ptz_start(device_id: str, client_id: str, command: PTZCommand) -> Dict[str, Any]:
+    payload = command.model_dump()
+    dry_run = ptz_device_dry_run(device_id)
+    client = ptz_control_client(device_id)
+    if dry_run:
+        result = await client._operation("ptz_start", payload)
+    else:
+        result = await client.ptz_start(command.command, command.speed)
+    control_log.add(device_id=device_id, client_id=client_id, action="ptz_start", ok=True, payload=payload, dry_run=dry_run)
+    await manager.broadcast(ControlEvent(device_id=device_id, type="ptz_started", payload=result))
+    return result
+
+
+@app.post("/api/devices/{device_id}/ptz/stop")
+async def ptz_stop(device_id: str, request: Request, command: PTZCommand) -> Dict[str, Any]:
+    ensure_ptz_device(device_id)
+    client_id = require_client_id(request)
+    payload = command.model_dump()
+    try:
+        await handle_expired_lease(device_id)
+        lease_manager.require_control(device_id, client_id)
+        return await execute_ptz_stop(device_id, client_id, command)
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, "ptz_stop", payload, exc)
+        raise
+
+
+async def execute_ptz_stop(device_id: str, client_id: str, command: PTZCommand) -> Dict[str, Any]:
+    payload = command.model_dump()
+    dry_run = ptz_device_dry_run(device_id)
+    client = ptz_control_client(device_id)
+    if dry_run:
+        result = await client._operation("ptz_stop", payload)
+    else:
+        result = await client.ptz_stop(command.command)
+    control_log.add(device_id=device_id, client_id=client_id, action="ptz_stop", ok=True, payload=payload, dry_run=dry_run)
+    await manager.broadcast(ControlEvent(device_id=device_id, type="ptz_stopped", payload=result))
+    return result
+
+
+@app.post("/api/devices/{device_id}/ptz/home")
+async def ptz_home(device_id: str, request: Request) -> Dict[str, Any]:
+    ensure_ptz_device(device_id)
+    client_id = require_client_id(request)
+    payload = {}
+    try:
+        await handle_expired_lease(device_id)
+        lease_manager.require_control(device_id, client_id)
+        return await execute_ptz_home(device_id, client_id)
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, "ptz_home", payload, exc)
+        raise
+
+
+async def execute_ptz_home(device_id: str, client_id: str) -> Dict[str, Any]:
+    dry_run = ptz_device_dry_run(device_id)
+    client = ptz_control_client(device_id)
+    if dry_run:
+        result = await client._operation("ptz_home", {})
+    else:
+        result = await client.ptz_home()
+    control_log.add(device_id=device_id, client_id=client_id, action="ptz_home", ok=True, payload={}, dry_run=dry_run)
+    await manager.broadcast(ControlEvent(device_id=device_id, type="ptz_home", payload=result))
+    return result
+
+
+@app.post("/api/devices/{device_id}/presets/{action}")
+async def preset_action(device_id: str, action: str, request: Request, command: PresetCommand) -> Dict[str, Any]:
+    ensure_ptz_device(device_id)
+    client_id = require_client_id(request)
+    payload = command.model_dump()
+    try:
+        await handle_expired_lease(device_id)
+        if action not in {"save", "goto", "delete"}:
+            raise HTTPException(status_code=400, detail="Unsupported preset action")
+        lease_manager.require_control(device_id, client_id)
+        dry_run = ptz_device_dry_run(device_id)
+        client = ptz_control_client(device_id)
+        if dry_run:
+            result = await client._operation(f"preset_{action}", payload)
+        else:
+            result = await client.preset(action, command.preset)
+        control_log.add(device_id=device_id, client_id=client_id, action=f"preset_{action}", ok=True, payload=payload, dry_run=dry_run)
+        await manager.broadcast(ControlEvent(device_id=device_id, type=f"preset_{action}", payload=result))
+        return result
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, f"preset_{action}", payload, exc)
+        raise
+
+
+@app.post("/api/devices/{device_id}/light")
+async def set_light(device_id: str, request: Request, command: LightCommand) -> Dict[str, Any]:
+    ensure_ptz_device(device_id)
+    client_id = require_client_id(request)
+    payload = command.model_dump()
+    try:
+        await handle_expired_lease(device_id)
+        lease_manager.require_control(device_id, client_id)
+        return await execute_ptz_light(device_id, client_id, command)
+    except HTTPException as exc:
+        await record_control_failure(device_id, client_id, "light", payload, exc)
+        raise
+
+
+async def execute_ptz_light(device_id: str, client_id: str, command: LightCommand) -> Dict[str, Any]:
+    payload = command.model_dump()
+    dry_run = ptz_device_dry_run(device_id)
+    client = ptz_control_client(device_id)
+    if dry_run:
+        event_type = "light_on" if command.enabled else "light_off"
+        result = await client._operation(event_type, payload)
+    else:
+        result = await client.light(command.enabled)
+        event_type = "light_on" if command.enabled else "light_off"
+    control_log.add(device_id=device_id, client_id=client_id, action=event_type, ok=True, payload=payload, dry_run=dry_run)
+    await manager.broadcast(ControlEvent(device_id=device_id, type=event_type, payload=result))
+    return result
+
+
+def bind_central_bridge() -> None:
+    async def _bridge_lift_status() -> Dict[str, Any]:
+        if settings.lift_dry_run:
+            return lift_status_payload()
+        return await lift_real_adapter.status_payload()
+
+    central_bridge.deps.get_settings = lambda: settings
+    central_bridge.deps.lease_manager = lease_manager
+    central_bridge.deps.handle_expired_lease = handle_expired_lease
+    central_bridge.deps.emergency_stop_device = emergency_stop_device
+    central_bridge.deps.m20_status = m20_robot_client.status_payload
+    central_bridge.deps.lift_status = _bridge_lift_status
+    central_bridge.deps.lift_control = execute_lift_control
+    central_bridge.deps.ptz_start = execute_ptz_start
+    central_bridge.deps.ptz_stop = execute_ptz_stop
+    central_bridge.deps.ptz_home = execute_ptz_home
+    central_bridge.deps.ptz_light = execute_ptz_light
+    central_bridge.deps.ensure_ptz_device = ensure_ptz_device
+    central_bridge.deps.control_log_add = control_log.add
+    central_bridge.deps.broadcast = manager.broadcast
+    central_bridge.deps.LiftCommand = LiftCommand
+    central_bridge.deps.PTZCommand = PTZCommand
+    central_bridge.deps.LightCommand = LightCommand
+    central_bridge.deps.ControlEvent = ControlEvent
+
+
+@app.websocket("/ws/control")
+async def control_socket(websocket: WebSocket) -> None:
+    client_id = websocket.query_params.get("client_id") or "unknown"
+    await manager.connect(websocket, client_id)
+    await websocket.send_json(ControlEvent(device_id="system", type="connected").model_dump())
+    try:
+        while True:
+            message = await websocket.receive_json()
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=message.get("device_id", "system"),
+                    type=message.get("type", "client_event"),
+                    payload=message.get("payload", {}),
+                )
+            )
+    except WebSocketDisconnect:
+        disconnected_client_id = manager.disconnect(websocket)
+        if disconnected_client_id:
+            for payload in lease_manager.release_by_holder(disconnected_client_id):
+                await emergency_stop_device(payload["device_id"], "websocket_disconnected")
+                await manager.broadcast(
+                    ControlEvent(device_id=payload["device_id"], type="lease_released", payload=payload)
+                )
+
+
+def ensure_device(device_id: str) -> None:
+    get_device(device_id)
+
+
+def ensure_ptz_device(device_id: str) -> None:
+    ensure_device(device_id)
+    if not is_ptz_device(device_id):
+        raise HTTPException(status_code=400, detail="Device does not support PTZ control")
+
+
+def ensure_robot_device(device_id: str) -> None:
+    device = get_device(device_id)
+    if device["kind"] != "m20pro_robot":
+        raise HTTPException(status_code=400, detail="Device does not support robot control")
+
+
+def ensure_lift_device(device_id: str) -> None:
+    device = get_device(device_id)
+    if device["kind"] != "lift_pole":
+        raise HTTPException(status_code=400, detail="Device does not support lift control")
+
+
+async def handle_expired_lease(device_id: str) -> None:
+    expired = lease_manager.expire(device_id)
+    if not expired:
+        return
+
+    await emergency_stop_device(device_id, "lease_expired")
+    await manager.broadcast(ControlEvent(device_id=device_id, type="lease_expired", payload=expired))
+
+
+async def emergency_stop_device(device_id: str, reason: str) -> None:
+    device = get_device(device_id)
+    if device["kind"] == "m20pro_robot":
+        try:
+            result = await m20_robot_client.stop_motion()
+            control_log.add(
+                device_id=device_id,
+                client_id=None,
+                action="robot_stop_move",
+                ok=True,
+                dry_run=bool(result["dry_run"]),
+                payload={"reason": reason, "safety": True},
+            )
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=device_id,
+                    type="robot_stop_move",
+                    payload={"reason": reason, "result": result},
+                )
+            )
+        except HTTPException as exc:
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=device_id,
+                    type="control_failed",
+                    payload={"reason": reason, "stop_command": "robot_stop_move", "error": exc.detail},
+                )
+            )
+        return
+
+    if device["kind"] == "lift_pole":
+        try:
+            if settings.lift_dry_run:
+                state = apply_lift_dry_run_command(LiftCommand(action="stop"))
+                result = {"ok": True, "dry_run": True, "operation": "lift_stop", "payload": {"state": state}}
+            else:
+                state = await lift_real_adapter.control(LiftCommand(action="stop"))
+                result = {"ok": True, "dry_run": False, "operation": "lift_stop", "payload": {"state": state}}
+            control_log.add(
+                device_id=device_id,
+                client_id=None,
+                action="lift_stop",
+                ok=True,
+                dry_run=settings.lift_dry_run,
+                payload={"reason": reason, "safety": True},
+            )
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=device_id,
+                    type="lift_stop",
+                    payload={"reason": reason, "result": result},
+                )
+            )
+        except HTTPException as exc:
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=device_id,
+                    type="control_failed",
+                    payload={"reason": reason, "stop_command": "lift_stop", "error": exc.detail},
+                )
+            )
+        return
+
+    if not is_ptz_device(device_id):
+        return
+
+    client = ptz_control_client(device_id)
+    for command in ("up", "zoom_in"):
+        try:
+            result = await client.ptz_stop(command)
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=device_id,
+                    type="ptz_stopped",
+                    payload={"reason": reason, "stop_command": command, "result": result},
+                )
+            )
+        except HTTPException as exc:
+            await manager.broadcast(
+                ControlEvent(
+                    device_id=device_id,
+                    type="control_failed",
+                    payload={"reason": reason, "stop_command": command, "error": exc.detail},
+                )
+            )
+
+
+async def record_control_failure(
+    device_id: str,
+    client_id: Optional[str],
+    action: str,
+    payload: Dict[str, Any],
+    exc: HTTPException,
+) -> None:
+    error = stringify_error(exc.detail)
+    category = classify_error(exc)
+    entry = control_log.add(
+        device_id=device_id,
+        client_id=client_id,
+        action=action,
+        ok=False,
+        payload=payload,
+        error=error,
+        category=category,
+        dry_run=device_dry_run(device_id),
+    )
+    await manager.broadcast(
+        ControlEvent(
+            device_id=device_id,
+            type="control_failed",
+            payload=entry.model_dump(),
+        )
+    )
+
+
+def stringify_error(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    return json.dumps(detail, ensure_ascii=False)
+
+
+def classify_error(exc: HTTPException) -> str:
+    detail = stringify_error(exc.detail).lower()
+    if exc.status_code == 409:
+        return "no_control_lease"
+    if exc.status_code == 400:
+        return "config_error"
+    if "unauthorized" in detail or "forbidden" in detail or "401" in detail or "403" in detail:
+        return "auth_failed"
+    if "connection" in detail or "offline" in detail or "timed out" in detail:
+        return "device_offline"
+    if "notsupport" in detail or "not support" in detail or "unsupported" in detail:
+        return "capability_not_supported"
+    if exc.status_code == 502:
+        return "protocol_failed"
+    return "unknown"
+
+
+def device_dry_run(device_id: str) -> bool:
+    try:
+        device = get_device(device_id)
+    except HTTPException:
+        return settings.dry_run
+    if device["kind"] == "m20pro_robot":
+        return settings.m20_dry_run
+    if device["kind"] == "lift_pole":
+        return settings.lift_dry_run
+    if device_id == "roof_ptz_1":
+        return settings.roof_ptz_dry_run
+    return settings.dry_run
+
+
+async def probe_device_status(device_id: str) -> Dict[str, Any]:
+    device = get_device(device_id)
+    checked_at = datetime.now(timezone.utc).isoformat()
+    device_video = device.get("video")
+
+    if device["kind"] == "m20pro_robot":
+        return await m20_robot_client.status_payload()
+
+    if device["kind"] == "lift_pole":
+        return await lift_real_adapter.status_payload() if not settings.lift_dry_run else lift_status_payload()
+
+    if device["kind"] == "m20pro_camera":
+        video = await probe_device_video(device_video)
+        source = await probe_rtsp_describe(device_video.get("source")) if device_video and device_video.get("enabled") is not False else {"status": video["status"]}
+        online = await probe_tcp(settings.m20_host, 8554)
+        details = {"online": online, "source": source, "video": video}
+        errors = [
+            f"{name}: {result['error']}"
+            for name, result in details.items()
+            if result["status"] == "error" and result.get("error")
+        ]
+        status = DeviceStatus(
+            online=online["status"] == "ok",
+            video=video["status"],
+            onvif="unknown",
+            isapi="unknown",
+            control_mode="video_only",
+            last_checked_at=checked_at,
+            last_error=errors[0] if errors else None,
+            details=details,
+        )
+        return status.model_dump()
+
+    if not is_ptz_device(device_id):
+        status = DeviceStatus(
+            online=False,
+            video="unknown",
+            onvif="unknown",
+            isapi="unknown",
+            control_mode="disabled",
+            last_checked_at=checked_at,
+            last_error="Device is disabled or not implemented",
+            details={"status": device.get("status")},
+        )
+        return status.model_dump()
+
+    # 车顶云台使用独立配置
+    ptz_host = settings.roof_ptz_host if device_id == "roof_ptz_1" else settings.device_host
+    ptz_onvif_port = settings.roof_ptz_onvif_port if device_id == "roof_ptz_1" else settings.onvif_port
+    video_task = probe_device_video(device_video)
+    online_task = probe_tcp(ptz_host, ptz_onvif_port)
+    onvif_task = probe_ptz_onvif(ptz_host, ptz_onvif_port)
+    isapi_task = probe_ptz_isapi(ptz_host, settings.roof_ptz_user if device_id == "roof_ptz_1" else settings.device_user, settings.roof_ptz_password if device_id == "roof_ptz_1" else settings.device_password)
+    video, online, onvif, isapi = await asyncio.gather(video_task, online_task, onvif_task, isapi_task)
+
+    details = {
+        "online": online,
+        "video": video,
+        "onvif": onvif,
+        "isapi": isapi,
+    }
+    errors = [
+        f"{name}: {result['error']}"
+        for name, result in details.items()
+        if result["status"] == "error" and result.get("error")
+    ]
+
+    status = DeviceStatus(
+        online=online["status"] == "ok",
+        video=video["status"],
+        onvif=onvif["status"],
+        isapi=isapi["status"],
+        control_mode="dry_run" if (settings.roof_ptz_dry_run if device_id == "roof_ptz_1" else settings.dry_run) else "real",
+        last_checked_at=checked_at,
+        last_error=errors[0] if errors else None,
+        details=details,
+    )
+    return status.model_dump()
+
+
+async def probe_unknown(name: str) -> Dict[str, Any]:
+    return {"status": "unknown", "target": name}
+
+
+async def probe_disabled(name: str) -> Dict[str, Any]:
+    return {"status": "disabled", "target": name}
+
+
+async def probe_device_video(device_video: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not device_video:
+        return await probe_unknown("video")
+    if device_video.get("enabled") is False:
+        return await probe_disabled(device_video.get("path") or "video")
+    # 优先通过 MediaMTX API 检查源就绪状态
+    path = device_video.get("path", "")
+    source_ok = await probe_mediamtx_source(path)
+    if source_ok is not None:
+        return source_ok
+    # API 不可用时，通过 RTSP DESCRIBE 检查源是否可达
+    source_url = device_video.get("source", "")
+    if source_url:
+        return await probe_rtsp_describe(source_url)
+    # 无 RTSP 源时兜底 HTTP 探测
+    return await probe_http(device_video["player_url"])
+
+
+async def probe_mediamtx_source(path: str) -> Optional[Dict[str, Any]]:
+    """返回 None 表示 API 不可用，兜底用 HTTP 探测"""
+    try:
+        import httpx
+        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+            resp = await client.get("http://localhost:9997/v2/paths/list")
+        if resp.status_code >= 400:
+            return None
+        data = resp.json()
+        items = data.get("items", {}) if isinstance(data, dict) else {}
+        for name, info in items.items():
+            if name == path:
+                ready = info.get("sourceReady", False)
+                if ready:
+                    return {"status": "ok", "path": path, "source_ready": True}
+                return {"status": "error", "path": path, "error": "RTSP source not connected"}
+        return {"status": "error", "path": path, "error": f"path {path} not found"}
+    except Exception:
+        return None
+
+
+def robot_status_payload() -> Dict[str, Any]:
+    checked_at = datetime.now(timezone.utc).isoformat()
+    details = {
+        "online": {"status": "ok", "target": settings.m20_host, "dry_run": True},
+        **robot_state,
+    }
+    return DeviceStatus(
+        online=True,
+        video="unknown",
+        onvif="unknown",
+        isapi="unknown",
+        control_mode="dry_run",
+        last_checked_at=checked_at,
+        last_error=None,
+        details=details,
+    ).model_dump()
+
+
+def lift_status_payload() -> Dict[str, Any]:
+    checked_at = datetime.now(timezone.utc).isoformat()
+    speed_ratio = float(lift_state.get("speed") or 0.3)
+    max_pr = float(settings.lift_max_pv_speed_pr_s)
+    min_pr = float(settings.lift_min_pv_speed_pr_s)
+    pr_s = max(min_pr, min(max_pr, round(speed_ratio * max_pr)))
+    details = {
+        "probe": {"status": "ok", "dry_run": True},
+        "travel_height_cm": float(settings.lift_travel_height),
+        "base_height_cm": settings.lift_base_height_cm,
+        "command_speed_cm_s": round((pr_s / float(PULSES_PER_REV)) * float(CM_PER_REV), 3),
+        "height_cm": round(float(lift_state.get("height") or 0.0) / 100.0 * float(settings.lift_travel_height), 2),
+        "zero_pulse": int(getattr(settings, "lift_position_zero_pulse", 0) or 0),
+        **lift_state,
+    }
+    if settings.lift_base_height_cm is not None:
+        details["total_height_cm"] = round(float(settings.lift_base_height_cm) + float(details["height_cm"]), 2)
+    else:
+        details["total_height_cm"] = None
+    return {
+        "online": bool(lift_state["online"]),
+        "video": "unknown",
+        "onvif": "unknown",
+        "isapi": "unknown",
+        "control_mode": "dry_run",
+        "last_checked_at": checked_at,
+        "last_error": None if not lift_state["faults"] else str(lift_state["faults"][0]),
+        "details": details,
+    }
+
+
+def apply_robot_dry_run_command(command: RobotCommand) -> Dict[str, Any]:
+    action = command.action
+    if action == "soft_estop":
+        robot_state["posture"] = "lie_down"
+        robot_state["motion"] = {"x": 0, "y": 0, "rotation": 0}
+    elif action in {"stand", "recover_stand"}:
+        robot_state["posture"] = "stand"
+    elif action == "lie_down":
+        robot_state["posture"] = "lie_down"
+        robot_state["motion"] = {"x": 0, "y": 0, "rotation": 0}
+    elif action == "direction_reverse":
+        robot_state["operator_direction"] = "rear" if robot_state.get("operator_direction") == "front" else "front"
+    elif action == "light_front":
+        robot_state["lights"]["front"] = not robot_state["lights"]["front"]
+    elif action == "light_rear":
+        robot_state["lights"]["rear"] = not robot_state["lights"]["rear"]
+    elif action == "set_lights":
+        if command.front_light is None or command.rear_light is None:
+            raise HTTPException(status_code=400, detail="Missing robot light target")
+        robot_state["lights"]["front"] = command.front_light
+        robot_state["lights"]["rear"] = command.rear_light
+    elif action == "set_mode":
+        if command.value not in {"normal", "navigation", "assist"}:
+            raise HTTPException(status_code=400, detail="Unsupported robot mode")
+        robot_state["mode"] = command.value
+    elif action == "set_gait":
+        if command.value not in {"basic", "stairs", "platform"}:
+            raise HTTPException(status_code=400, detail="Unsupported robot gait")
+        robot_state["gait"] = command.value
+    elif action == "set_speed":
+        if command.speed is None:
+            raise HTTPException(status_code=400, detail="Missing robot speed")
+        robot_state["speed"] = command.speed
+    elif action == "sleep":
+        robot_state["sleep"] = "sleeping"
+        robot_state["motion"] = {"x": 0, "y": 0, "rotation": 0}
+    elif action == "wake":
+        robot_state["sleep"] = "awake"
+    elif action == "move":
+        robot_state["motion"] = M20RobotClient._scaled_motion_axes(command)
+    elif action == "stop_move":
+        robot_state["motion"] = {"x": 0, "y": 0, "rotation": 0}
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported robot action")
+    return json.loads(json.dumps(robot_state))
+
+
+def apply_lift_dry_run_command(command: LiftCommand) -> Dict[str, Any]:
+    global _lift_dry_run_jog_at
+    action = command.action
+    current_height = float(lift_state["height"] or 0.0)
+    if action == "set_speed":
+        if command.speed is None:
+            raise HTTPException(status_code=400, detail="Missing lift speed")
+        lift_state["speed"] = command.speed
+    elif action == "up":
+        lift_state["motion"] = "up"
+        lift_state["target_height"] = None
+        lift_state["height"] = min(100.0, round(current_height + max(lift_state["speed"], 0.1) * 5, 2))
+        _lift_dry_run_jog_at = time.monotonic()
+    elif action == "down":
+        lift_state["motion"] = "down"
+        lift_state["target_height"] = None
+        lift_state["height"] = max(0.0, round(current_height - max(lift_state["speed"], 0.1) * 5, 2))
+        _lift_dry_run_jog_at = time.monotonic()
+    elif action == "stop":
+        lift_state["motion"] = "stopped"
+        lift_state["target_height"] = None
+        _lift_dry_run_jog_at = None
+    elif action == "estop":
+        lift_state["motion"] = "stopped"
+        lift_state["target_height"] = None
+        _lift_dry_run_jog_at = None
+    elif action == "goto":
+        if command.height is None:
+            raise HTTPException(status_code=400, detail="Missing target height")
+        lift_state["target_height"] = command.height
+        lift_state["height"] = command.height
+        lift_state["motion"] = "stopped"
+        _lift_dry_run_jog_at = None
+    elif action == "max":
+        lift_state["target_height"] = 100.0
+        lift_state["height"] = 100.0
+        lift_state["motion"] = "stopped"
+        _lift_dry_run_jog_at = None
+    elif action == "min":
+        lift_state["target_height"] = 0.0
+        lift_state["height"] = 0.0
+        lift_state["motion"] = "stopped"
+        _lift_dry_run_jog_at = None
+    elif action == "set_retracted_zero":
+        lift_state["target_height"] = 0.0
+        lift_state["height"] = 0.0
+        lift_state["motion"] = "stopped"
+        _lift_dry_run_jog_at = None
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported lift action")
+
+    lift_state["limits"] = {
+        "min": float(lift_state["height"]) <= 0,
+        "max": float(lift_state["height"]) >= 100,
+    }
+    return json.loads(json.dumps(lift_state))
+
+
+async def probe_tcp(host: str, port: int) -> Dict[str, Any]:
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2)
+        writer.close()
+        await writer.wait_closed()
+        return {"status": "ok", "target": f"{host}:{port}"}
+    except Exception as exc:
+        return {"status": "error", "target": f"{host}:{port}", "error": str(exc)}
+
+
+async def probe_http(url: str) -> Dict[str, Any]:
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(trust_env=False, timeout=2, follow_redirects=True) as client:
+            response = await client.get(url)
+        if response.status_code < 400:
+            return {"status": "ok", "url": url, "http_status": response.status_code}
+        return {"status": "error", "url": url, "http_status": response.status_code}
+    except Exception as exc:
+        return {"status": "error", "url": url, "error": str(exc)}
+
+
+async def probe_rtsp_describe(url: Optional[str]) -> Dict[str, Any]:
+    if not url:
+        return {"status": "unknown"}
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port or 554
+        path = parsed.path or "/"
+        if not host:
+            return {"status": "error", "url": url, "error": "missing RTSP host"}
+
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2)
+        request = (
+            f"DESCRIBE {url} RTSP/1.0\r\n"
+            "CSeq: 1\r\n"
+            "Accept: application/sdp\r\n"
+            "User-Agent: patrol-platform\r\n"
+            "\r\n"
+        ).encode("utf-8")
+        writer.write(request)
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(8192), timeout=2)
+        writer.close()
+        await writer.wait_closed()
+
+        text = response.decode("utf-8", errors="replace")
+        first_line = text.replace("\r", "").split("\n", 1)[0] if text else "empty response"
+        codec = None
+        for line in text.splitlines():
+            if line.startswith("a=rtpmap:") and " " in line:
+                codec = line.split(" ", 1)[1].split("/", 1)[0].upper()
+                break
+        ok = first_line.startswith("RTSP/1.0 200") or first_line.startswith("RTSP/1.0 401")
+        return {
+            "status": "ok" if ok else "error",
+            "url": url,
+            "path": path,
+            "rtsp_status": first_line,
+            "codec": codec,
+        }
+    except Exception as exc:
+        return {"status": "error", "url": url, "error": str(exc)}
+
+
+async def probe_onvif() -> Dict[str, Any]:
+    try:
+        await control_client._run_blocking(control_client._ensure_onvif)
+        return {"status": "ok", "target": f"{settings.device_host}:{settings.onvif_port}"}
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        return {"status": "error", "target": f"{settings.device_host}:{settings.onvif_port}", "error": str(detail)}
+
+
+async def probe_isapi() -> Dict[str, Any]:
+    url = f"http://{settings.device_host}/ISAPI/System/deviceInfo"
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(
+            auth=httpx.DigestAuth(settings.device_user, settings.device_password),
+            trust_env=False,
+            timeout=2,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url)
+        if response.status_code < 400:
+            return {"status": "ok", "url": url, "http_status": response.status_code}
+        return {
+            "status": "error",
+            "url": url,
+            "http_status": response.status_code,
+            "error": response.text.strip()[:200],
+        }
+    except Exception as exc:
+        return {"status": "error", "url": url, "error": str(exc)}
+
+
+# 车顶云台使用独立配置的探测函数
+async def probe_ptz_onvif(host: str, port: int) -> Dict[str, Any]:
+    target = f"{host}:{port}"
+    try:
+        await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2)
+        return {"status": "ok", "target": target}
+    except Exception as exc:
+        return {"status": "error", "target": target, "error": str(exc)}
+
+
+async def probe_ptz_isapi(host: str, user: str, password: str) -> Dict[str, Any]:
+    url = f"http://{host}/ISAPI/System/deviceInfo"
+    try:
+        import httpx
+
+        auth = httpx.DigestAuth(user, password) if password else None
+        async with httpx.AsyncClient(
+            auth=auth, trust_env=False, timeout=2, follow_redirects=True,
+        ) as client:
+            response = await client.get(url)
+        if response.status_code < 400:
+            return {"status": "ok", "url": url, "http_status": response.status_code}
+        return {"status": "error", "url": url, "http_status": response.status_code, "error": response.text.strip()[:200]}
+    except Exception as exc:
+        return {"status": "error", "url": url, "error": str(exc)}
+
+
+def optional_client_id(request: Request) -> Optional[str]:
+    value = request.headers.get("X-Patrol-Client-Id")
+    return value.strip() if value else None
+
+
+def require_client_id(request: Request) -> str:
+    client_id = optional_client_id(request)
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Missing X-Patrol-Client-Id header")
+    return client_id

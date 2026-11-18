@@ -53,7 +53,7 @@ _FAULTS = [
 ]
 _WARNINGS = [
 ('110','分频脉冲输出设定故障',True,29,'核对 P05-17 与编码器规格和输出功能。'),
-('601','回原点失败',True,30,'检查原点/限位信号、方向和回零时限；手册 P05-34/35 引用存在歧义，不据此自动写参。'),
+('601','回原点失败',True,30,'检查原点/限位信号、方向和回零时限。点击人工故障复位，工具停止、撤销HOME使能并核对DI3后清警；清除及检查通过后可重新点击一键回零，不自动启动。手册P05-34/35引用有歧义，不自动写参。'),
 ('730','编码器电池警告',True,30,'安排检查编码器电池与连接，按厂家流程维护；重新核实坐标。'),
 ('831','AI零漂过大',True,30,'检查模拟输入接线、屏蔽及零输入条件。'),
 ('900','DI紧急刹车',True,30,'检查物理/虚拟 DI 急停来源；确认现场安全后人工解除，不通过复位绕过输入。'),
@@ -69,38 +69,40 @@ _WARNINGS = [
 ('A40','内部故障',True,30,'检查电机自学习、编码器线缆及类型；不自动自学习。'),
 ]
 REFERENCE_LOSS = {int(x,16) for x in ['122','136','208','234','410','430','601','730','731','733','735','740','A33','A34','A35','B00','B03','D10','980','A40']}
-MAINTENANCE_ONLY = {int(x,16) for x in ['207','625','626','731','733','735','900','941','980','A40']}
 CATALOG = {}
 for category, rows in [('fault', _FAULTS), ('warning', _WARNINGS)]:
     for code, name, reset, page, advice in rows:
         number = int(code,16)
         CATALOG[number] = dict(code=number, text='Er.'+code, name=name, manual_category=category,
             manual_resettable=reset, source_pdf_page=page, advice=advice,
-            reset_allowed=reset and number not in MAINTENANCE_ONLY,
+            reset_allowed=True,
             reference_lost=number in REFERENCE_LOSS,
-            policy='directional_limit' if number in (0x950,0x952) else 'stop_and_latch')
+            policy='operator_decides')
 
 
 def describe(raw):
     raw = int(raw) & 0xFFFF
     code, encoding = raw, 'exact'
-    # Preserve original evidence. Only the legacy-observed aliases are accepted.
+    # Preserve original evidence; never strip arbitrary leading nibbles.
     aliases = {0x6B00:0xB00, 0x6620:0x620, 0xE950:0x950, 0xE952:0x952}
-    if raw in aliases:
+    verified_aliases = {0xE601:0x601, 0x6121:0x121}
+    if raw in verified_aliases:
+        code, encoding = verified_aliases[raw], 'field_observed_alias'
+    elif raw in aliases:
         code, encoding = aliases[raw], 'legacy_observed_alias_pending_hardware_verification'
     if code == 0:
         result = dict(code=0,text='',name='无报警',manual_category='none',manual_resettable=False,
                       reset_allowed=False,reference_lost=False,policy='none',advice='保持状态监测。')
     else:
         result = dict(CATALOG.get(code, dict(code=code,text='Er.%X'%code,name='未识别报警',
-            manual_category='unknown',manual_resettable=None,reset_allowed=False,reference_lost=True,
-            policy='stop_and_latch',advice='保留原始码与设备参数快照，联系厂家确认；禁止自动忽略或复位。')))
+            manual_category='unknown',manual_resettable=None,reset_allowed=True,reference_lost=False,
+            policy='operator_decides',advice='含义及复位能力尚未确认；保留原始码，由操作者判断。可人工尝试复位，以实际读回判断结果，不自动复位。')))
     result.update(raw_code=raw,raw_hex='0x%04X'%raw,encoding=encoding)
     return result
 
 
 def blocked(sample, direction=None, homing=False):
-    """Return a reason, or empty string. Only live, unambiguous limits may escape."""
+    """Physical limits guard direction; alarm interpretation is advisory."""
     if sample.get('di4_function') != 14 or sample.get('di5_function') != 15:
         return '限位映射不符合预期'
     if sample.get('di4_logic') not in (0,1) or sample.get('di5_logic') not in (0,1):
@@ -108,18 +110,11 @@ def blocked(sample, direction=None, homing=False):
     upper, lower = sample.get('upper_limit'), sample.get('lower_limit')
     if upper is None or lower is None or upper and lower:
         return '限位未知或上下同时有效'
-    code = sample.get('alarm_code',0)
-    if code == 0:
-        if not homing and ((upper and direction=='up') or (lower and direction=='down')):
-            return '物理限位禁止该方向'
-        if homing and upper:
-            return '上限位有效，禁止开始/继续负向回零，先人工检查'
-        return ''
-    if code == 0x950 and upper and not lower and direction=='down' and not homing:
-        return ''
-    if code == 0x952 and lower and not upper and (direction=='up' or homing):
-        return ''
-    return describe(sample.get('alarm_raw',code))['text']+'：报警未满足方向放行条件'
+    if not homing and ((upper and direction=='up') or (lower and direction=='down')):
+        return '物理限位禁止该方向'
+    if homing and upper:
+        return '上限位有效，禁止开始/继续负向回零，先人工检查'
+    return ''
 
 
 def jog_blocked(sample, direction):
@@ -131,9 +126,16 @@ def jog_blocked(sample, direction):
     upper, lower = sample.get('upper_limit'), sample.get('lower_limit')
     if type(upper) is not bool or type(lower) is not bool or (upper and lower):
         return '限位未知或上下同时有效'
-    code = sample.get('alarm_code', 0)
-    if code not in (0, 0x950, 0x952):
-        return describe(sample.get('alarm_raw', code))['text']+'：故障未解除'
     if (upper and direction == 'up') or (lower and direction == 'down'):
         return '物理限位禁止该方向'
+    return ''
+
+
+def home_blocked(sample):
+    """HOME uses actual physical DI, never alarm names as switch feedback."""
+    reason=jog_blocked(sample,'up')
+    if reason and reason!='物理限位禁止该方向':
+        return reason
+    if sample.get('upper_limit'):
+        return '上限位有效，禁止开始/继续负向回零，先人工检查'
     return ''

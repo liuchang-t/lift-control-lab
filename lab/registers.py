@@ -56,10 +56,20 @@ CATALOG = [
     (0x102A, 2, 'P10-42', 'PV 速度', 'RW', 'PV/独立设速'),
 ]
 
-# Trigger registers may be readable without being useful persistent state.
-# Preserve the existing refresh policy independently of hardware access labels.
-REFRESH_EXCLUDED = {0x0D01, 0x0D08}
-HIDDEN_ADDRESSES = set(range(0x0306, 0x030C))
+CATALOG.sort(key=lambda row: row[0])
+
+# Readable trigger registers are observations too; readback is not completion.
+REFRESH_EXCLUDED = set()
+HIDDEN_ADDRESSES = set(range(0x0308, 0x030C))
+# Merge only adjacent documented words. A bounded block yields the bus between
+# requests so explicit refresh never holds the controller preparation lock.
+REFRESH_GROUPS = []
+for address,width,*_ in CATALOG:
+    if REFRESH_GROUPS and address == sum(REFRESH_GROUPS[-1]) and REFRESH_GROUPS[-1][1]+width <= 16:
+        start,count=REFRESH_GROUPS[-1]
+        REFRESH_GROUPS[-1]=(start,count+width)
+    else:
+        REFRESH_GROUPS.append((address,width))
 
 # Each background turn reads one bounded block after fresh protection feedback.
 # Addresses are contiguous only where the manual defines all covered words.
@@ -75,7 +85,7 @@ REFERENCE_ADDRESSES = {0x0202,0x1016,0x0C1A,0x001F,0x0020,0x0502,0x0503,0x0507,0
 
 
 def polling_policy(address):
-    if address in (0x0B00,0x0B02,0x0B03,0x0B04,0x0B07,0x0B22,0x0C0D,0x0D0B,0x0D11,0x0D12):
+    if address in (0x0307,0x0B00,0x0B02,0x0B03,0x0B04,0x0B07,0x0B22,0x0C0D,0x0D0B,0x0D11,0x0D12):
         return dict(polling_kind='fast',polling_label='保护轮询',interval_s=None,
                     polling_notice='每个保护采样周期读取；周期由poll_s与总线响应决定，失鲜会停机。')
     if address in (0x1003,0x100E,0x1019,0x102A,0x4604):
@@ -86,10 +96,10 @@ def polling_policy(address):
                     polling_notice='HOME期间每个保护周期核对回零模式、速度和加速度；其它时候低频轮转。')
     if address in MONITOR_ADDRESSES:
         return dict(polling_kind='slow',polling_label='低频轮转',interval_s=MONITOR_INTERVAL*len(MONITOR_GROUPS),
-                    polling_notice='每0.5秒最多一块，名义全轮%s秒；控制序列和总线忙时让行，PP/HOME运动监视超过12秒未更新则停止，JOG不依赖整轮参数刷新。'%(MONITOR_INTERVAL*len(MONITOR_GROUPS)))
+                    polling_notice='每0.5秒最多一块，名义全轮%s秒；控制序列和总线忙时让行，PP运动监视超过12秒未更新则停止；HOME独立核对活动参数，JOG不依赖整轮参数刷新。'%(MONITOR_INTERVAL*len(MONITOR_GROUPS)))
     if 0x0D00<=address<0x0E00:
-        return dict(polling_kind='command',polling_label='命令写应答',interval_s=None,
-                    polling_notice='触发寄存器可能自清零，只记录发送及ACK；不是持续驱动状态，副作用由反馈监测。')
+        return dict(polling_kind='command',polling_label='命令读回 / 手动刷新',interval_s=None,
+                    polling_notice='触发寄存器可能自清零；主值为03读回，发送与ACK另列。读回不是持续状态或动作完成反馈。')
     return dict(polling_kind='on_demand',polling_label='动作检查 / 手动刷新',interval_s=None,
                 polling_notice='连接预检或显式刷新时读取，不声称实时轮询；驱动软限位仍只读且行为待实机验证。')
 
@@ -100,6 +110,7 @@ class RegisterMonitor:
         self.read_words = {}
         self.write_words = {}
         self.serial = 0
+        self.read_errors = {}
 
     def observe(self, request, response, epoch):
         """Cache only matching successful exchanges; ACK is not a readback."""
@@ -127,14 +138,20 @@ class RegisterMonitor:
                 item = dict(value=value, at=now, epoch=epoch, source=source, serial=self.serial)
                 self.words[address+offset] = item
                 (self.read_words if source == 'read' else self.write_words)[address+offset] = item
+                if source == 'read':
+                    self.read_errors.pop(address+offset,None)
         except (ValueError, IndexError, struct.error, ModbusRtuError):
             return
+
+    def read_failed(self,address,count,error,epoch):
+        for offset in range(count):
+            self.read_errors[address+offset]=dict(error=str(error),epoch=epoch)
 
     def snapshot(self, epoch, stale_after=2.0, active_mode=None):
         rows = []
         now = time.monotonic()
         for address, width, parameter, name, access, operations in CATALOG:
-            cache = self.read_words if address == 0x0D0B else self.words
+            cache = self.read_words
             words = [cache.get(address+i) for i in range(width)]
             complete = all(words)
             coherent = complete and len({(w['epoch'],w['serial']) for w in words}) == 1
@@ -152,20 +169,32 @@ class RegisterMonitor:
             elif policy['polling_kind'] in ('slow','active'):
                 threshold = MONITOR_MAX_AGE
             else:
-                threshold = None  # On-demand readings and command ACKs have no refresh schedule.
-            stale = (not coherent or any(w['epoch'] != epoch for w in words)
+                threshold = None  # On-demand readings and command readbacks have no refresh schedule.
+            pending_readback=any(self.write_words.get(address+i,{}).get('epoch')==epoch and
+                                 (not words[i] or self.write_words[address+i]['serial']>words[i]['serial'])
+                                 for i in range(width))
+            read_error=next((self.read_errors[address+i]['error'] for i in range(width)
+                             if self.read_errors.get(address+i,{}).get('epoch')==epoch),'')
+            stale = (not coherent or any(w['epoch'] != epoch for w in words) or pending_readback or bool(read_error)
                      or (threshold is not None and age > threshold))
-            raw = [w['value'] for w in words] if complete else None
+            raw = [w['value'] for w in words] if coherent else None
             value = None
             if coherent:
                 value = registers_to_int32_le_word(raw) if width == 2 else raw[0]
                 if address in (0x0B00, 0x0B02):
                     value = signed_word(value)
+            written=[self.write_words.get(address+i) for i in range(width)]
+            write_coherent=(all(written) and all(w['epoch']==epoch for w in written)
+                            and len({w['serial'] for w in written})==1)
+            written_raw=[w['value'] for w in written] if write_coherent else None
+            written_value=(registers_to_int32_le_word(written_raw) if width==2 else written_raw[0]) if write_coherent else None
             rows.append(dict(parameter=parameter,address=address,address_hex='0x%04X'%address,name=name,
                              width=width,access=access,operations=operations,value=value,raw_words=raw,
                              visible=address not in HIDDEN_ADDRESSES,
-                             last_write_value=self.write_words.get(address,{}).get('value') if self.write_words.get(address,{}).get('epoch')==epoch else None,
+                             last_write_value=written_value,last_write_raw_words=written_raw,
+                             last_write_age_s=max(now-w['at'] for w in written) if write_coherent else None,
+                             readback_pending=pending_readback,read_error=read_error,
                              source=words[0]['source'] if coherent else 'unknown',age_s=age,stale=stale,
                              epoch=words[0]['epoch'] if coherent else None,stale_after_s=threshold,**policy))
         return dict(registers=rows,connection_epoch=epoch,
-                    notice='读写为本工具正常流程用途；写回包不是读回。过期值仅供参考，连接变化后须重新读取。')
+                    notice='主值仅来自实际03读回；写应答另列，不代表动作完成。刷新会逐块读取，失败项保留错误标记。')

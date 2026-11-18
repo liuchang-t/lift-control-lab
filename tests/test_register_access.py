@@ -12,9 +12,9 @@ class RegisterAccessTests(unittest.TestCase):
             self.assertEqual(rows[address][4],'RW',rows[address][2])
         self.assertEqual(sum(row[4]=='RW' for row in CATALOG),38)
 
-    def test_trigger_readability_does_not_change_refresh_policy(self):
+    def test_readable_triggers_are_included_in_explicit_refresh(self):
         rows={row[0]:row for row in CATALOG}
-        self.assertEqual(REFRESH_EXCLUDED,{0x0D01,0x0D08})
+        self.assertEqual(REFRESH_EXCLUDED,set())
         for address in (0x0D01,0x0D08,0x0D11,0x0D12):
             self.assertEqual(rows[address][4],'RW')
         self.assertNotIn(0x0D11,REFRESH_EXCLUDED)

@@ -6,7 +6,7 @@ from lab.transport import Simulator, Trace
 
 class ForceInputTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.transport=Simulator(Config(mode='sim'),Trace())
+        self.transport=Simulator(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0),Trace())
         self.driver=Driver(self.transport.config,self.transport)
 
     async def test_givens_are_read_independently_without_claiming_completion(self):
@@ -14,7 +14,7 @@ class ForceInputTests(unittest.IsolatedAsyncioTestCase):
         await self.driver.write_force_input(0x0D12,507)
         status=self.driver.force_status()
         self.assertEqual((status['selection'],status['given']),(1,507))
-        self.assertEqual(status['di3'],1) # Simulator models physical DI separately, not force completion.
+        self.assertEqual(status['di3'],0) # Forced input observation is not power-stage completion.
         self.assertFalse(status['completion_confirmed'])
         rows=self.transport.registers.snapshot(1)['registers']
         self.assertEqual(next(r for r in rows if r['address']==0x0D12)['source'],'read')
@@ -29,8 +29,8 @@ class ForceInputTests(unittest.IsolatedAsyncioTestCase):
         original=self.driver.wire.read_registers
         async def wrong(address,count):
             values=await original(address,count)
-            if address==0x0D11 and self.transport.regs.get(0x0D12)==507:
-                return [values[0],511]
+            if address==0x0307 and self.transport.regs.get(0x0307)==1:
+                return [0]
             return values
         with patch.object(self.driver.wire,'read_registers',side_effect=wrong):
             with self.assertRaises(LabError):

@@ -9,7 +9,7 @@ from lab.readiness import build_readiness
 class JogLimitWarningTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.s=Service(Config(mode='sim', state_file=str(Path(self.tmp.name)/'state.json'),poll_s=.02,deadman_s=.12,stop_timeout_s=.15))
+        self.s=Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.tmp.name)/'state.json'),poll_s=.02,deadman_s=.12,stop_timeout_s=.15))
         self.s.connected=True
         self.s.connection_state='connected'
         self.c=self.s.controller
@@ -90,21 +90,22 @@ class JogLimitWarningTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.c.armed)
             self.assertEqual(self.c.emergency,emergency)
 
-    async def test_rejected_reset_at_active_limit_does_not_block_escape(self):
+    async def test_manual_reset_at_active_limit_keeps_direction_protection(self):
         self.sim.inject('physical_cm',0)
         self.sim.regs[0x0b22]=0xe950
-        with self.assertRaisesRegex(LabError,'物理限位'): await self.c.reset_fault({'confirm_reset':True})
+        await self.c.reset_fault({'confirm_reset':True})
         self.assertTrue(self.c.armed)
         await self.jog('up')
 
-    async def test_overload_after_warning_still_stops_and_locks(self):
+    async def test_alarm_change_does_not_create_controller_lock(self):
         self.sim.regs[0x0b22]=0xe950
         await self.jog()
         self.sim.regs[0x0b22]=0x6620
         await self.c._monitor_motion(await self.c.observe())
-        self.assertTrue(self.c.pending_stop)
-        self.assertFalse(self.c.armed)
-        await self.c._confirm_stop()
+        self.assertFalse(self.c.pending_stop)
+        self.assertTrue(self.c.armed)
+        self.assertEqual(self.c.sample['alarm_code'],0x620)
+        await self.c.stop()
         self.assertIsNone(self.sim.motion)
 
     async def test_heartbeat_timeout_still_stops_with_warning(self):

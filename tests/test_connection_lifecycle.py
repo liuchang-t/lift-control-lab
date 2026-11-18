@@ -17,7 +17,7 @@ class ConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.root=Path(self.temp.name)
         self.root_patch=patch('lab.service.ROOT',self.root)
         self.root_patch.start()
-        self.service=Service(Config(mode='sim', state_file=str(self.root/'zero.json'),poll_s=.02,stop_timeout_s=.15))
+        self.service=Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(self.root/'zero.json'),poll_s=.02,stop_timeout_s=.15))
         self.headers={'X-Patrol-Client-Id':'connection-tester'}
         await self.service.start()
         await self.until(lambda:bool(self.service.controller.sample))
@@ -159,7 +159,7 @@ class ConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old.motion,'up')
 
     async def test_old_tcp_transport_cannot_open_socket_after_shutdown(self):
-        transport=TcpTransport(Config(mode='sim'),Trace())
+        transport=TcpTransport(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0),Trace())
         await transport.shutdown()
         with patch('asyncio.open_connection',side_effect=AssertionError('must not reconnect')):
             with self.assertRaises(ConnectionError):

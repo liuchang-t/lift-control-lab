@@ -41,6 +41,11 @@ class Config:
     home_tolerance_cm: float = 0.05
     home_timeout_s: float = 600.0
     home_start_timeout_s: float = 3.0
+    home_speed: int = None
+    home_creep_speed: int = None
+    home_acceleration: int = None
+    home_enable_hold_s: float = 4.0
+    home_disable_hold_s: float = 0.2
     verified_deceleration_cm_s2: float = 2.0
     control_latency_s: float = 1.0
     limit_margin_cm: float = 0.1
@@ -98,6 +103,13 @@ class Config:
         for name in ('home_tolerance_cm','home_timeout_s','home_start_timeout_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm'):
             if finite(getattr(self,name)) <= 0:
                 raise ValueError(name+' 必须为有限正数')
+        for name in ('home_speed','home_creep_speed','home_acceleration'):
+            value=getattr(self,name)
+            if value is not None and (type(value) is not int or not 1 <= value <= 2147483647):
+                raise ValueError(name+' 必须为空或1～2147483647的整数')
+        for name in ('home_enable_hold_s','home_disable_hold_s'):
+            if not 0 <= finite(getattr(self,name)) <= 10:
+                raise ValueError(name+' 必须为0～10秒，实验性最短保持时间')
         if type(self.motion_profile_verified) is not bool:
             raise ValueError('motion_profile_verified 必须为布尔值')
         self.units.target(self.soft_upper_cm,self.home_reference_pulse)
@@ -107,6 +119,14 @@ class Config:
         if self.mode == "real" and self.bridge_enabled and not self.bridge_token:
             raise ValueError("real Bridge requires a token")
         return self
+
+    def home_parameters(self, actual):
+        # Saved intent is separate from the drive's observed values.
+        result=dict(actual)
+        for key in ('home_speed','home_creep_speed','home_acceleration'):
+            if getattr(self,key) is not None:
+                result[key]=getattr(self,key)
+        return result
 
     def pulse(self, cm):
         return self.units.pulse(cm)

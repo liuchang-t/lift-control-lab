@@ -5,7 +5,7 @@ from lab.transport import Simulator, Trace
 
 class BusPreparationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.config=Config(mode='sim')
+        self.config=Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0)
         self.transport=Simulator(self.config,Trace())
         self.driver=Driver(self.config,self.transport)
 

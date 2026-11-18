@@ -44,7 +44,8 @@ class FrameTests(unittest.TestCase):
         request=bytes.fromhex(frame(16,0x1019,2,[123,0]))
         monitor.observe(request,append_crc(request[:6]),1)
         row=next(r for r in monitor.snapshot(1)['registers'] if r['address']==0x1019)
-        self.assertEqual((row['value'],row['source'],row['stale']),(123,'write_ack',False))
+        self.assertEqual((row['value'],row['source'],row['stale']),(None,'unknown',True))
+        self.assertEqual(row['last_write_value'],123)
         row=next(r for r in monitor.snapshot(2)['registers'] if r['address']==0x1019)
         self.assertTrue(row['stale'])
         # A partial write cannot synthesize a coherent 32-bit value.
@@ -58,7 +59,7 @@ class FrameTests(unittest.TestCase):
 class ManualBusTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.service=Service(Config(mode='sim', state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,stop_timeout_s=.5))
+        self.service=Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,stop_timeout_s=.5))
         self.ctrl=self.service.controller
         self.sim=self.service.transport
         self.headers={'X-Patrol-Client-Id':'manual-test'}
@@ -81,6 +82,78 @@ class ManualBusTests(unittest.IsolatedAsyncioTestCase):
     async def send(self,fn,address,value,values=None,confirm=True):
         return await self.service.request('POST','/api/manual/transaction',
             {'frame':frame(fn,address,value,values),'confirm_write':confirm},self.headers)
+
+    def writes_since(self,mark):
+        return [x['frame'] for x in self.service.trace.items
+                if x['id']>mark and x['kind']=='tx' and bytes.fromhex(x['frame'])[1] in (6,16)]
+
+    async def test_manual_takeover_retires_automatic_jog_without_stop_or_renewal(self):
+        self.sim.physical=self.ctrl.config.pulse(10)
+        await self.ctrl.observe()
+        await self.ctrl.arm()
+        await self.ctrl.command({'action':'up','intent_id':'automatic-before-manual'})
+        mark=self.service.trace.serial
+        await self.send(6,0x1003,6)
+        # Longer than the normal JOG renewal/deadman interval.
+        await asyncio.sleep(1.2)
+        self.assertEqual(self.writes_since(mark),[frame(6,0x1003,6)])
+        self.assertIsNone(self.ctrl.mode)
+        self.assertIsNone(self.ctrl.intent)
+        self.assertFalse(self.ctrl.pending_stop)
+        self.assertFalse(self.ctrl.armed)
+
+    async def test_manual_takeover_cancels_a_stop_still_waiting_for_bus(self):
+        self.sim.physical=self.ctrl.config.pulse(10)
+        await self.ctrl.observe()
+        await self.ctrl.arm()
+        await self.ctrl.command({'action':'up','intent_id':'jog-before-queued-stop'})
+        mark=self.service.trace.serial
+        await self.sim.lock.acquire()
+        stopping=asyncio.create_task(self.ctrl.stop())
+        try:
+            await self.until(lambda:self.ctrl.pending_stop)
+            writing=asyncio.create_task(self.send(6,0x1003,6))
+            await self.until(lambda:bool(self.service.manual_active))
+        finally:
+            self.sim.lock.release()
+        await asyncio.gather(stopping,writing)
+        await asyncio.sleep(.1)
+        self.assertEqual(self.writes_since(mark),[frame(6,0x1003,6)])
+        self.assertFalse(self.ctrl.pending_stop)
+        self.assertIsNone(self.ctrl.mode)
+
+    async def test_manual_home_limit_warnings_do_not_insert_stop_frames(self):
+        self.sim.physical=self.ctrl.config.pulse(10)
+        await self.send(6,0x0D0B,1)
+        await self.send(6,0x1003,6)
+        await self.send(6,0x1023,17)
+        mark=self.service.trace.serial
+        await self.send(6,0x0D08,128)
+        for warning in (0x950,0x952):
+            self.sim.inject('alarm',warning)
+            await self.ctrl.observe()
+            await asyncio.sleep(.15)
+        self.assertEqual(self.writes_since(mark),[frame(6,0x0D08,128)])
+        self.assertFalse(self.ctrl.pending_stop)
+        # Explicit ordinary Stop must use the latest P10 command channel,
+        # even though P0D-11 was used for enabling earlier in this sequence.
+        mark=self.service.trace.serial
+        await self.service.request('POST','/api/control',{'action':'stop'},self.headers)
+        self.assertIn(frame(6,0x0D08,256),self.writes_since(mark))
+        self.assertNotIn(frame(6,0x0D0B,1),self.writes_since(mark))
+        self.assertIsNone(self.sim.motion)
+
+    async def test_poll_failure_does_not_stop_or_lock_manual_channel(self):
+        await self.send(6,0x0D0B,1)
+        mark=self.service.trace.serial
+        with patch.object(self.ctrl.driver,'sample',side_effect=TimeoutError('feedback unavailable')):
+            await asyncio.sleep(.2)
+            self.ctrl.sample_at=0
+            self.service._monitor_manual()
+            await self.send(6,0x1003,6)
+        self.assertEqual(self.writes_since(mark),[frame(6,0x1003,6)])
+        self.assertFalse(self.ctrl.pending_stop)
+        await self.send(6,0x0D0B,65)
 
     async def test_read_does_not_take_over_or_stop(self):
         await self.ctrl.arm()
@@ -124,31 +197,44 @@ class ManualBusTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LabError):
             await self.ctrl.arm()
 
-    async def test_stop_locks_further_manual_writes(self):
+    async def test_new_manual_write_allowed_after_estop_without_clearing_normal_latch(self):
         await self.send(6,0x0D12,507)
         await self.service.request('POST','/api/control',{'action':'estop'},self.headers)
-        with self.assertRaises(LabError):
-            await self.send(6,0x0D08,16)
-        self.assertTrue(self.service.manual_status()['failed'])
-        self.assertIsNone(self.sim.motion)
-
-    async def test_alarm_stops_manual_motion_and_locks_writes(self):
-        await self.send(6,0x0D12,507)
+        self.assertTrue(self.ctrl.emergency)
         await self.send(6,0x0D08,16)
-        self.sim.inject('alarm',0xB00)
-        await self.until(lambda:self.service.manual_status()['failed'] and self.sim.motion is None)
-        with self.assertRaises(LabError):
-            await self.send(6,0x0D08,16)
+        self.assertEqual(self.sim.motion,'up')
+        self.assertTrue(self.ctrl.emergency)
+        self.assertFalse(self.ctrl.armed)
 
-    async def test_lost_write_ack_is_not_retried_and_requests_stop(self):
+    async def test_alarm_limits_eeprom_and_reference_do_not_gate_manual_writes(self):
         await self.send(6,0x0D12,507)
+        self.ctrl.armed=self.ctrl.trusted=False
+        self.ctrl.emergency=True
+        self.sim.physical=0
+        self.sim.regs[0x0C0D]=1
+        for alarm in (0x950,0x952,0xB00,0xFFFF):
+            with self.subTest(alarm=alarm):
+                self.sim.inject('alarm',alarm)
+                await self.ctrl.observe()
+                mark=self.service.trace.serial
+                await self.send(6,0x1003,6)
+                await asyncio.sleep(.15)
+                self.assertEqual(self.writes_since(mark),[frame(6,0x1003,6)])
+                self.assertFalse(self.ctrl.pending_stop)
+        self.assertTrue(self.ctrl.emergency)
+        self.assertFalse(self.ctrl.armed)
+
+    async def test_lost_write_ack_is_unknown_not_retried_or_followed_by_control_writes(self):
+        await self.send(6,0x0D12,507)
+        mark=self.service.trace.serial
         self.sim.faults['lost_start_ack']=True
         with self.assertRaises(LabError):
             await self.send(6,0x0D08,16)
-        await self.until(lambda:self.sim.motion is None)
-        starts=[x for x in self.service.trace.items if x['kind']=='tx' and x['frame']==frame(6,0x0D08,16)]
-        self.assertEqual(len(starts),1)
-        self.assertTrue(self.service.manual_status()['failed'])
+        await asyncio.sleep(.2)
+        self.assertEqual(self.writes_since(mark),[frame(6,0x0D08,16)])
+        self.assertFalse(self.ctrl.pending_stop)
+        await self.send(6,0x0D08,256)
+        self.assertIsNone(self.sim.motion)
 
     async def test_queued_manual_start_cannot_follow_stop_intent(self):
         await self.send(6,0x0D12,507)
@@ -162,21 +248,13 @@ class ManualBusTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(x['kind']=='tx' and x['frame']==frame(6,0x0D08,16) for x in self.service.trace.items))
 
     async def test_stop_during_first_takeover_cancels_raw_write(self):
-        entered,release=asyncio.Event(),asyncio.Event()
-        original=self.ctrl.stop
-        async def delayed_stop(*args,**kwargs):
-            result=await original(*args,**kwargs)
-            entered.set()
-            await release.wait()
-            return result
-        with patch.object(self.ctrl,'stop',side_effect=delayed_stop):
-            task=asyncio.create_task(self.send(6,0x0D08,16))
-            await entered.wait()
-            self.ctrl._stop_intent(True)
-            release.set()
-            with self.assertRaises(LabError):
-                await task
-        self.assertFalse(self.service.manual_active)
+        await self.sim.lock.acquire()
+        task=asyncio.create_task(self.send(6,0x0D08,16))
+        await asyncio.sleep(.03)
+        self.ctrl._stop_intent(True)
+        self.sim.lock.release()
+        with self.assertRaises(LabError):
+            await task
         self.assertFalse(any(x['kind']=='tx' and x['frame']==frame(6,0x0D08,16) for x in self.service.trace.items))
 
     async def test_explicit_single_reset_can_clear_existing_alarm(self):
@@ -186,14 +264,17 @@ class ManualBusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sim.regs[0x0B22],0)
         self.assertFalse(self.service.manual_status()['failed'])
 
-    async def test_refresh_catalog_and_manual_cache_only(self):
+    async def test_refresh_catalog_and_manual_mode_reads_actual_values(self):
         result=await self.service.refresh_registers()
         self.assertEqual(len(result['registers']),len(CATALOG))
-        self.assertTrue(all(r['value'] is not None for r in result['registers'] if r['address'] not in (0x0D01,0x0D08,0x0D0B)))
+        self.assertTrue(all(r['value'] is not None and r['source']=='read' for r in result['registers']))
         await self.send(6,0x0D12,507)
-        with patch.object(self.ctrl.driver.wire,'read_registers',side_effect=AssertionError('refresh must not issue reads')):
-            result=await self.service.refresh_registers()
-        self.assertTrue(result['cached'])
+        self.sim.regs[0x1019]=5432
+        result=await self.service.refresh_registers()
+        self.assertFalse(result['cached'])
+        row=next(r for r in result['registers'] if r['address']==0x1019)
+        self.assertEqual(row['value'],5432)
+        self.assertFalse(row['stale'])
 
     async def test_client_idle_and_lease_release_do_not_stop_manual_motion(self):
         await self.send(6,0x0D12,507)

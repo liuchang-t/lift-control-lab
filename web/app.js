@@ -1,4 +1,4 @@
-/* Device state stays visible; all motion and manual frames use server-owned guards. */
+/* Normal motion uses controller guards; confirmed manual frames use direct RTU transport. */
 const clientId=sessionStorage.liftLabClient||(sessionStorage.liftLabClient=crypto.randomUUID());
 const $=id=>document.getElementById(id);
 let config={},live={},draggingTarget=false,readiness=null,registers=[],lastNotice='',pendingFrame=null;
@@ -52,10 +52,10 @@ window.addEventListener('blur',releaseAll);window.addEventListener('pagehide',re
 document.addEventListener('visibilitychange',()=>{if(document.hidden)releaseAll();});
 document.querySelectorAll('[data-jog]').forEach(b=>bindHold(b,b.dataset.jog));
 click('arm',async()=>{if(connection.mode==='real'&&!await ask('检查 / 恢复前确认','即将检查驱动参数；检查本身不启动运动。请确认现场可随时停止设备，再继续。'))return;await api('/api/arm',{hardware_confirmed:true});notify('检查通过。按上方恢复指引继续。');});
-click('stop',async()=>{releaseAll(false);await control({action:'stop'});notify('停止命令已应答；实际转速以反馈为准，可重新按住点动。');});
+click('stop',async()=>{releaseAll(false);const result=await control({action:'stop'});const d=result.status?.details||result.payload?.state;notify(d?.stop_confirmation==='feedback'?'全局停止已发送并确认静止。':'停止请求已处理，请核对实际反馈。');});
 click('estop',async()=>{releaseAll(false);settleConfirmation(false);pendingFrame=null;$('writeConfirm').hidden=true;await control({action:'estop'});notify('软件急停已锁定。排查原因后点“检查 / 恢复”；位置未可信时还需回零。');});
-click('home',async()=>{if(baseline())throw new Error('冻结基线不支持回零');if(connection.mode==='real'&&!await ask('模式17回零','将向负限位寻找并反向脱离。已确认方向、限位、HOME速度和行程安全？'))return;await control({action:'home',confirm_homing:true});notify('正在回零。等待回零完成并确认静止；随后可点“全收”至软件下限。');});
-click('resetFault',async()=>{const warning=[0x950,0x952].includes(live.details?.alarm?.code);if(await ask('人工故障复位',warning?'清除限位警告？复位不会启动运动；此前检查仍有效时无需重新检查。':'确认已按报警建议排除故障原因？复位后不会自动恢复运动，需要重新检查 / 恢复；位置失效时还需回零。')){const result=await control({action:'reset_fault',confirm_reset:true});const d=result.status?.details||result.payload?.state;notify(d?.armed?'限位警告已清除，可继续点动；未自动启动运动。':'驱动报警复位完成。下一步：检查 / 恢复；位置未可信时重新回零。');}});
+click('home',async()=>{if(baseline())throw new Error('冻结基线不支持回零');if(connection.mode==='real'&&!await ask('模式17回零','将向负限位寻找并反向脱离。已确认方向、限位、HOME速度和行程安全？'))return;await control({action:'home',confirm_homing:true});notify('正在回零。请观察回零阶段、限位和位置反馈。');});
+click('resetFault',async()=>{const warning=[0x950,0x952].includes(live.details?.alarm?.code);if(await ask('人工故障复位',warning?'清除限位警告？复位不会启动运动；此前检查仍有效时无需重新检查。':'尝试发送一次故障复位？是否能清除以驱动器实际读回为准，不会自动恢复运动。')){const result=await control({action:'reset_fault',confirm_reset:true});const d=result.status?.details||result.payload?.state;notify(d?.armed?'报警已清除，可继续点动；未自动启动运动。':'驱动报警复位完成。下一步：检查 / 恢复；定位需要可信位置参考。');}});
 function inputNumber(id){const text=String($(id).value).trim();if(!text||!Number.isFinite(Number(text)))throw new Error('请输入有效数值');return Number(text);}
 function targetCommand(){const target=inputNumber('target');return baseline()?{action:'goto',height:target/config.travel_cm*100}:{action:'goto',target_cm:target};}
 click('goto',()=>control(targetCommand()));
@@ -66,10 +66,12 @@ click('savePpSpeed',()=>saveSpeed('pp'));click('savePvSpeed',()=>saveSpeed('pv')
 click('saveLegacySpeed',()=>control({action:'set_speed',speed:inputNumber('legacySpeed')}));
 click('legacyZero',async()=>{if(await ask('基线设零','仅模拟：将当前反馈记为软件零点，不执行回零。'))await control({action:'set_retracted_zero',confirm_retracted:true});});
 $('target').addEventListener('focus',()=>draggingTarget=true);$('target').addEventListener('blur',()=>draggingTarget=false);
-const configKeys=['travel_cm','base_cm','soft_lower_cm','soft_upper_cm','min_pp_speed','max_pp_speed','min_pv_speed','max_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s'];
-function showConfig(value){config=value;if(!editingMechanical&&config.cm_per_rev!==undefined)$('mechanicalCm').value=config.cm_per_rev;$('target').min=config.soft_lower_cm??0;$('target').max=config.soft_upper_cm??config.travel_cm;$('config').value=JSON.stringify(Object.fromEntries(configKeys.filter(k=>config[k]!==undefined).map(k=>[k,config[k]])),null,2);}
+const configKeys=['travel_cm','base_cm','soft_lower_cm','soft_upper_cm','min_pp_speed','max_pp_speed','min_pv_speed','max_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s','home_enable_hold_s','home_disable_hold_s'];
+const homeParameterKeys=['home_speed','home_creep_speed','home_acceleration'];
+function homeParameterValues(){return Object.fromEntries(homeParameterKeys.map(k=>[k,$(k).value.trim()===''?null:Number($(k).value)]));}
+function showConfig(value){config=value;for(const k of homeParameterKeys)$(k).value=config[k]??'';if(!editingMechanical&&config.cm_per_rev!==undefined)$('mechanicalCm').value=config.cm_per_rev;$('target').min=config.soft_lower_cm??0;$('target').max=config.soft_upper_cm??config.travel_cm;$('config').value=JSON.stringify(Object.fromEntries(configKeys.filter(k=>config[k]!==undefined).map(k=>[k,config[k]])),null,2);}
 click('openConfig',()=>$('configPanel').hidden=false);click('closeConfig',()=>$('configPanel').hidden=true);
-click('saveConfig',async()=>{showConfig(await api('/api/config',JSON.parse($('config').value)));$('configPanel').hidden=true;notify('配置已保存。下一步：检查 / 恢复即可基础点动；定位另需回零。');});
+click('saveConfig',async()=>{showConfig(await api('/api/config',{...JSON.parse($('config').value),...homeParameterValues()}));$('configPanel').hidden=true;notify('配置已保存。下一步：检查 / 恢复即可基础点动；定位另需回零。');});
 function ageSeconds(value){return value===null||value===undefined?'—':Math.max(0,Math.floor(Number(value)))+' 秒';}
 function number(value,unit='',digits=2){return value===null||value===undefined?'—':Number(value).toFixed(digits)+(unit?' '+unit:'');}
 function renderSpeeds(d){for(const mode of ['pp','pv']){const speed=d.speeds?.[mode];if(!speed){$(mode+'SpeedInfo').textContent='等待读取';continue;}if(!editingSpeed[mode])$(mode+'Speed').value=Number(Number(speed.requested_cm_s).toPrecision(12));$(mode+'Speed').max=speed.max_cm_s;$(mode+'SpeedInfo').textContent=`非零 ${number(speed.min_cm_s,'',3)}–${number(speed.max_cm_s,'',3)} · 比例 ${number(speed.ratio)}`;$(mode+'SpeedInfo').dataset.tip=`已保存 ${number(speed.requested_cm_s,'cm/s',3)}；${number(speed.pr_s,'Pr/s')}；${number(speed.rpm,'rpm')}。速度以cm/s独立保存，0表示不启动。`;}}
@@ -83,11 +85,11 @@ function render(value){
   $('eeprom').textContent=check?`P0C-13 ${check.value??'未知'}${check.status==='warning'?' · 待检查':''}`:'冻结基线不提供 P0C-13 检查';$('eeprom').dataset.status=check?.status||'unknown';$('eeprom').dataset.tip=check?.message||'基线仅模拟';
   $('mode').textContent=(live.control_mode==='real'?'真实设备':'寄存器模拟')+' · '+(baseline()?'冻结基线':'候选实现');$('online').textContent=live.online?'在线':'离线 / 过期';
   $('height').textContent=number(d.height_cm,'cm');$('rpm').textContent=number(d.speed_rpm,'rpm');$('speedApplied').textContent=number(d.command_speed_cm_s,'cm/s');
-  const states={DISARMED:'待检查',IDLE:'静止',MOVING:'运动中',HOMING:'回零中',STARTING:'准备启动',STOPPING:'停止确认中',FAULT:'故障锁定',MOTION_UNKNOWN:'运动状态未知',MANUAL:'手动接管',MANUAL_LOCKED:'手动写入锁定'};
+  const states={DISARMED:'待检查',IDLE:'静止',MOVING:'运动中',HOMING:'回零中',STARTING:'准备启动',STOPPING:'停止确认中',FAULT:'故障锁定',MOTION_UNKNOWN:'运动状态未知',MANUAL:'手动接管',MANUAL_LOCKED:'手动通信异常'};
   const stateLabel=d.motion_notice?d.motion_notice:d.stop_confirmation==='ack'&&d.state==='IDLE'?'停止指令已应答'+(d.observed_motion?' · 反馈仍有运动':''):d.untracked_motion?'外部/未跟踪运动':states[d.state]||d.state||d.motion||'未知';
   $('state').dataset.tip=d.motion_advice||(d.stop_confirmation==='ack'&&d.state==='IDLE'?'停止命令已收到正确应答；不代表实际静止，正反向点动均无需等待零转速。':d.untracked_motion?'反馈显示设备在运动，但本后端没有跟踪该运动任务；不推断命令来自哪台主机，不因观察到运动而自动停止。':'');
   $('state').textContent=`${stateLabel} · ${d.position_trusted?'位置可信':'位置未可信'} · ${d.armed?'已检查':'待检查'}`;
-  const homes={not_homed:'未回零',complete:'回零完成',cancelled:'回零已取消',failed:'回零失败',running:'回零中',starting:'回零准备中',homing:'回零中'};$('homeStatus').textContent=baseline()?'基线无回零':homes[d.home_status]||d.home_status||'未回零';
+  const homes={not_homed:'未回零',complete:'回零完成',cancelled:'回零已取消',failed:'回零失败',running:'回零中',starting:'回零准备中',homing:'回零中'};$('homeStatus').textContent=baseline()?'基线无回零':({preparing:'准备参数与使能给定',seeking_lower:'寻找下限位',leaving_lower:'脱离下限位',settling:'核对回零完成与静止'})[d.home_phase]||homes[d.home_status]||d.home_status||'未回零';
   $('sensors').dataset.tip='P0B-02按16位有符号原码显示；百分比倍率待核实，原始十六进制见寄存器表。';
   $('sensors').textContent=`上限 ${d.upper_limit===undefined?'未知':d.upper_limit?'触发':'正常'} / 下限 ${d.lower_limit===undefined?'未知':d.lower_limit?'触发':'正常'} · 负载原码 ${d.load_signed??'—'} · ${ageSeconds(d.observed_age_s)}前`;
   $('limitsInfo').textContent=`软件范围 ${number(d.soft_lower_cm??config.soft_lower_cm)}–${number(d.soft_upper_cm??config.soft_upper_cm)} cm`;
@@ -113,7 +115,7 @@ function renderForceInputs(value){
 }
 function renderReadiness(value){
   readiness=value;
-  $('manualState').textContent=value.manual?'手动接管 · 普通软件行程保护未覆盖':'普通控制';$('endManual').disabled=!value.manual;$('guideSummary').textContent=value.summary||'检查操作条件';$('guideSteps').textContent=(value.steps||[]).join(' → ');$('conditions').replaceChildren();
+  $('manualState').textContent=value.manual?'手动接管 · 直接收发':'普通控制';$('endManual').disabled=!value.manual;$('guideSummary').textContent=value.summary||'检查操作条件';$('guideSteps').textContent=(value.steps||[]).join(' → ');$('conditions').replaceChildren();
   for(const check of value.checks||[]){const chip=document.createElement('span');chip.className='condition'+(check.ok?' ok':'');chip.textContent=(check.ok?'✓ ':'○ ')+check.label;chip.dataset.tip=check.detail||'';$('conditions').appendChild(chip);}
   $('guideActions').replaceChildren();for(const action of value.actions||[]){const button=document.createElement('button');button.textContent=action.label;button.disabled=action.enabled===false;button.dataset.tip=action.reason||'';button.addEventListener('click',()=>{const map={reset_fault:'resetFault',readParameters:'refreshRegisters',connect:'connectDevice',connect_device:'connectDevice',disconnect:'disconnectDevice'};if(action.id==='exit_manual'){api('/api/manual/exit',{}).then(()=>{notify('手动接管已结束。下一步：检查 / 恢复即可基础点动；定位另需回零。');return refreshReadiness();}).catch(e=>notify(e.message));}else $(map[action.id]||action.id)?.click();});$('guideActions').appendChild(button);}
   applyConnectionState();
@@ -122,7 +124,7 @@ function renderReadiness(value){
 renderReadiness.rejectionAt=0;
 let readingReadiness=false;
 async function refreshReadiness(){if(readingReadiness)return;readingReadiness=true;try{renderReadiness(await api('/api/readiness'));}catch(e){$('guideSummary').textContent='操作条件暂不可用';$('guideSteps').textContent=e.message;}finally{readingReadiness=false;}}
-function renderRegisters(value){registers=value.registers||[];$('registerNotice').hidden=true;filterRegisters();}
+function renderRegisters(value){registers=(value.registers||[]).slice().sort((a,b)=>Number(a.address??a.address_hex)-Number(b.address??b.address_hex));$('registerNotice').hidden=true;filterRegisters();}
 function filterRegisters(){
   const filter=$('registerFilter').value.trim().toLowerCase(),visible=registers.filter(r=>r.visible!==false).filter(r=>[r.parameter,r.name,r.address_hex,r.polling_label].join(' ').toLowerCase().includes(filter));
   $('registerRows').replaceChildren();
@@ -131,13 +133,13 @@ function filterRegisters(){
     const identifier=document.createElement('td');identifier.textContent=r.parameter;const addr=document.createElement('small');addr.textContent=r.address_hex;identifier.appendChild(addr);
     const name=document.createElement('td');name.textContent=r.name;
     const polling=document.createElement('small');polling.className='polling-badge';polling.dataset.kind=r.polling_kind||'unknown';polling.textContent=r.polling_label||'读取机制未标注';name.appendChild(polling);
-    const val=document.createElement('td');val.className='value-cell';val.textContent=r.value??'—';const raw=document.createElement('small');raw.textContent=(r.raw_words||[]).map(x=>Number(x).toString(16).padStart(4,'0').toUpperCase()).join(' ');val.appendChild(raw);
-    const observed=document.createElement('td');observed.textContent=r.value===null||r.value===undefined?'未读取':`${r.stale?'过期 · ':''}${ageSeconds(r.age_s)}`;
-    const source=document.createElement('small');source.textContent=({read:'读回',write_ack:'写入回显'})[r.source]||r.source||'';observed.appendChild(source);
+    const actual=r.source==='read';const val=document.createElement('td');val.className='value-cell';val.textContent=actual?(r.value??'—'):'—';if(r.last_write_value!==undefined&&r.last_write_value!==null)val.dataset.tip=`最近写应答 ${r.last_write_value} · ${ageSeconds(r.last_write_age_s)}前（不是读回）`;const raw=document.createElement('small');raw.textContent=(actual?(r.raw_words||[]):[]).map(x=>Number(x).toString(16).padStart(4,'0').toUpperCase()).join(' ');val.appendChild(raw);
+    const observed=document.createElement('td');observed.textContent=!actual||r.value===null||r.value===undefined?'未读取':`${r.stale?'过期 · ':''}${ageSeconds(r.age_s)}`;
+    const source=document.createElement('small');source.textContent=r.read_error?'读取失败':r.readback_pending?'写后待读回':actual?'读回':'';if(r.read_error)source.dataset.tip=r.read_error;observed.appendChild(source);
     const access=document.createElement('td');access.className='access-cell';access.textContent=r.access||'—';
     row.append(identifier,name,access,val,observed);$('registerRows').appendChild(row);
   }
-  $('registerCount').textContent=`${visible.length} / ${registers.filter(r=>r.visible!==false).length} 项 · 写回显不等于读取验证`;
+  $('registerCount').textContent=`${visible.length} / ${registers.filter(r=>r.visible!==false).length} 项`;
 }
 function renderConversion(value){
   unitVerification=value||null;
@@ -158,7 +160,7 @@ click('saveMechanical',async()=>{
   notify('控制台比例已保存，仍待实机核实；驱动器电子齿轮和PP/PV期望cm/s未修改。下一步：检查 / 恢复即可基础点动；定位另需回零。');
 });
 $('registerFilter').addEventListener('input',filterRegisters);
-click('refreshRegisters',async()=>renderRegisters(await api('/api/registers/refresh',{})));
+click('refreshRegisters',async()=>{notify('正在读取寄存器…');const result=await api('/api/registers/refresh',{});renderRegisters(result);const failures=(result.errors||[]).map(e=>`${e.address_hex}: ${e.error}`).join('；');notify(`${result.notice||`已读回 ${result.refreshed_count??0} / ${result.requested_count??0} 项`}${failures?'；'+failures:''}`);});
 function modbusCrc(bytes){
   let crc=0xFFFF;
   for(const byte of bytes){crc^=byte;for(let bit=0;bit<8;bit++)crc=(crc&1)?(crc>>>1)^0xA001:crc>>>1;}
@@ -194,7 +196,7 @@ function updateManualPreview(){
 }
 $('manualFrame').addEventListener('input',updateManualPreview);
 $('autoCrc').addEventListener('change',updateManualPreview);
-async function sendManual(frame,confirmWrite){try{const result=await api('/api/manual/transaction',{frame,confirm_write:confirmWrite});$('manualResult').textContent=`TX  ${result.tx}\nRX  ${result.rx}\n${result.notice||''}`;notify(result.write?'手动写入已发送。手动接管期间不保证普通软件行程保护；结束手动后重新检查并回零。':'手动读取完成。');await refreshRegistersCache();}catch(e){$('manualResult').textContent='未确认成功：'+e.message;throw e;}finally{await refreshReadiness();}}
+async function sendManual(frame,confirmWrite){try{const result=await api('/api/manual/transaction',{frame,confirm_write:confirmWrite});$('manualResult').textContent=`TX  ${result.tx}\nRX  ${result.rx}\n${result.notice||''}`;notify(result.write?'手动写入已应答；实际效果请观察反馈。':'手动读取完成。');await refreshRegistersCache();}catch(e){$('manualResult').textContent='未确认成功：'+e.message;throw e;}finally{await refreshReadiness();}}
 click('endManual',async()=>{await api('/api/manual/exit',{});notify('手动接管已结束。下一步：检查 / 恢复即可基础点动；定位另需回零。');});
 click('sendFrame',async()=>{const frame=inspectFrame();$('manualPreview').textContent='TX（含CRC）：'+frame.frame;if(frame.write){pendingFrame=frame.frame;$('writeConfirm').hidden=false;$('manualResult').textContent='等待确认，尚未发送。';}else await sendManual(frame.frame,false);});
 click('confirmFrame',async()=>{if(!pendingFrame)throw new Error('报文已改变，请重新检查');const frame=pendingFrame;pendingFrame=null;$('writeConfirm').hidden=true;await sendManual(frame,true);});
@@ -262,9 +264,11 @@ function applyConnectionState(){
   const disabled=!active||transition||connection.state==='stop_pending';
   $('servoEnable').disabled=disabled||baseline()||!!readiness?.manual||['MOVING','HOMING','STARTING','STOPPING'].includes(live.details?.state)||!!live.details?.pending_stop;
   $('servoDisable').disabled=!active||transition||baseline()||!!readiness?.manual;
-  for(const id of ['arm','goto','min','max','savePpSpeed','savePvSpeed','saveLegacySpeed','legacyZero','sendFrame','confirmFrame','refreshRegisters'])$(id).disabled=disabled;
+  for(const id of ['arm','goto','min','max','savePpSpeed','savePvSpeed','saveLegacySpeed','legacyZero'])$(id).disabled=disabled;
+  $('refreshRegisters').disabled=!active||transition;
+  for(const id of ['sendFrame','confirmFrame'])$(id).disabled=!active||transition;
   document.querySelectorAll('[data-jog]').forEach(b=>b.disabled=disabled);
-  if(connection.mode==='real'&&!baseline()){for(const id of ['home','goto','min','max'])$(id).disabled=true;}
+  if(connection.mode==='real'&&!baseline()){for(const id of ['goto','min','max'])$(id).disabled=true;}
   // Stops stay available while a disconnect request is waiting for hardware confirmation.
   $('stop').disabled=!active;$('estop').disabled=!active;
   if(disabled){$('home').disabled=true;$('resetFault').disabled=true;$('endManual').disabled=true;}

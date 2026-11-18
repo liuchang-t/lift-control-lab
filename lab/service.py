@@ -13,8 +13,9 @@ from .legacy import Legacy
 from .model import Config, LabError, atomic_json_write, ROOT
 from .transport import Simulator, TcpTransport, Trace
 from .manual_bus import parse_frame, validate_response
-from .registers import CATALOG, REFRESH_EXCLUDED
+from .registers import CATALOG, REFRESH_GROUPS
 from .readiness import build_readiness
+from baseline.lift_modbus import build_read_holding_registers, parse_read_holding_registers
 
 
 class Service:
@@ -31,6 +32,7 @@ class Service:
         self.manual_active=None
         self._manual_lock=asyncio.Lock()
         self._connection_lock=asyncio.Lock()
+        self._register_refresh_lock=asyncio.Lock()
         self.connected=False
         self.connection_state="disconnected"
         self.connection_error=""
@@ -300,7 +302,7 @@ class Service:
             if path=='/api/connection/disconnect':
                 return await self.disconnect(client)
             is_stop=suffix in ('/lift/control','/api/control') and body.get('action') in ('stop','estop')
-            self._require_connected(allow_stop=is_stop)
+            self._require_connected(allow_stop=is_stop or path in ('/api/manual/transaction','/api/registers/refresh'))
             if path=='/api/manual/transaction':
                 return await self.manual_transaction(client,body)
             if path=='/api/manual/exit':
@@ -368,36 +370,35 @@ class Service:
         session=self.manual_active or {}
         return dict(active=bool(self.manual_active),holder_id=session.get('holder_id'),
                     failed=bool(session.get('failed')),reason=session.get('reason',''),
-                    notice='手动写优先接管，普通运动已取消；手动报文不执行软件行程保护。结束手动后重新允许控制并回零。' if self.manual_active else '手动读不打断运动；首次确认手动写先停止自动运动并接管。')
+                    notice='手动写直接接管，仅发送所编辑报文；报警与反馈只观测，不自动插入停止。结束手动后普通控制需重新检查。' if self.manual_active else '手动读不打断运动；确认手动写取消普通任务，不自动停止设备。')
 
     def _clear_manual(self):
         self.manual_active=None
         self.controller.manual_active=False
         self.controller.manual_failed=False
 
-    def _lock_manual(self,reason,request_stop=True):
+    def _lock_manual(self,reason,request_stop=False):
+        # Called by explicit stop/exit/disconnect. A later new manual request
+        # can take over again; ordinary control still requires its own checks.
         if not self.manual_active:
             return
-        self.manual_active.update(failed=True,reason=reason)
-        self.controller.manual_failed=True
+        self.manual_active.update(failed=False,reason=reason)
+        self.controller.manual_failed=False
         if request_stop:
-            self.controller._fault(reason,True)
+            self.controller._stop_intent()
 
     def _monitor_manual(self):
-        if not self.manual_active or self.manual_active.get('failed'):
+        if not self.manual_active:
             return
         ctrl=self.controller
-        reason=None
-        if ctrl.epoch!=self.manual_active['epoch'] or ctrl.pending_stop:
-            reason='停止或连接变化已取消手动会话'
-        elif self.transport.epoch!=self.manual_active['connection_epoch']:
-            reason='驱动连接变化，手动运动状态未知'
-        elif not ctrl.sample_at or time.monotonic()-ctrl.sample_at>self.config.control_latency_s:
-            reason='手动控制反馈过期，请检查通信'
-        elif not self.manual_active.get('reset_pending') and ctrl.sample.get('alarm_raw',ctrl.sample.get('alarm_code',0)):
-            reason='手动控制期间驱动器报警，已请求停止；按报警建议排查'
-        if reason:
-            self._lock_manual(reason)
+        reason=''
+        if not ctrl.sample_at or time.monotonic()-ctrl.sample_at>self.config.control_latency_s:
+            reason='手动观测反馈过期；不自动发送控制指令，请核对通信和实际设备状态'
+        elif ctrl.sample.get('alarm_raw',ctrl.sample.get('alarm_code',0)):
+            reason='驱动器报告报警；仅显示，不拦截手动指令或自动复位/停止'
+        elif ctrl.pending_stop:
+            reason='用户请求的停止仍待确认；新手动写可接管并取消旧停止重试'
+        self.manual_active['reason']=reason or self.manual_active.get('last_error','')
 
     async def exit_manual(self):
         if self.config.implementation=='baseline':
@@ -424,36 +425,57 @@ class Service:
             stale_after=max(self.config.control_latency_s,self.config.poll_s*3),active_mode=mode)
 
     async def refresh_registers(self):
-        self._require_connected()
+        self._require_connected(allow_stop=True)
         if self.config.implementation=='baseline':
             raise LabError('冻结基线仅展示已观测报文，不主动刷新候选寄存器',400)
-        ctrl=self.controller
-        if ctrl.mode or ctrl.pending_stop or ctrl._sequence.locked() or self.manual_active:
-            result=self.register_snapshot()
-            result.update(cached=True,notice='运动、手动接管或控制操作期间返回缓存，不增加保护通信负担')
-            return result
-        async with ctrl._sequence:
-            epoch=ctrl.epoch
-            for address,width,_,_,access,_ in CATALOG:
-                if epoch!=ctrl.epoch or ctrl.pending_stop:
-                    raise LabError('寄存器刷新已被停止或新控制意图取消')
-                # Command registers have write-ACK evidence, never pretend that
-                # a read of a trigger register reports an active command.
-                if address not in REFRESH_EXCLUDED:
-                    await ctrl.driver._read_words(address,width)
-                    ctrl.driver._limit_config_epoch = None
-        return self.register_snapshot()
+        ctrl,transport=self.controller,self.transport
+        def checkpoint():
+            self._require_connected(allow_stop=True)
+            if self.connection_state not in ('connected','stop_pending') or ctrl is not self.controller or transport is not self.transport:
+                raise LabError('连接已变化，寄存器刷新已取消；请在当前连接重新刷新',409)
+        errors=[]
+        refreshed=0
+        async with self._register_refresh_lock:
+            checkpoint()
+            for address,width in REFRESH_GROUPS:
+                checkpoint()
+                request=build_read_holding_registers(self.config.slave_id,address,width)
+                try:
+                    # Use the shared transport directly: observation must not
+                    # accept changed parameters as the normal motion baseline.
+                    response=await transport.transaction(request,5+2*width,before_send=checkpoint)
+                    parse_read_holding_registers(response,self.config.slave_id,width)
+                    checkpoint()
+                    refreshed+=sum(address<=item[0]<address+width for item in CATALOG)
+                except Exception as exc:
+                    checkpoint()
+                    transport.registers.read_failed(address,width,exc,transport.epoch)
+                    errors.append(dict(address=address,address_hex='0x%04X'%address,error=str(exc) or type(exc).__name__))
+                # A refresh has no controller-sequence lock. Yield between
+                # bounded blocks for protection samples and explicit control.
+                await asyncio.sleep(0)
+        result=self.register_snapshot()
+        result.update(cached=False,refreshed_count=refreshed,requested_count=len(CATALOG),
+                      errors=errors,partial=bool(errors),
+                      notice=('已实际读取%d/%d项寄存器；%d组读取失败，请查看错误项'%(refreshed,len(CATALOG),len(errors)))
+                              if errors else '已实际读取%d项寄存器，主值均为读回；命令读回不代表动作完成'%refreshed)
+        return result
+
+    def _require_manual_connection(self):
+        self._require_connected(allow_stop=True)
+        if self.connection_state not in ('connected','stop_pending'):
+            raise LabError('连接正在切换，不能将手动指令发送到不确定的目标',409)
 
     async def manual_transaction(self,client,body):
-        self._require_connected()
-        parsed=parse_frame(body.get("frame"),self.config.slave_id)
-        if parsed["write"]:
+        self._require_manual_connection()
+        parsed=parse_frame(body.get('frame'),self.config.slave_id)
+        if parsed['write']:
             controller=self.controller
             issued=controller.epoch
             async with self._manual_lock:
-                self._require_connected()
+                self._require_manual_connection()
                 if controller is not self.controller or issued!=controller.epoch:
-                    raise LabError("排队手动写已被停止或连接变化取消")
+                    raise LabError('排队手动写已被停止或连接变化取消')
                 return await self._manual_transaction(client,body)
         return await self._manual_transaction(client,body)
 
@@ -461,80 +483,67 @@ class Service:
         if self.config.implementation=='baseline':
             raise LabError('冻结基线不提供手动总线接口',400)
         parsed=parse_frame(body.get('frame'),self.config.slave_id)
-        self._require_owner(client)
         ctrl=self.controller
         transport=self.transport
         def same_connection():
-            self._require_connected()
+            self._require_manual_connection()
             if ctrl is not self.controller or transport is not self.transport:
                 raise LabError('连接已变化，旧手动报文已取消')
-            self._require_owner(client)
         if not parsed['write']:
             response=await transport.transaction(parsed['request'],parsed['expected_length'],before_send=same_connection)
             validate_response(parsed,response)
         else:
             if body.get('confirm_write') is not True:
-                raise LabError('确认手动写入后才能发送；它会取消自动任务，且不执行软件行程保护',400)
-            if self.manual_active and self.manual_active.get('failed'):
-                raise LabError('手动会话已锁定；先结束手动并排查原因')
-            if not self.manual_active:
-                # Cancel immediately, before waiting for an in-flight automatic
-                # preparation. Its checkpoint will retire late automatic starts.
-                ctrl.armed=ctrl.trusted=False
-                expected_epoch=ctrl.epoch+1
-                await ctrl.stop()
-                if ctrl.epoch!=expected_epoch or ctrl.pending_stop:
-                    raise LabError('手动接管期间收到新的停止或控制意图，未发送手动报文')
-                ctrl.home_status='not_homed'
-                ctrl.fault='手动控制已接管；普通运动需重新允许控制并回零'
-                ctrl.state='DISARMED'
-                self.manual_active=dict(holder_id=client,failed=False,reason='',epoch=ctrl.epoch,
-                                        connection_epoch=self.transport.epoch)
-                ctrl.manual_active=True
-                ctrl.manual_failed=False
-            resetting=(parsed['address']==0x0D01 and parsed['count']==1 and parsed['values']==[1])
-            # Only a single explicit reset may resolve an existing alarm. Never
-            # suppress alarm protection for a mixed multi-register command.
-            self.manual_active['reset_pending']=resetting
+                raise LabError('请确认直接手动写入；它会接管普通任务，不自动执行停止或运动保护',400)
+            if (not self.manual_active or self.manual_active['epoch']!=ctrl.epoch or ctrl.pending_stop):
+                ctrl.take_manual_control()
+                self.manual_active=dict(holder_id=client,failed=False,reason='',last_error='',epoch=ctrl.epoch,
+                                        connection_epoch=transport.epoch)
+                if self.connection_state=='stop_pending':
+                    self.connection_state='connected'
+                    self.connection_error=''
             issued=self.manual_active['epoch']
             def checkpoint():
                 same_connection()
-                if (not self.manual_active or self.manual_active.get('failed') or
-                    ctrl.epoch!=issued or ctrl.pending_stop or
-                    self.transport.epoch!=self.manual_active['connection_epoch']):
-                    raise LabError('手动写入已被停止、失联或新控制意图取消')
-                self._require_owner(client)
+                if not self.manual_active or ctrl.epoch!=issued or ctrl.pending_stop:
+                    raise LabError('排队手动写已被后续停止、断开或新控制意图取消')
             async with ctrl._sequence:
                 checkpoint()
                 try:
-                    # Recheck *inside* the shared bus lock, so a queued raw
-                    # start cannot be sent after an emergency-stop intent.
-                    if parsed['address'] <= 0x0D0B < parsed['address']+parsed['count']:
-                        ctrl.driver.jog_context=True
-                        ctrl.driver.jog_running=True
-                    response=await transport.transaction(parsed['request'],parsed['expected_length'],before_send=checkpoint)
+                    # Select the operator-stop channel at actual transmission,
+                    # including uncertain ACK outcomes, never on a queued write.
+                    def before_send():
+                        checkpoint()
+                        for offset,value in enumerate(parsed['values']):
+                            address=parsed['address']+offset
+                            if address==0x0D0B:
+                                ctrl.driver.jog_context=True
+                                ctrl.driver.jog_running=value in (17,33)
+                                ctrl.driver.jog_enable_epoch=transport.epoch if value in (1,17,33) else None
+                            elif address==0x0D08 and value in (1,3,5,7,8,16,32,64,128,256,512):
+                                ctrl.driver.jog_context=False
+                                ctrl.driver.jog_running=False
+                    response=await transport.transaction(parsed['request'],parsed['expected_length'],before_send=before_send)
                     validate_response(parsed,response)
                     checkpoint()
-                    if resetting:
-                        await ctrl.observe()
-                        checkpoint()
+                    self.manual_active['last_error']=''
                     self.trace.add('manual_write',frame=parsed['request'].hex(' '),client=client)
                 except Exception as exc:
-                    self._lock_manual('手动写结果未确认：'+str(exc))
-                    self.last_rejection=dict(message=str(exc),action='manual_write',at=time.time())
-                    raise LabError('手动写结果未确认，已请求停止并锁定；请结束手动并检查：'+str(exc),503)
-                finally:
-                    if self.manual_active:
-                        self.manual_active['reset_pending']=False
+                    message='手动写未确认：'+str(exc)+'；不自动重发或插入停止，实际执行结果请核对反馈'
+                    if self.manual_active and self.manual_active['epoch']==issued:
+                        self.manual_active['last_error']=message
+                        self.manual_active['reason']=message
+                    self.last_rejection=dict(message=message,action='manual_write',at=time.time())
+                    raise LabError(message,503)
             self._monitor_manual()
         self.last_rejection=None
         return dict(tx=parsed['request'].hex(' '),rx=response.hex(' '),function=parsed['function'],
                     address=parsed['address'],count=parsed['count'],write=parsed['write'],
-                    notice='写回包仅表示驱动器应答，需读回确认参数；手动操作不执行软件行程保护' if parsed['write'] else '读取完成')
+                    notice='仅发送所编辑报文；应答不代表运动完成，报警/限位仅观测，不自动插入控制指令' if parsed['write'] else '读取完成')
 
     async def update_config(self,body):
         # Connection changes have a separate explicit stop/disconnect/connect lifecycle.
-        allowed={'cm_per_rev','travel_cm','base_cm','max_pp_speed','max_pv_speed','min_pp_speed','min_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','release_enable_s','soft_lower_cm','soft_upper_cm','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s'}
+        allowed={'cm_per_rev','travel_cm','base_cm','max_pp_speed','max_pv_speed','min_pp_speed','min_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','release_enable_s','soft_lower_cm','soft_upper_cm','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s','home_enable_hold_s','home_disable_hold_s','home_speed','home_creep_speed','home_acceleration'}
         if set(body)-allowed:
             raise LabError('此处仅允许调整行程/速度/保护参数；连接参数请在连接设置中保存，再显式连接',400)
         if self.config.implementation=='candidate' and self.controller._sequence.locked():

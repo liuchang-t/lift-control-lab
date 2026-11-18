@@ -20,7 +20,7 @@ async def until(predicate, timeout=5):
 class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.cfg=Config(mode='sim', state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,
+        self.cfg=Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,
                         travel_cm=5,soft_upper_cm=4,max_move_pulse=1000000,
                         deadman_s=.3,home_timeout_s=1.5,home_start_timeout_s=.4,
                         stop_timeout_s=.4,control_latency_s=.1,limit_margin_cm=.05)
@@ -68,6 +68,29 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status['position_trusted'])
         prohibited={0x0C0D,0x0A28,0x0A29,0x0A2B,0x1012,0x1014,0x0D14}
         self.assertFalse(any(address in prohibited for address,_ in self.writes()))
+
+    async def test_home_then_repeated_jog_preserves_reference_without_home_cleanup_writes(self):
+        await self.home()
+        self.assertFalse(self.ctrl.driver.home_enable_owned)
+        self.assertEqual(self.sim.regs[0x0307],0)
+        self.cfg.deadman_s=2
+        self.svc.trace.clear()
+        for i,direction in enumerate(('up','up','down','up')):
+            before=self.sim.physical
+            await self.ctrl.command(dict(action=direction,intent_id='after-home-%s'%i))
+            await until(lambda:abs(self.sim.physical-before)>30)
+            self.assertEqual(self.sim.motion,direction)
+            self.assertGreater((self.sim.physical-before)*(1 if direction=='up' else -1),0)
+            await self.ctrl.stop()
+            self.assertTrue(self.ctrl.armed)
+            self.assertTrue(self.ctrl.trusted)
+            self.assertFalse(self.ctrl.pending_stop)
+            self.assertEqual(self.ctrl.stop_confirmation,'ack')
+        writes=self.writes()
+        self.assertFalse(any(a in (0x0307,0x0D08,0x1003,0x0D11,0x0D12) for a,v in writes))
+        self.assertNotIn((0x0D0B,65),writes)
+        self.assertEqual(self.ctrl.home_status,'complete')
+        self.assertEqual(self.ctrl.zero,self.cfg.home_reference_pulse)
 
     async def test_stale_home_complete_cannot_establish_new_reference(self):
         self.sim.inject('home_stale_complete',True)
@@ -152,13 +175,14 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await self.ctrl.command({'action':'set_speed','mode':'pv','speed_cm_s':.35})
         self.assertEqual(self.ctrl.speeds,previous)
 
-    async def test_alarm_stops_pp_and_manual_reset_does_not_restart_or_trust(self):
+    async def test_pp_alarm_is_advisory_and_manual_reset_does_not_restart_or_trust(self):
         await self.home()
         await self.retract()
         await self.ctrl.command({'action':'goto','target_cm':3})
         self.sim.inject('alarm',0xB00)
-        await until(lambda:not self.ctrl.armed)
-        await until(lambda:not self.ctrl.pending_stop)
+        await self.ctrl.observe()
+        self.assertTrue(self.ctrl.armed)
+        self.assertFalse(self.ctrl.pending_stop)
         self.assertFalse(self.ctrl.trusted)
         with self.assertRaises(LabError):
             await self.ctrl.command({'action':'reset_fault'})
@@ -169,14 +193,13 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.sim.motion)
         self.assertIn((0x0D01,1),self.writes())
 
-    async def test_nonresettable_and_unknown_alarms_do_not_receive_reset_write(self):
+    async def test_any_alarm_allows_one_explicit_reset_attempt(self):
         for alarm in (0x104,0x731,0x1234):
             self.sim.inject('alarm',alarm)
             await self.ctrl.observe()
             self.svc.trace.items.clear()
-            with self.assertRaises(LabError):
-                await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
-            self.assertNotIn((0x0D01,1),self.writes())
+            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+            self.assertEqual(self.writes().count((0x0D01,1)),1)
 
     async def test_latched_expected_home_limit_can_be_reset_after_release(self):
         self.sim.inject('alarm',0x952)
@@ -188,24 +211,23 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.ctrl.armed)
         self.assertIsNone(self.sim.motion)
 
-    async def test_active_limit_cannot_be_cleared_to_bypass_switch(self):
+    async def test_active_limit_allows_reset_attempt_without_bypassing_direction(self):
         self.sim.inject('alarm',0x952)
         self.svc.trace.items.clear()
-        with self.assertRaises(LabError):
-            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
-        self.assertNotIn((0x0D01,1),self.writes())
-        self.assertEqual(self.sim.regs[0x0B22],0x952)
+        await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertIn((0x0D01,1),self.writes())
+        from lab.alarms import jog_blocked
+        self.assertTrue(jog_blocked(await self.ctrl.observe(),'down'))
 
-    async def test_alarm_change_during_reset_setup_prevents_reset_write(self):
+    async def test_alarm_change_is_logged_but_does_not_gate_explicit_reset(self):
         self.sim.inject('alarm',0x620)
         original=self.ctrl.driver.disable
-        async def changed_alarm():
+        async def changed_alarm(checkpoint=lambda:None):
             await original()
             self.sim.inject('alarm',0x104)
         with patch.object(self.ctrl.driver,'disable',side_effect=changed_alarm):
-            with self.assertRaises(LabError):
-                await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
-        self.assertNotIn((0x0D01,1),self.writes())
+            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertEqual(self.writes().count((0x0D01,1)),1)
 
     async def test_reset_ack_without_clearing_alarm_is_not_success(self):
         self.sim.inject('alarm',0x620)
@@ -261,6 +283,148 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(LabError):
                 await setting
         self.assertEqual(self.sim._i32(0x102A),previous)
+        self.assertIsNone(self.sim.motion)
+
+
+    async def test_601_reset_releases_unowned_latched_son_then_allows_explicit_home(self):
+        for raw in (0x601,0xE601):
+            await self.ctrl.driver.wire.write_register(0x0307,1)
+            await self.ctrl.driver.wire.write_register(0x0307,0)
+            self.ctrl.driver.home_enable_owned=False  # Restart/lost ownership.
+            self.sim.inject('alarm',raw)
+            self.ctrl.armed=False
+            self.ctrl.trusted=False
+            self.ctrl.state='FAULT'
+            self.svc.trace.clear()
+            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+            writes=self.writes()
+            self.assertEqual(writes.count((0x0D01,1)),1)
+            self.assertLess(writes.index((0x0D12,507)),writes.index((0x0D12,511)))
+            self.assertLess(writes.index((0x0D11,0)),writes.index((0x0D01,1)))
+            self.assertFalse(self.sim.enabled)
+            self.assertEqual(self.sim.regs[0x0B22],0)
+            self.assertTrue(self.ctrl.armed)
+            self.assertFalse(self.ctrl.trusted)
+            self.assertNotIn((0x0D08,128),writes)
+            self.assertIsNone(self.sim.motion)
+            await self.home()  # Separate explicit user action, no extra arm.
+            self.assertTrue(self.ctrl.trusted)
+
+    async def test_601_uncleared_alarm_never_restores_control_or_repeats_reset(self):
+        self.sim.inject('alarm',0xE601)
+        self.sim.inject('alarm_persistent',True)
+        self.svc.trace.clear()
+        with self.assertRaisesRegex(LabError,'报警未清除'):
+            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertEqual(self.writes().count((0x0D01,1)),1)
+        self.assertFalse(self.ctrl.armed)
+        self.assertFalse(self.ctrl.trusted)
+        self.assertNotIn((0x0D08,128),self.writes())
+        self.sim.inject('alarm_persistent',False)
+
+    async def test_601_di3_timeout_does_not_send_fault_reset(self):
+        self.sim.inject('alarm',0xE601)
+        original=self.ctrl.driver._read_words
+        async def stuck(address,count):
+            values=await original(address,count)
+            if address==0x0B03 and self.sim.regs[0x0D11]==1:
+                return [values[0]|4]
+            return values
+        self.svc.trace.clear()
+        with patch.object(self.ctrl.driver,'_read_words',side_effect=stuck):
+            with self.assertRaises(LabError):
+                await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertNotIn((0x0D01,1),self.writes())
+        self.assertFalse(self.ctrl.armed)
+
+    async def test_601_reset_does_not_clear_emergency_or_bypass_preflight(self):
+        self.sim.inject('alarm',0x601)
+        self.ctrl.emergency=True
+        await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertEqual(self.sim.regs[0x0B22],0)
+        self.assertTrue(self.ctrl.emergency)
+        self.assertFalse(self.ctrl.armed)
+        self.assertIn('软件急停',self.ctrl.fault)
+        self.ctrl.emergency=False
+        self.sim.inject('alarm',0x601)
+        original=self.ctrl.driver.preflight
+        async def failed():
+            report=await original()
+            report['failures'].append('模拟检查未通过')
+            return report
+        with patch.object(self.ctrl.driver,'preflight',side_effect=failed):
+            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertFalse(self.ctrl.armed)
+        self.assertIn('601已清除',self.ctrl.fault)
+        self.assertIn('模拟检查未通过',self.ctrl.fault)
+
+    async def test_local_home_timeout_recovers_without_inventing_driver_601(self):
+        self.sim.inject('home_never_complete',True)
+        await self.ctrl.command({'action':'home','confirm_homing':True})
+        await until(lambda:bool(self.ctrl.fault))
+        await until(lambda:not self.ctrl.pending_stop)
+        self.assertEqual(self.sim.regs[0x0B22],0)
+        self.assertFalse(self.ctrl.trusted)
+        self.assertNotIn((0x0D01,1),self.writes())
+        self.sim.inject('home_never_complete',False)
+        await self.ctrl.arm()
+        await self.home()
+
+
+    async def test_601_reuses_cleanup_completed_by_same_stop(self):
+        self.sim.inject('alarm',0x601)
+        self.ctrl.driver.home_enable_owned=True
+        self.ctrl.mode='home'
+        self.ctrl.state='FAULT'
+        self.svc.trace.clear()
+        await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertEqual(self.writes().count((0x0D12,507)),1)
+        self.assertEqual(self.writes().count((0x0D01,1)),1)
+        self.assertTrue(self.ctrl.armed)
+
+    async def test_601_clear_then_parameter_read_failure_is_reported_separately(self):
+        self.sim.inject('alarm',0x601)
+        with patch.object(self.ctrl.driver,'read_parameters',side_effect=TimeoutError('parameters')):
+            with self.assertRaisesRegex(LabError,'601已清除，但恢复检查未通过'):
+                await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertEqual(self.sim.regs[0x0B22],0)
+        self.assertFalse(self.ctrl.armed)
+
+
+    async def test_601_automatic_stop_preserves_alarm_until_explicit_reset(self):
+        self.ctrl.mode='home'
+        self.ctrl.state='HOMING'
+        self.ctrl.driver.home_enable_owned=True
+        self.sim.regs[0x0307]=1
+        self.sim.inject('alarm',0xE601)
+        self.svc.trace.clear()
+        await self.ctrl.stop()
+        self.assertEqual(self.sim.regs[0x0B22],0xE601)
+        self.assertFalse(self.ctrl.pending_stop)
+        self.assertIsNone(self.ctrl.mode)
+        self.assertFalse(self.ctrl.armed)
+        self.assertIn('人工故障复位',self.ctrl.fault)
+        self.assertFalse(any(a in (0x0307,0x0D11,0x0D12,0x0D01) for a,v in self.writes()))
+        await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertEqual(self.sim.regs[0x0B22],0)
+        self.assertIn((0x0D12,507),self.writes())
+        self.assertTrue(self.ctrl.armed)
+
+    async def test_601_cleared_by_manual_disable_skips_reset_trigger(self):
+        self.sim.inject('alarm',0xE601)
+        self.ctrl.driver.home_enable_owned=True
+        self.sim.regs[0x0307]=1
+        original=self.ctrl.driver.wire.write_register
+        async def clear_on_disable(address,value):
+            await original(address,value)
+            if (address,value)==(0x0D12,507):
+                self.sim.regs[0x0B22]=0
+        self.svc.trace.clear()
+        with patch.object(self.ctrl.driver.wire,'write_register',side_effect=clear_on_disable):
+            await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
+        self.assertNotIn((0x0D01,1),self.writes())
+        self.assertTrue(self.ctrl.armed)
+        self.assertFalse(self.ctrl.trusted)
         self.assertIsNone(self.sim.motion)
 
 

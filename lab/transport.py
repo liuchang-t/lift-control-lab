@@ -9,6 +9,19 @@ from .units import integer
 from .registers import RegisterMonitor
 
 
+def guarded_send(transport, request, before_send):
+    """Capture a write intent before queueing; validate at actual transmission."""
+    factory = getattr(transport, 'write_guard', None)
+    guard = factory() if factory and len(request) > 1 and request[1] in (6, 16) else None
+    if guard is None:
+        return before_send
+    def check():
+        guard()
+        if before_send:
+            before_send()
+    return check
+
+
 class Trace:
     def __init__(self):
         self.items = deque(maxlen=20000)
@@ -53,6 +66,7 @@ class TcpTransport:
             await self.close()
 
     async def transaction(self, request, expected_length, before_send=None):
+        before_send = guarded_send(self, request, before_send)
         async with self.lock:
             if not self.active:
                 raise ConnectionError("连接已主动断开，请显式连接")
@@ -113,6 +127,7 @@ class Simulator:
         self.counter_offset = 0.0
         self.rpm = 0
         self.enabled = False
+        self.home_son_latched = False  # Field-observed behavior, not a firmware model.
         self.jog_active = False
         self.motion = None
         self.home_attained = False
@@ -206,7 +221,8 @@ class Simulator:
             di &= ~(1 << 4)
         if self.physical >= self.upper_switch-1:
             di &= ~(1 << 3)
-        self.regs[0x0B03] = di
+        # Observed hardware input-monitor behavior under forced DI.
+        self.regs[0x0B03] = self.regs[0x0D12] if self.regs[0x0D11] in (1,3) else di
 
     def inject(self, name, value=True):
         self.tick()
@@ -239,6 +255,7 @@ class Simulator:
             await self.close()
 
     async def transaction(self, request, expected_length, before_send=None):
+        before_send = guarded_send(self, request, before_send)
         async with self.lock:
             if not self.active:
                 raise ConnectionError("连接已主动断开，请显式连接")
@@ -272,7 +289,7 @@ class Simulator:
                 raise TimeoutError('reset not delivered')
             for offset, value in enumerate(values):
                 self.regs[address+offset] = value
-            if address == 0x0D0B:
+            if address == 0x0D0B and not self.home_son_latched:
                 value=values[0]
                 if value in (1,65):
                     self.enabled=value==1
@@ -286,13 +303,19 @@ class Simulator:
                     if self.faults['lost_start_ack']:
                         self.faults['lost_start_ack']=False
                         raise TimeoutError('JOG start applied, acknowledgement lost')
-            if address == 0x0D12:
+            if address == 0x0307 and values[0]==1:
+                self.home_son_latched=True
+                self.enabled=True
+            # Writing polarity back to zero alone does not release S-ON.
+            if address == 0x0D12 and self.regs[0x0D11] in (1,3):
                 self.enabled = values[0] == 507
+                if not self.enabled:
+                    self.home_son_latched = False
                 if not self.enabled:
                     self.motion = None
                     self.home_phase=None
             if address == 0x0D01:
-                if not self.faults['alarm_persistent']:
+                if not self.faults['alarm_persistent'] and not (self.regs[0x0B22] in (0x601,0xE601) and (self.enabled or self.home_son_latched)):
                     self.regs[0x0B22] = 0
             if address == 0x0D08:
                 self.jog_active=False

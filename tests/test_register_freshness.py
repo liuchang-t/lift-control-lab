@@ -6,7 +6,7 @@ class FreshnessTests(unittest.TestCase):
     def row(self, address, age, mode=None, epoch=1):
         monitor=RegisterMonitor()
         for offset in range(2):
-            monitor.words[address+offset]=dict(value=0,at=100-age,epoch=1,source='read',serial=1)
+            monitor.read_words[address+offset]=dict(value=0,at=100-age,epoch=1,source='read',serial=1)
         with patch('lab.registers.time.monotonic',return_value=100):
             return next(r for r in monitor.snapshot(epoch,stale_after=1,active_mode=mode)['registers'] if r['address']==address)
 
@@ -36,6 +36,6 @@ class FreshnessTests(unittest.TestCase):
 
     def test_incomplete_multiword_remains_invalid(self):
         monitor=RegisterMonitor()
-        monitor.words[0x1019]=dict(value=1,at=100,epoch=1,source='read',serial=1)
+        monitor.read_words[0x1019]=dict(value=1,at=100,epoch=1,source='read',serial=1)
         row=next(r for r in monitor.snapshot(1)['registers'] if r['address']==0x1019)
         self.assertTrue(row['stale'])

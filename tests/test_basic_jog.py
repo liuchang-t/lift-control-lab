@@ -13,7 +13,7 @@ from lab.readiness import build_readiness
 class BasicJogTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.s=Service(Config(mode='sim', state_file=str(Path(self.tmp.name)/'state.json'),poll_s=.02,deadman_s=.15,stop_timeout_s=.12))
+        self.s=Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.tmp.name)/'state.json'),poll_s=.02,deadman_s=.15,stop_timeout_s=.12))
         self.c=self.s.controller
         self.s.connected=True
         self.s.connection_state='connected'
@@ -65,12 +65,13 @@ class BasicJogTests(unittest.IsolatedAsyncioTestCase):
         await self.jog('up')
         self.assertEqual(self.sim.motion,'up')
 
-    async def test_overload_and_unknown_alarm_block_start(self):
+    async def test_alarm_does_not_gate_explicit_jog_request(self):
         for alarm in (0x6620,0x909,0x1234):
             self.sim.regs[0x0b22]=alarm
             self.s.trace.clear()
-            with self.assertRaises(LabError): await self.jog()
-            self.assertEqual(self.writes(),[])
+            await self.jog(i=str(alarm))
+            self.assertIn((0x0D0B,17),self.writes())
+            await self.c.stop()
 
     async def test_limit_stop_then_reverse_without_rearm_or_home(self):
         await self.jog('down')
@@ -160,15 +161,17 @@ class BasicJogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(v['can_jog_down'])
         self.assertIn('无需回零',v['summary'])
 
-    async def test_real_pp_home_cannot_enter_old_force_di_path(self):
+    async def test_real_pp_blocked_but_home_uses_physical_di_path(self):
         self.c.config.mode='real'
         self.c.trusted=True
         self.s.trace.clear()
-        with self.assertRaisesRegex(LabError,'PP/HOME'):
+        with self.assertRaisesRegex(LabError,'PP'):
             await self.c.driver.start('pp',10000,1000,'up',lambda:None)
-        with self.assertRaisesRegex(LabError,'PP/HOME'):
-            await self.c.driver.home(lambda:None,lambda:None)
         self.assertEqual(self.writes(),[])
+        await self.c.driver.home(lambda:None,lambda:None)
+        self.assertIn((0x0307,1),self.writes())
+        self.assertIn((0x0D08,128),self.writes())
+        self.assertFalse(any(a in (0x0D11,0x0D12) for a,v in self.writes()))
 
     def test_direction_policy_matrix(self):
         base=dict(di4_function=14,di5_function=15,di4_logic=0,di5_logic=0)

@@ -9,7 +9,7 @@ from lab.service import Service
 class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
-        self.service=Service(Config(mode='sim', state_file=str(Path(self.temp.name)/'zero.json'),stop_timeout_s=.15))
+        self.service=Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.temp.name)/'zero.json'),stop_timeout_s=.15))
         self.ctrl=self.service.controller
         self.sim=self.service.transport
 
@@ -26,8 +26,9 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.sim.motion)
         self.assertFalse(self.ctrl.trusted)
         self.assertFalse(self.ctrl.armed)
-        self.assertEqual(self.sim.regs[0x0D11],0)
-        self.assertEqual(self.sim.regs[0x0D0B],1)
+        self.assertEqual(self.sim.regs[0x0D11],1)
+        self.assertEqual(self.sim.regs[0x0D12],507)
+        self.assertFalse(any(a==0x0D0B for a,v in self.writes()))
         self.assertFalse(any(a==0x0D08 and v in (1,3,5,7,8,16,32,64,128) for a,v in self.writes()))
 
     async def test_disable_stops_motion_before_force_write(self):
@@ -44,7 +45,7 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.sim.motion)
         events=list(self.service.trace.items)
         confirmed=next(i for i,x in enumerate(events) if x['kind']=='stop_acknowledged')
-        force=next(i for i,x in enumerate(events) if x['kind']=='tx' and bytes.fromhex(x['frame'])[1:6]==bytes([6,13,11,0,65]))
+        force=next(i for i,x in enumerate(events) if x['kind']=='tx' and bytes.fromhex(x['frame'])[1:6]==bytes([6,13,17,0,1]))
         self.assertLess(confirmed,force)
 
     async def test_stop_failure_does_not_send_disable(self):
@@ -60,40 +61,94 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
             await self.ctrl.command({'action':'servo_enable'})
         self.assertEqual(self.writes(),[])
 
-    async def test_alarm_prevents_enable_but_allows_disable(self):
-        self.sim.regs[0x0B22]=0x410
-        with self.assertRaises(LabError):
-            await self.ctrl.command({'action':'servo_enable'})
-        self.assertNotIn((0x0D12,507),self.writes())
+    async def test_alarm_does_not_gate_enable_or_disable(self):
+        self.sim.regs[0x0B22]=0x6121
+        await self.ctrl.command({'action':'servo_enable'})
+        self.assertIn((0x0D12,507),self.writes())
         await self.ctrl.command({'action':'servo_disable'})
         self.assertEqual(self.sim.regs[0x0D12],511)
+
+    async def test_unknown_alarm_allows_enable_and_disable_without_reset(self):
+        self.sim.regs[0x0B22]=0xFFFF
+        await self.ctrl.command({'action':'servo_enable'})
+        await self.ctrl.command({'action':'servo_disable'})
+        self.assertIn((0x0D12,507),self.writes())
+        self.assertIn((0x0D12,511),self.writes())
+        self.assertNotIn((0x0D01,1),self.writes())
+        self.assertEqual(self.sim.regs[0x0B22],0xFFFF)
 
     async def test_stop_cancels_enable_during_preparation(self):
         entered=asyncio.Event()
         resume=asyncio.Event()
-        original=self.ctrl.driver.prepare_jog
-        async def delayed(checkpoint):
-            await original(checkpoint)
+        async def delayed(enabled,checkpoint):
             entered.set()
             await resume.wait()
             checkpoint()
-        with patch.object(self.ctrl.driver,'prepare_jog',side_effect=delayed):
+        with patch.object(self.ctrl.driver,'set_force_servo_given',side_effect=delayed):
             task=asyncio.create_task(self.ctrl.command({'action':'servo_enable'}))
             await asyncio.wait_for(entered.wait(),1)
             await self.ctrl.stop()
             resume.set()
             with self.assertRaises(LabError): await task
-        self.assertNotIn((0x0D0B,1),self.writes())
+        self.assertNotIn((0x0D12,507),self.writes())
 
     async def test_force_selection_readback_failure_prevents_enable(self):
         self.sim.regs[0x0d11]=1
         original=self.ctrl.driver.wire.read_registers
         async def wrong(address,count):
             values=await original(address,count)
-            if address==0x0D11: return [1,511]
+            if address==0x0D11: return [0,511]
             return values
         with patch.object(self.ctrl.driver.wire,'read_registers',side_effect=wrong):
             with self.assertRaises(LabError):
                 await self.ctrl.command({'action':'servo_enable'})
-        self.assertNotIn((0x0D0B,1),self.writes())
+        self.assertNotIn((0x0D12,507),self.writes())
         self.assertTrue(self.ctrl.pending_stop)
+
+
+    async def test_buttons_write_and_read_each_force_step_in_order(self):
+        for enabled in (True,False):
+            self.service.trace.clear()
+            await self.ctrl.command({'action':'servo_enable' if enabled else 'servo_disable'})
+            expected=[(0x0D11,1),(0x0D12,507 if enabled else 511)]
+            if not enabled: expected.append((0x0D11,0))
+            frames=[bytes.fromhex(x['frame']) for x in self.service.trace.items if x['kind']=='tx']
+            indices=[i for i,f in enumerate(frames) if f[1]==6 and int.from_bytes(f[2:4],'big') in (0x0D11,0x0D12)]
+            self.assertEqual([(int.from_bytes(frames[i][2:4],'big'),int.from_bytes(frames[i][4:6],'big')) for i in indices],expected)
+            for i in indices:
+                self.assertEqual(frames[i+1][1:6],bytes([3,13,17,0,2]))
+            self.assertEqual(self.sim.enabled,enabled)
+
+    async def test_each_force_read_failure_aborts_following_writes(self):
+        for enabled in (True,False):
+            sequence=[(0x0D11,1),(0x0D12,507 if enabled else 511)]+([] if enabled else [(0x0D11,0)])
+            for fail_index in range(len(sequence)):
+                for timeout in (False,True):
+                    self.service.trace.clear()
+                    read=self.ctrl.driver.wire.read_registers
+                    write=self.ctrl.driver.wire.write_register
+                    count=0
+                    async def track(address,value):
+                        nonlocal count
+                        await write(address,value)
+                        count+=1
+                    async def bad(address,n):
+                        values=await read(address,n)
+                        if count==fail_index+1 and address==0x0D11:
+                            if timeout: raise TimeoutError('read failed')
+                            values[sequence[fail_index][0]-0x0D11]^=1
+                        return values
+                    with patch.object(self.ctrl.driver.wire,'write_register',side_effect=track),patch.object(self.ctrl.driver.wire,'read_registers',side_effect=bad):
+                        with self.assertRaises((LabError,TimeoutError)):
+                            await self.ctrl.driver.set_force_servo_given(enabled,lambda:None)
+                    self.assertEqual(self.writes(),sequence[:fail_index+1])
+
+    async def test_jog_stop_ack_with_residual_motion_cannot_switch_force_di(self):
+        self.ctrl.driver.jog_context=True
+        self.ctrl.driver.jog_running=True
+        sample=await self.ctrl.driver.sample()
+        sample['speed_rpm']=30
+        with patch.object(self.ctrl,'observe',return_value=sample):
+            with self.assertRaises(LabError):
+                await self.ctrl.command({'action':'servo_disable'})
+        self.assertFalse(any(a in (0x0D11,0x0D12) for a,v in self.writes()))

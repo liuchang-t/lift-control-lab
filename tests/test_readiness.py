@@ -11,7 +11,7 @@ from lab.readiness import build_readiness
 class ReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.service = Service(Config(mode='sim', state_file=str(Path(self.tmp.name) / 'zero.json')))
+        self.service = Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.tmp.name) / 'zero.json')))
         # This fixture observes directly without starting Service lifecycle tasks.
         self.service.connected = True
         self.service.connection_state = 'connected'
@@ -124,13 +124,13 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.actions().get('up', {}).get('enabled', False))
         self.assertFalse(self.actions().get('reset_fault', {}).get('enabled', False))
 
-    async def test_unknown_alarm_does_not_offer_generic_reset(self):
+    async def test_unknown_alarm_is_advisory_and_offers_manual_reset(self):
         await self.prepared()
         self.sim.inject('alarm', 0xFFFF)
         await self.ctrl.observe()
-        self.assertFalse(self.view()['can_move'])
-        self.assertFalse(self.actions().get('reset_fault', {}).get('enabled', False))
-        self.assertFalse(self.actions().get('home', {}).get('enabled', False))
+        self.assertTrue(self.view()['can_move'])
+        self.assertTrue(self.actions().get('reset_fault', {}).get('enabled', False))
+        self.assertTrue(self.ctrl.trusted)
 
     async def test_negative_limit_with_untrusted_reference_can_offer_home_not_jog(self):
         await self.ctrl.arm()
@@ -139,7 +139,7 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         actions = self.actions()
         self.assertTrue(actions.get('home', {}).get('enabled', False))
         self.assertFalse(actions.get('up', {}).get('enabled', False))
-        self.assertFalse(actions.get('reset_fault', {}).get('enabled', False))
+        self.assertTrue(actions.get('reset_fault', {}).get('enabled', False))
 
     async def test_positive_limit_with_unknown_reference_does_not_offer_escape(self):
         await self.prepared()
@@ -197,7 +197,7 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(actions.get('max', {}).get('enabled', False))
         self.assertNotIn('min', actions)
         self.assertNotIn('home', actions)
-        self.assertFalse(actions.get('reset_fault', {}).get('enabled', False))
+        self.assertTrue(actions.get('reset_fault', {}).get('enabled', False))
 
     async def test_zero_speeds_do_not_claim_normal_motion_is_ready(self):
         await self.prepared()
@@ -209,7 +209,7 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def test_known_invalid_home_parameters_disable_home(self):
         await self.ctrl.arm()
         self.ctrl.driver.parameters['home_method'] = 0
-        self.assertFalse(self.actions().get('home', {}).get('enabled', False))
+        self.assertTrue(self.actions().get('home', {}).get('enabled', False))
         self.ctrl.driver.parameters['home_method'] = 17
         self.ctrl.driver.parameters['home_offset'] = self.service.config.home_reference_pulse + 100
         self.assertFalse(self.actions().get('home', {}).get('enabled', False))
@@ -219,6 +219,28 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.ctrl.speeds['pp'] = 0.
         self.assertFalse(self.actions().get('min', {}).get('enabled', False))
         self.assertFalse(self.view()['can_move'])
+
+    async def test_real_home_offered_but_pp_remains_unavailable(self):
+        await self.ctrl.arm()
+        self.service.config.mode = 'real'  # Simulator transport stays unchanged; no real I/O.
+        self.assertTrue(self.actions().get('home', {}).get('enabled', False))
+        self.assertFalse(self.view()['can_move'])
+        self.assertNotIn('min', self.actions())
+        self.assertNotIn('max', self.actions())
+
+    async def test_home_stop_guidance_waits_for_feedback_not_only_ack(self):
+        await self.ctrl.arm()
+        self.ctrl.mode = 'home'
+        self.ctrl.pending_stop = True
+        self.assertIn('等待静止反馈', self.view()['summary'])
+        self.assertTrue(any('P03-07' in step for step in self.view()['steps']))
+        self.assertNotIn('home', self.actions())
+
+    async def test_home_guidance_reports_actual_phase(self):
+        await self.ctrl.arm()
+        self.ctrl.mode = 'home'
+        self.ctrl.home_phase = 'leaving_lower'
+        self.assertIn('脱离下限位', self.view()['summary'])
 
 if __name__ == '__main__':
     unittest.main()

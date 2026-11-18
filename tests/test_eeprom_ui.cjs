@@ -30,6 +30,15 @@ context.atomicEvent.connection=context.connected;vm.runInContext('render(atomicE
 context.ready={summary:'需要检查',steps:['检查 / 恢复','回零'],checks:[{id:'armed',label:'检查通过',ok:false,detail:'先检查'}],actions:[{id:'arm',label:'检查 / 恢复',enabled:true}],manual:false,last_rejection:{message:'位置未可信',at:1}};
 vm.runInContext('renderReadiness(ready)',context);assert.equal(get('guideSummary').textContent,'需要检查');assert.equal(get('guideSteps').textContent,'检查 / 恢复 → 回零');assert.equal(get('conditions').children[0].textContent,'○ 检查通过');assert.match(get('rejection').textContent,/位置未可信/);assert.equal(get('endManual').disabled,true);
 context.ready.manual=true;vm.runInContext('renderReadiness(ready)',context);assert.equal(get('endManual').disabled,false);assert.match(get('manualState').textContent,/手动接管/);
+// Manual send is not gated by normal motion or a pending stop, but needs a live connection.
+context.manualPending={...context.connected,state:'stop_pending'};
+vm.runInContext('renderConnection(manualPending);applyConnectionState()',context);
+assert.equal(get('sendFrame').disabled,false);assert.equal(get('confirmFrame').disabled,false);assert.equal(get('goto').disabled,true);
+context.manualTransition={...context.connected,state:'disconnecting'};
+vm.runInContext('renderConnection(manualTransition)',context);
+assert.equal(get('sendFrame').disabled,true);assert.equal(get('confirmFrame').disabled,true);
+vm.runInContext('renderConnection(connected)',context);
+assert.match(html,/不自动插入停止或复位/);assert.doesNotMatch(html,/先停止普通动作，再发送本帧|停止与故障保护优先/);
 get('autoCrc').checked=false;
 get('manualFrame').value='01 03 0C 0D 00 01 16 9B';assert.equal(vm.runInContext('inspectFrame().write',context),false);
 get('manualFrame').value='01 06 10 03 00 03 00 00';assert.equal(vm.runInContext('inspectFrame().write',context),true);
@@ -46,8 +55,17 @@ for(const [body,complete] of [
 get('manualFrame').value='01 10 10 0E 00 02 02 00 00';assert.throws(()=>vm.runInContext('inspectFrame()',context),/数量/);
 get('manualFrame').value='01 06 02 00 00';assert.throws(()=>vm.runInContext('inspectFrame()',context),/至少6字节/);
 get('manualFrame').value='01 06 02 00 00 09';vm.runInContext("pendingFrame='old'",context);get('writeConfirm').hidden=false;get('autoCrc').checked=false;get('autoCrc').events.change();assert.equal(vm.runInContext('pendingFrame',context),null);assert.equal(get('writeConfirm').hidden,true);assert.equal(get('manualFrameLabel').textContent,'485报文（含CRC）');assert.equal(get('manualFrame').value,'01 06 02 00 00 09');
-context.regs={registers:[{parameter:'P10-25',address_hex:'0x1019',name:'PP速度',width:2,value:30000,raw_words:[30000,0],access:'RW',source:'write_ack',age_s:12.9,stale:false,epoch:1,operations:['PP'],polling_kind:'low_frequency',polling_label:'自动低频',polling_notice:'仅空闲读取'}],notice:'缓存'};
-vm.runInContext('renderRegisters(regs)',context);assert.equal(get('registerRows').children.length,1);assert.equal(get('registerRows').children[0].children[4].children[0].textContent,'写入回显');assert.equal(get('registerRows').children[0].children[4].textContent,'12 秒');assert.equal(get('registerRows').children[0].children[1].children[0].textContent,'自动低频');assert.equal(get('registerRows').children[0].children[1].children[0].dataset.tip,undefined);assert.equal(get('registerRows').children[0].dataset.tip,undefined);assert.equal(get('registerRows').children[0].children[2].textContent,'RW');get('registerFilter').value='missing';vm.runInContext('filterRegisters()',context);assert.equal(get('registerRows').children.length,0);
+context.regs={registers:[{parameter:'P10-25',address_hex:'0x1019',name:'PP速度',width:2,value:30000,raw_words:[30000,0],access:'RW',source:'read',last_write_value:32000,last_write_age_s:1,age_s:12.9,stale:false,epoch:1,operations:['PP'],polling_kind:'low_frequency',polling_label:'自动低频',polling_notice:'仅空闲读取'}],notice:'缓存'};
+vm.runInContext('renderRegisters(regs)',context);assert.equal(get('registerRows').children.length,1);assert.equal(get('registerRows').children[0].children[4].children[0].textContent,'读回');assert.equal(get('registerRows').children[0].children[4].textContent,'12 秒');assert.equal(get('registerRows').children[0].children[1].children[0].textContent,'自动低频');assert.equal(get('registerRows').children[0].children[1].children[0].dataset.tip,undefined);assert.equal(get('registerRows').children[0].dataset.tip,undefined);assert.equal(get('registerRows').children[0].children[2].textContent,'RW');get('registerFilter').value='missing';vm.runInContext('filterRegisters()',context);assert.equal(get('registerRows').children.length,0);
+get('registerFilter').value='';
+context.sortedRegs={registers:[{parameter:'later',address_hex:'0x1019',source:'write_ack',value:99,raw_words:[99],age_s:1},{parameter:'earlier',address:0x0307,address_hex:'0x0307',source:'read',value:0,age_s:4,last_write_value:1,last_write_age_s:2,readback_pending:true,read_error:'timeout'}]};
+vm.runInContext('renderRegisters(sortedRegs)',context);
+assert.equal(get('registerRows').children[0].children[0].textContent,'earlier');
+assert.equal(get('registerRows').children[0].children[3].textContent,0);
+assert.match(get('registerRows').children[0].children[3].dataset.tip,/最近写应答 1/);
+assert.equal(get('registerRows').children[0].children[4].children[0].textContent,'读取失败');
+assert.equal(get('registerRows').children[1].children[3].textContent,'—');
+assert.equal(get('registerRows').children[1].children[4].textContent,'未读取');
 context.units={status:'consistent',path:'direct',encoder_counts_per_rev:8388608,pulses_setting:10000,gear_numerator:8388608,gear_denominator:10000,effective_command_per_rev:10000,effective_fraction:'10000/1',configured_command_per_rev:10000,consistent:true,mechanical_cm_per_rev:.35,mechanical_verified:false,notice:'驱动读回一致，机械位移仍需实测',observed_age_s:12.9};
 vm.runInContext('renderConversion(units)',context);assert.equal(get('conversionStatus').textContent,'驱动/配置数值一致');assert.equal(get('conversionPath').textContent,'P05-02 直接设定');assert.equal(get('conversionEncoder').textContent,8388608);assert.equal(get('conversionEffective').textContent,10000);assert.equal(get('mechanicalCm').value,.35);assert.match(get('conversionStatus').dataset.tip,/12 秒前/);assert.doesNotMatch(html,/待实机核实|id="conversionNotice"/);assert.equal(get('registerNotice').hidden,true);assert.match(html,/保存控制台比例/);assert.match(html,/新比例 = 旧比例 × 实测位移 \/ 指令位移/);assert.match(html,/PP\/JOG期望cm\/s不变/);
 get('mechanicalCm').value='0.4';get('mechanicalCm').events.input();context.units.mechanical_cm_per_rev=.35;vm.runInContext('renderConversion(units)',context);assert.equal(get('mechanicalCm').value,'0.4');
@@ -119,10 +137,11 @@ console.log('Log rendering bound: 20,000 retained; 300 DOM lines/date formats pe
 // Candidate real mode must not expose the legacy forced-DI PP/HOME path.
 context.jogReal={...context.connected,mode:'real',current:{...context.connected.current,mode:'real'}};
 vm.runInContext('renderConnection(jogReal); applyConnectionState()',context);
-for(const id of ['home','goto','min','max'])assert.equal(get(id).disabled,true);
+for(const id of ['goto','min','max'])assert.equal(get(id).disabled,true);
+context.homeReady={status:{online:true,implementation:'candidate',details:{state:'IDLE',armed:true}}};vm.runInContext('render(homeReady)',context);assert.equal(get('home').disabled,false);
 assert.match(html,/>JOG 速度/);
 assert.doesNotMatch(html,/只允许软件保护范围内|回零后先全收到软件下限|靠近边界时保护逻辑可能降低/);
-console.log('Basic JOG UI: independent speed label, no homing/software-bound hints; unsafe real PP/HOME disabled.');
+console.log('Basic JOG UI: independent speed label, no homing/software-bound hints; real HOME available; unsafe PP disabled.');
 
 context.ackStop={status:{online:true,implementation:'candidate',details:{state:'IDLE',stop_confirmation:'ack',observed_motion:true,untracked_motion:true,speed_rpm:80,armed:true}}};
 vm.runInContext('render(ackStop)',context);
@@ -177,3 +196,12 @@ context.warningHint.status.details.motion_advice='';
 vm.runInContext('render(warningHint);renderReadiness({summary:warningHint.status.details.motion_notice,steps:[],checks:[],actions:[]})',context);
 assert.doesNotMatch(get('state').dataset.tip,/驱动器内部/);
 assert.doesNotMatch(get('guideSteps').textContent,/驱动器内部/);
+
+// HOME intent fields remain separate from actual register monitoring and advanced JSON.
+context.homeConfig={home_speed:30000,home_creep_speed:null,home_acceleration:20000};
+vm.runInContext('showConfig(homeConfig)',context);
+assert.equal(get('home_speed').value,30000);
+assert.equal(get('home_creep_speed').value,'');
+get('home_speed').value='40000';get('home_creep_speed').value='';get('home_acceleration').value='25000';
+assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),JSON.stringify({home_speed:40000,home_creep_speed:null,home_acceleration:25000}));
+for(const id of ['home_speed','home_creep_speed','home_acceleration'])assert.ok(html.includes('id="'+id+'"'));

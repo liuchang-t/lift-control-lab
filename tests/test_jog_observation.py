@@ -116,14 +116,14 @@ class JogObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.snapshot()['details']['motion_notice'],'')
         self.assertTrue(self.c.armed)
 
-    async def test_real_overload_still_stops_and_locks_after_notice(self):
+    async def test_alarm_after_notice_remains_visible_without_controller_lock(self):
         await self.no_motion()
         self.sim.regs[0x0b22]=0x6620
         await self.c._monitor_motion(await self.c.observe())
-        self.assertFalse(self.c.armed)
-        self.assertTrue(self.c.pending_stop)
-        self.assertNotIn('未检测到运动',self.c.fault)
-        await self.c._confirm_stop()
+        self.assertTrue(self.c.armed)
+        self.assertFalse(self.c.pending_stop)
+        self.assertEqual(self.c.sample['alarm_code'],0x620)
+        await self.c.stop()
         self.assertIsNone(self.sim.motion)
 
     async def test_physical_limit_still_stops_after_notice(self):

@@ -67,8 +67,8 @@ class ParameterMonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.ctrl.observe()
         frames=[bytes.fromhex(x['frame']) for x in self.service.trace.items if x['kind']=='tx']
         addresses={int.from_bytes(f[2:4],'big') for f in frames if f[1]==3}
-        self.assertFalse(addresses & {0x001F,0x0502,0x0507,0x0202,0x0306,0x0308})
-        self.assertTrue({0x0D0B,0x0B03}.issubset(addresses))
+        self.assertFalse(addresses & {0x001F,0x0502,0x0507,0x0202,0x0308})
+        self.assertTrue({0x0D0B,0x0B03,0x0306}.issubset(addresses))
 
     async def test_own_running_speed_write_updates_expected_after_readback(self):
         await self.move()

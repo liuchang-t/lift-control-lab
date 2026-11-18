@@ -1,5 +1,5 @@
 """Read-only operator guidance; execution guards remain authoritative."""
-from .alarms import blocked, jog_blocked
+from .alarms import blocked, jog_blocked, home_blocked
 
 
 def build_readiness(service, client):
@@ -37,20 +37,17 @@ def build_readiness(service, client):
                 and data.get('di4_logic') in (0, 1) and data.get('di5_logic') in (0, 1)
                 and upper is not None and lower is not None and not (upper and lower))
     directional = bool(valid_di and code in (0x950,0x952) and (upper != lower))
-    alarm_ok = not code or directional  # PP/HOME keep their existing policy.
-    jog_alarm_ok = code in (0,0x950,0x952)
+    alarm_ok = jog_alarm_ok = True  # Alarm interpretation does not gate operator commands.
     height = data.get('height_cm')
     lo, hi = service.config.soft_lower_cm, service.config.soft_upper_cm
     in_range = height is not None and lo - .001 <= height <= hi + .001
     speeds = data.get('speeds', {})
     pp_ok = speeds.get('pp', {}).get('requested_cm_s', 0) > 0
     pv_ok = speeds.get('pv', {}).get('requested_cm_s', 0) > 0
-    params = data.get('parameters', {})
+    params = service.config.home_parameters(data.get('parameters', {}))
     home_issue = ''
     if params and not params.get('stale', True):
-        if params.get('home_method') != 17:
-            home_issue = '驱动回零方式不是17，请人工核实 P10-35 后刷新参数。'
-        elif params.get('home_offset') != service.config.home_reference_pulse:
+        if params.get('home_offset') != service.config.home_reference_pulse:
             home_issue = '驱动原点偏移与配置参考不一致，请核实 P10-16；不自动改写。'
         elif any(params.get(k, 0) <= 0 for k in ('home_speed', 'home_creep_speed', 'home_acceleration')):
             home_issue = 'HOME速度或加速度无效，请核实 P10-36/38/40。'
@@ -63,10 +60,10 @@ def build_readiness(service, client):
 
     check('online', '反馈在线', online, '反馈必须新鲜；失联先检查通信，再等待停止确认。')
     check('stopped', '停止指令已应答' if data.get('stop_confirmation')=='ack' else '停止已确认', not pending, '停止未确认时不要重新启动；现场需使用独立硬急停。')
-    check('manual', '正常流程控制', not manual, '手动写已接管；结束手动并重新检查，再回零。')
+    check('manual', '正常流程控制', not manual, '这些条件用于普通运动，不限制手动发送；结束手动并重新检查后可恢复基础点动。')
     check('eeprom', 'P0C-13 = 0', eeprom_ok, '请人工核实 EEPROM 设置；故障复位不能代替此项。')
     check('limits', '限位信号有效', valid_di, '检查 DI4/DI5 功能、极性和实际开关；不能靠复位绕过限位。')
-    check('alarm', '报警允许点动', jog_alarm_ok, alarm.get('advice', '等待报警状态。'))
+    check('alarm', '报警仅提示', True, alarm.get('advice', '等待报警状态。'))
     check('storage', '配置有效', storage_ok, getattr(ctrl, 'storage_error', '') or '速度与配置已加载。')
     check('units', '驱动/配置换算一致', unit_ok,
           '连接后和运动前读取每转指令数、编码器及电子齿轮；数值一致不等于已核实机械导程或实际生效。')
@@ -84,23 +81,30 @@ def build_readiness(service, client):
 
     idle = online and not pending and not moving
     base = idle and not manual and eeprom_ok and valid_di and storage_ok and unit_ok
-    if pending:
-        summary = '停止命令尚未确认应答，请稍后重新按住'
-        steps.append('等待停止命令应答；应答不代表实际静止，实际运动以反馈为准。通信中断时使用现场停机措施。')
+    if manual:
+        summary = '手动总线直接收发，普通运动条件不拦截手动指令'
+        steps.append('不自动插入停止或复位；实际效果以驱动器反馈为准。')
+        if pending:
+            steps.append('用户请求的停止尚未确认；新手动写可接管并取消旧停止重试。')
+        if not online:
+            steps.append('反馈离线或已过期，请核对通信；手动发送仍可尝试，失败会报告结果未知。')
+        reason = (getattr(service, 'manual_active', None) or {}).get('reason', '')
+        if reason:
+            steps.append(reason)
+        steps.append('恢复基础点动：结束手动 → 检查 / 恢复；定位另需回零。')
+        action('stop', '停止')
+        action('exit_manual', '结束手动')
+    elif pending:
+        home_stopping = getattr(ctrl, 'mode', None) == 'home' or getattr(ctrl.driver, 'home_enable_owned', False)
+        summary = '回零停止处理中：等待静止反馈与撤销使能给定' if home_stopping else '停止命令尚未确认应答，请稍后重新按住'
+        steps.append('HOME停止不仅确认命令应答，还需核验实际转速/位置静止，再清除控制字并撤销P03-07的S-ON给定；完成前不能重新启动。通信中断时使用现场停机措施。' if home_stopping else '等待停止命令应答；应答不代表实际静止，实际运动以反馈为准。通信中断时使用现场停机措施。')
         action('stop', '再次请求停止')
     elif not online:
         summary = '反馈离线或已过期'
         steps.append('检查驱动器、串口服务器及通信；恢复后重新检查；基础点动无需回零。')
-    elif manual:
-        summary = '手动总线已接管，正常运动流程未运行'
-        if getattr(ctrl, 'manual_failed', False):
-            steps.append('手动写已锁定；先确认停止并排查原因，再结束手动。')
-        else:
-            steps.append('手动运动不保证正常流程的软件限位；保持观察，可随时停止。')
-        steps.append('恢复基础点动：结束手动 → 检查 / 恢复；定位另需回零。')
-        action('exit_manual', '结束手动')
     elif moving:
-        summary = data.get('motion_notice') or ('回零进行中' if getattr(ctrl, 'mode', None) == 'home' else '运动进行中')
+        home_phases = {'preparing':'回零：准备参数与使能给定', 'seeking_lower':'回零：寻找下限位', 'leaving_lower':'回零：脱离下限位', 'settling':'回零：核对完成位、位置和静止'}
+        summary = data.get('motion_notice') or (home_phases.get(data.get('home_phase'), '回零进行中') if getattr(ctrl, 'mode', None) == 'home' else '运动进行中')
         steps.append(data.get('motion_advice') or ('此提示不锁定点动；松开即发送停止。' if data.get('motion_notice') else '等待完成；需要中断时点击“停止”或“软件急停”。'))
         action('stop', '停止')
     elif data.get('untracked_motion') and data.get('stop_confirmation')!='ack':
@@ -123,23 +127,21 @@ def build_readiness(service, client):
             steps.append('JOG速度为0，点动前设置非零JOG速度并保存。')
         if code:
             steps.append('%s %s：%s' % (alarm.get('text', ''), alarm.get('name', ''), alarm.get('advice', '')))
-            reset_ok = bool(alarm.get('reset_allowed') and (code not in (0x950, 0x952) or valid_di and not upper and not lower))
+            action('reset_fault', '人工故障复位', idle)
             if directional:
                 steps.append('仅按物理限位允许的反方向点动脱离；不要求回零，不按950/952文字猜测方向。')
-            elif reset_ok:
-                steps.append('限位警告保留显示；当前两侧均未触发，可双向点动，无需因警告重新检查；人工故障复位可选。' if code in (0x950,0x952) else '排查原因后点击“人工故障复位”；随后仍须重新检查 / 恢复。')
-                action('reset_fault', '人工故障复位', idle)
             else:
-                steps.append('当前不允许通用故障复位，请按报警建议现场处理。')
+                steps.append('限位警告保留显示；当前两侧均未触发，可双向点动，无需因警告重新检查；人工故障复位可选。' if code in (0x950,0x952) else ('点击“人工故障复位”，完成失能、清警及检查；通过后可再次点击“一键回零”，不会自动运动。' if code==0x601 else '可按需点击“人工故障复位”，实际是否清除以读回为准。'))
+            steps.append('报警不单独阻止操作；由操作者判断，驱动器决定是否接受。人工复位不保证能清除。')
         if not armed and jog_alarm_ok and eeprom_ok and valid_di and storage_ok:
             steps.append('点击“检查 / 恢复”，解除软件锁定并核对驱动条件。')
             action('arm', '检查 / 恢复', idle)
-        if not trusted and alarm_ok:
+        if not trusted and not home_blocked(data):
             if upper:
                 steps.append('上限位有效，先现场检查；当前不能开始负向回零。')
             else:
                 steps.append('基础点动不需要回零；仅自动定位需要建立位置参考。')
-                action('home', '模式17一键回零', base and armed and not home_issue and not blocked(data, homing=True), home_issue)
+                action('home', '模式17一键回零', base and armed and not home_issue and not home_blocked(data), home_issue)
         elif trusted and not in_range and height is not None:
             key, label = ('min', '全收') if height < lo else ('max', '全升')
             steps.append('当前位置在工作范围外，可设置 %.2f–%.2f cm 内的目标进行PP定位，也可点击“%s”。' % (lo, hi, label))
@@ -173,10 +175,11 @@ def build_readiness(service, client):
     if (jog_up or jog_down) and not moving and (not data.get('untracked_motion') or data.get('stop_confirmation')=='ack') and not manual:
         summary = '可以基础点动（无需回零）' if jog_up and jog_down else '仅允许向下点动脱离' if jog_down else '仅允许向上点动脱离'
     if service.config.mode=='real':
-        actions=[a for a in actions if a['id'] not in ('home','min','max')]
+        actions=[a for a in actions if a['id'] not in ('min','max')]
         steps=[s for s in steps if '点击“全收”' not in s and '点击“全升”' not in s]
-        steps.append('实机PP/HOME使能兼容性尚未核实，暂不可用；基础点动可独立使用。')
+        if not moving:
+            steps.append('实机PP定位暂未开放；可基础点动或执行模式17回零。')
     return dict(summary=summary, checks=checks, actions=actions, steps=steps,
                 can_jog_up=jog_up,can_jog_down=jog_down,
-                can_move=bool(base and armed and trusted and alarm_ok and pp_ok),
+                can_move=bool(service.config.mode != 'real' and base and armed and trusted and alarm_ok and pp_ok),
                 manual=manual, last_rejection=rejection)

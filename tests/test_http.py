@@ -67,12 +67,13 @@ class HttpTests(unittest.TestCase):
         self.call('/api/arm',{})
         self.call('/api/devices/lift_pole_1/lease/acquire',{'holder_name':'HTTP test'})
         self.call('/api/control',{'action':'home','confirm_homing':True})
-        for _ in range(100):
+        for _ in range(350):
             details=self.call('/api/status')['details']
             if details['position_trusted'] and not details['pending_stop']:
                 break
             time.sleep(.03)
-        self.assertTrue(self.call('/api/status')['details']['position_trusted'])
+        self.assertTrue(details['position_trusted'])
+        self.assertFalse(details['pending_stop'],'HOME cleanup must finish before positioning')
         self.call('/api/control',{'action':'min'})
         for _ in range(200):
             if self.call('/api/status')['details']['state']=='IDLE':

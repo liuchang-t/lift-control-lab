@@ -144,16 +144,16 @@ class AlarmPolicyTests(unittest.TestCase):
     def test_raw_unknown_and_prefix_evidence_are_retained(self):
         self.assertEqual(describe(0x6B00)['code'],0xB00)
         self.assertEqual(describe(0x6B00)['raw_code'],0x6B00)
-        unknown=describe(0x6121)
+        unknown=describe(0x6122)
         self.assertEqual(unknown['manual_category'],'unknown')
-        self.assertEqual(unknown['code'],0x6121)
-        self.assertFalse(unknown['reset_allowed'])
-        self.assertTrue(unknown['reference_lost'])
+        self.assertEqual(unknown['code'],0x6122)
+        self.assertTrue(unknown['reset_allowed'])
+        self.assertFalse(unknown['reference_lost'])
 
-    def test_manual_reset_support_does_not_automatically_allow_reset(self):
+    def test_manual_reset_capability_is_information_not_permission(self):
         self.assertTrue(describe(0x731)['manual_resettable'])
-        self.assertFalse(describe(0x731)['reset_allowed'])
-        self.assertFalse(describe(0x104)['reset_allowed'])
+        self.assertTrue(describe(0x731)['reset_allowed'])
+        self.assertTrue(describe(0x104)['reset_allowed'])
         self.assertTrue(describe(0xB00)['reset_allowed'])
         self.assertIn('无电机抱闸',describe(0x625)['advice'])
 
@@ -162,16 +162,48 @@ class AlarmPolicyTests(unittest.TestCase):
                   upper_limit=False,lower_limit=False,alarm_code=0)
         for code in CATALOG:
             if code not in (0x950,0x952):
-                self.assertTrue(blocked(dict(base,alarm_code=code),'up'))
+                self.assertFalse(blocked(dict(base,alarm_code=code),'up'))
         upper=dict(base,alarm_code=0x950,upper_limit=True)
         self.assertFalse(blocked(upper,'down'))
         self.assertTrue(blocked(upper,'up'))
-        self.assertTrue(blocked(dict(upper,upper_limit=False),'down'))
+        self.assertFalse(blocked(dict(upper,upper_limit=False),'down'))
         lower=dict(base,alarm_code=0x952,lower_limit=True)
         self.assertFalse(blocked(lower,'up'))
         self.assertFalse(blocked(lower,homing=True))
         self.assertTrue(blocked(dict(lower,upper_limit=True),'up'))
         self.assertTrue(blocked(dict(base,di5_function=0),'up'))
+
+
+
+
+class FieldAlarmEncodingTests(unittest.TestCase):
+    def test_official_tool_confirmed_servo_on_invalid_encoding(self):
+        alarm=describe(0x6121)
+        self.assertEqual(alarm['code'],0x121)
+        self.assertEqual(alarm['text'],'Er.121')
+        self.assertEqual(alarm['raw_hex'],'0x6121')
+        self.assertEqual(alarm['raw_code'],0x6121)
+        self.assertEqual(alarm['encoding'],'field_observed_alias')
+        self.assertEqual(alarm['name'],'伺服ON指令无效故障')
+        self.assertEqual(alarm['policy'],'operator_decides')
+        self.assertTrue(alarm['reset_allowed'])
+        self.assertIn('DI',alarm['advice'])
+        self.assertEqual(describe(0x6122)['manual_category'],'unknown')
+
+
+    def test_e601_is_home_failure_with_original_wire_evidence(self):
+        alarm=describe(0xE601)
+        self.assertEqual(alarm['raw_hex'],'0xE601')
+        self.assertEqual(alarm['raw_code'],0xE601)
+        self.assertEqual(alarm['code'],0x601)
+        self.assertEqual(alarm['text'],'Er.601')
+        self.assertEqual(alarm['name'],'回原点失败')
+        self.assertEqual(alarm['manual_category'],'warning')
+        self.assertTrue(alarm['manual_resettable'])
+        self.assertTrue(alarm['reset_allowed'])
+        self.assertTrue(alarm['reference_lost'])
+        self.assertEqual(alarm['encoding'],'field_observed_alias')
+        self.assertEqual(describe(0xE602)['manual_category'],'unknown')
 
 
 if __name__=='__main__':

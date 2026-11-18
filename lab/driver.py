@@ -5,7 +5,7 @@ import time
 from dataclasses import asdict
 from baseline.lift_modbus import OukeServoLiftClient, normalize_alarm_code, format_alarm_code, di_input_active
 from .model import LabError
-from .alarms import describe, blocked, jog_blocked
+from .alarms import describe, blocked, jog_blocked, home_blocked
 from baseline.lift_modbus import registers_to_int32_le_word, build_write_single_register, parse_write_single_register
 from .units import command_units_per_revolution, signed_word
 from .registers import PREFLIGHT_GROUPS, MONITOR_ADDRESSES, MONITOR_GROUPS, MONITOR_INTERVAL, MONITOR_MAX_AGE, REFERENCE_ADDRESSES
@@ -15,6 +15,10 @@ class ParameterChanged(LabError):
     def __init__(self,message,reference_lost=False):
         super().__init__(message)
         self.reference_lost=reference_lost
+
+
+class HomeFaultDeferred(LabError):
+    pass
 
 
 class Driver:
@@ -37,6 +41,8 @@ class Driver:
         self.force_requested = {}
         self.force_observed = None
         self.force_error = ''
+        self.home_enable_owned = False
+        self.home_cleanup_serial = 0
         self.jog_context = False
         self.jog_running = False
         self.jog_enable_epoch = None  # Last acknowledged command, not power-stage feedback.
@@ -225,7 +231,7 @@ class Driver:
             blocks.extend([(0x100E,2),(0x1019,2)])
 
         elif mode=='home':
-            blocks.append((0x1023,7))
+            blocks.extend([(0x1023,7),(0x0306,2)])
         for address,count in blocks:
             checkpoint()
             await self._check_block(address,count)
@@ -310,6 +316,8 @@ class Driver:
         value['alarm'] = describe(value['alarm_raw'])
         value['alarm_code'] = value['alarm']['code']
         value['alarm_text'] = value['alarm']['text']
+        di3=await self._read_words(0x0306,2)
+        value['di3_function'],value['di3_logic']=di3
         value['home_attained'] = bool(value['status_word'] & 8)
         value['upper_limit'] = value['di4_function'] == 14 and di_input_active(value['di_monitor'], 3, value['di4_logic'])
         value['lower_limit'] = value['di5_function'] == 15 and di_input_active(value['di_monitor'], 4, value['di5_logic'])
@@ -376,6 +384,10 @@ class Driver:
                                  completion_confirmed=False)
 
     async def prepare_jog(self, checkpoint):
+        # Only retire an S-ON request actually owned by this HOME flow.
+        # P03-07=1 alone is not evidence that ordinary JOG owns that setting.
+        if self.home_enable_owned:
+            await self.release_home_enable(checkpoint, cancel=True)
         self.jog_context = True
         self.jog_running = False
         checkpoint()
@@ -438,7 +450,7 @@ class Driver:
 
     def require_bus_motion_supported(self):
         if self.config.mode == 'real':
-            raise LabError('实机PP/HOME旧使能会屏蔽物理限位；新兼容方式未核实，当前请使用基础点动')
+            raise LabError('实机PP旧使能会屏蔽物理限位；新兼容方式未核实，当前请使用基础点动')
 
     async def start(self, mode, speed, target, direction, checkpoint):
         if mode == 'pv':
@@ -478,56 +490,245 @@ class Driver:
         await step(self.wire.write_register,0x0D08,3 if mode=='pp' else (16 if direction=='up' else 32))
 
     async def home(self, checkpoint, triggered):
-        self.require_bus_motion_supported()
         self.jog_context = False
         async def step(operation,*args):
             checkpoint()
             result=await operation(*args)
             checkpoint()
             return result
-        await step(self.verify_before_motion)
+        await step(self.require_units)
         sample=await step(self.sample)
+        reason=home_blocked(sample)
+        if reason:
+            raise LabError(reason)
+        if self.force_status()['selection'] != 0:
+            raise LabError('P0D-17 必须为0，HOME保留物理限位')
+        if sample['di3_function']!=1 or not (sample['di_monitor'] & 4):
+            raise LabError('HOME要求DI3功能1且当前物理电平为高；不自动替换接线或功能')
         if sample['eeprom_write']!=0:
             raise LabError('P0C-13 非0，拒绝写入回零参数')
+        again=await step(self.sample)
+        if abs(sample['speed_rpm'])>1 or abs(again['speed_rpm'])>1 or abs(sample['position_feedback']-again['position_feedback'])>20:
+            raise LabError('当前尚未静止，请先停止再回零')
+        params=self.config.home_parameters(await step(self.read_parameters))
+        if params['home_offset']!=self.config.home_reference_pulse or any(params[k]<=0 for k in ('home_speed','home_creep_speed','home_acceleration')):
+            raise LabError('HOME原点偏移、速度或加速度配置无效')
+        if max(params['home_speed'],params['home_creep_speed'])>params['max_velocity']:
+            raise LabError('HOME速度超过驱动最大速度限制')
+        # Retire any old start before changing the physical S-ON polarity.
+        await step(self.wire.write_register,0x0D08,256)
         await step(self.wire.write_register,0x0D08,0)
-        await step(self.disable)
-        await step(asyncio.sleep,.05)
+        await step(self._write_register,0x0307,0)
         await step(self._ensure_bus_mode)
         await step(self._write_register,0x1003,6)
         await step(self._write_register,0x1023,17)
-        # Keep existing, read-back-validated HOME speeds, acceleration and offset.
-        await step(self.write_force_input,0x0D11,1)
-        await step(self.write_force_input,0x0D12,507)
-        reason=blocked(await step(self.sample),homing=True)
-        if reason:
-            raise LabError(reason)
+        for key,address in (('home_speed',0x1024),('home_creep_speed',0x1026),('home_acceleration',0x1028)):
+            # Preserve unset parameters; search speed retains its existing rewrite.
+            if key=='home_speed' or getattr(self.config,key) is not None:
+                await step(self._write_int32,address,params[key])
+                self.parameters[key]=params[key]
+        # Snapshot only this HOME's active parameters, not stale historical values.
+        words=await step(self._read_words,0x1023,7)
+        self.expected_words.update({0x1023+i:v for i,v in enumerate(words)})
+        self.home_enable_owned=True  # ACK loss also requires S-ON cleanup.
+        await step(self._write_register,0x0307,1)
+        sample=await step(self.sample)
+        reason=home_blocked(sample)
+        if reason or self.force_status()['selection']!=0 or sample['di3_function']!=1 or sample['di3_logic']!=1 or not (sample['di_monitor']&4):
+            raise LabError(reason or 'HOME使能给定或物理DI配置改变')
+        self.home_start_sample=sample
         triggered()
         await step(self.wire.write_register,0x0D08,128)
 
-    async def reset_fault(self,checkpoint,expected_raw):
+    async def wait_home_di3(self, expected, checkpoint):
+        deadline=time.monotonic()+self.config.stop_timeout_s
+        observed=None
+        self.transport.trace.add('home_di3_wait',expected=expected,completion_confirmed=False)
+        while True:
+            checkpoint()
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                self.transport.trace.add('home_di3_timeout',expected=expected,observed=observed,
+                                         completion_confirmed=False)
+                raise LabError('HOME收尾等待DI3=%s超时（最近%s），停止状态待确认；输入变化不代表实际失能完成'%(expected,observed))
+            try:
+                words=await asyncio.wait_for(self._read_words(0x0B03,1),remaining)
+            except asyncio.TimeoutError as exc:
+                self.transport.trace.add('home_di3_timeout',expected=expected,observed=observed,
+                                         completion_confirmed=False)
+                raise LabError('HOME收尾读取DI3超时，停止状态待确认') from exc
+            checkpoint()
+            observed=(words[0]>>2)&1
+            if observed==expected:
+                self.transport.trace.add('home_di3_observed',expected=expected,observed=observed,
+                                         completion_confirmed=False)
+                return
+            # Polling cadence only: no unconditional settling delay or inferred
+            # power-stage completion. Every successful transition needs a fresh read.
+            await asyncio.sleep(min(.05,self.config.poll_s,max(0,deadline-time.monotonic())))
+
+    async def hold_home_di3(self, given, checkpoint, allow_fault_clear=False):
+        duration=self.config.home_enable_hold_s if given==507 else self.config.home_disable_hold_s
+        if duration<=0:
+            return
+        deadline=time.monotonic()+duration
+        last_position=None
+        self.transport.trace.add('home_di3_hold',given=given,seconds=duration,completion_confirmed=False)
+        while True:
+            checkpoint()
+            if not allow_fault_clear:
+                alarm=(await self._read_words(0x0B22,1))[0]
+                checkpoint()
+                if describe(alarm)['code']==0x601:
+                    raise HomeFaultDeferred('601需由人工故障复位处理')
+            words=await self.read_force_inputs()
+            checkpoint()
+            expected=0 if given==507 else 1
+            if words!=[1,given] or self.force_observed['di3']!=expected:
+                raise LabError('HOME收尾保持期间强制DI或DI3变化，停止状态待确认')
+            rpm=signed_word((await self._read_words(0x0B00,1))[0])
+            checkpoint()
+            position=registers_to_int32_le_word(await self._read_words(0x0B07,2))
+            checkpoint()
+            if abs(rpm)>1 or (last_position is not None and abs(position-last_position)>20):
+                raise LabError('HOME收尾保持期间检测到运动，停止状态待确认')
+            last_position=position
+            if time.monotonic()>=deadline:
+                self.transport.trace.add('home_di3_hold_elapsed',given=given,completion_confirmed=False)
+                return
+            await asyncio.sleep(min(.05,deadline-time.monotonic()))
+
+    async def release_home_enable(self, checkpoint=lambda:None, cancel=False, force=False):
         checkpoint()
-        await self.disable()
+        words=await self._read_words(0x0306,2)
+        checkpoint()
+        if not force and not self.home_enable_owned and words[1]!=1:
+            return
+        if words[0]!=1:
+            raise LabError('DI3功能已改变，不能自动撤销HOME使能给定')
+        # A matching P03-07 readback does not release the field-observed S-ON latch.
+        # Only run the experimentally verified transition after stationary feedback.
+        self.home_enable_owned=True
+        if cancel:
+            checkpoint()
+            await self.wire.write_register(0x0D08,256)
+            checkpoint()
+        first=await self.sample()
+        checkpoint()
+        second=await self.sample()
+        checkpoint()
+        if abs(first['speed_rpm'])>1 or abs(second['speed_rpm'])>1 or abs(first['position_feedback']-second['position_feedback'])>20:
+            raise LabError('HOME失能收尾等待静止，尚未切换强制DI')
+        if not force and (first['alarm_code']==0x601 or second['alarm_code']==0x601):
+            # Disabling itself can clear 601 on this drive. Reserve that operation
+            # for the explicit fault-reset button, even if stop began earlier.
+            return False
+        for address,value in [(0x0D08,0),(0x0307,0),(0x0D11,1),
+                              (0x0D12,507),(0x0D12,511),(0x0D11,0)]:
+            checkpoint()
+            # Preserve a 601 arriving after the initial stationary samples too.
+            if not force:
+                alarm=(await self._read_words(0x0B22,1))[0]
+                checkpoint()
+                if describe(alarm)['code']==0x601:
+                    return False
+            # Each transition must be read from the drive before the next write.
+            # This confirms the register value, not power-stage completion.
+            await self._write_register(address,value)
+            checkpoint()
+            if address==0x0D12:
+                await self.wait_home_di3(0 if value==507 else 1,checkpoint)
+                try:
+                    await self.hold_home_di3(value,checkpoint,allow_fault_clear=force)
+                except HomeFaultDeferred:
+                    return False
+                checkpoint()
+        checkpoint()
+        words=await self.read_force_inputs()
+        checkpoint()
+        if words!=[0,511]:
+            raise LabError('HOME失能收尾读回不一致，停止状态待确认')
+        self.jog_enable_epoch=None
+        self.home_enable_owned=False
+        self.home_cleanup_serial+=1
+        return True
+
+    async def set_force_servo_given(self, enabled, checkpoint):
+        # Independent buttons: never rely on an existing force-selection value.
+        sequence=[(0x0D11,1),(0x0D12,507 if enabled else 511)]
+        if not enabled:
+            sequence.append((0x0D11,0))
+        for address,value in sequence:
+            checkpoint()
+            await self.write_force_input(address,value)
+            checkpoint()
+        self.jog_enable_epoch=None
+        self.jog_running=False
+
+    async def reset_fault(self,checkpoint,expected_raw,home_cleanup_completed=False):
+        checkpoint()
+        home_failure=describe(expected_raw)['code']==0x601
+        if home_failure and not home_cleanup_completed:
+            # After restart/readback=0, the controller cannot infer S-ON release.
+            await self.release_home_enable(checkpoint,cancel=True,force=True)
+        elif not home_failure:
+            await self.disable(checkpoint)
         checkpoint()
         sample=await self.sample()
         checkpoint()
-        if sample['alarm_raw']!=expected_raw or not sample['alarm']['reset_allowed']:
-            raise LabError('报警已变化，请重新检查并确认，未发送复位')
-        if sample['alarm_code'] in (0x950,0x952) and (sample['upper_limit'] or sample['lower_limit']):
-            raise LabError('限位仍有效，未发送复位')
+        if home_failure and sample['alarm_raw']==0:
+            self.transport.trace.add('home_fault_cleared_by_manual_disable',reset_command_sent=False)
+            return
+        if sample['alarm_raw']!=expected_raw:
+            self.transport.trace.add('reset_alarm_changed',previous=expected_raw,current=sample['alarm_raw'])
         await self.wire.write_register(0x0D01,1)
         checkpoint()
+        if home_failure:
+            # Reset is a trigger: verify the alarm result, not the command echo.
+            deadline=time.monotonic()+self.config.stop_timeout_s
+            while True:
+                checkpoint()
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    raise LabError('601复位后报警未清除，未恢复控制；请检查驱动状态')
+                try:
+                    words=await asyncio.wait_for(self._read_words(0x0B22,1),remaining)
+                except asyncio.TimeoutError as exc:
+                    raise LabError('601复位后读取报警超时，清除结果未知') from exc
+                checkpoint()
+                if words[0]==0:
+                    return
+                if words[0]!=expected_raw:
+                    raise LabError('601复位后出现其他报警，未恢复控制：'+describe(words[0])['text'])
+                await asyncio.sleep(min(.05,self.config.poll_s,max(0,deadline-time.monotonic())))
 
-    async def stop(self, emergency=False):
+    async def stop(self, emergency=False, checkpoint=lambda:None, global_stop=False):
+        errors=[]
+        # Global buttons always send the documented bus stop, even after JOG.
+        if global_stop or not self.jog_context:
+            value=512 if emergency else 256
+            request=build_write_single_register(self.config.slave_id,0x0D08,value)
+            try:
+                response=await self.transport.transaction(request,8,before_send=checkpoint)
+                parse_write_single_register(response,self.config.slave_id,0x0D08,value)
+            except Exception as exc:
+                errors.append(exc)
         if self.jog_context:
+            checkpoint()
             keep_enabled=self.jog_running or self.jog_enable_epoch==self.transport.epoch
-            await self.jog_command(65 if emergency or not keep_enabled else 1, lambda:None)
-            self.jog_running=False
-        else:
-            await self.wire.write_register(0x0D08,512 if emergency else 256)
+            try:
+                await self.jog_command(65 if emergency or not keep_enabled else 1, checkpoint)
+                self.jog_running=False
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
-    async def disable(self):
-        await self.jog_command(65, lambda:None)
+    async def disable(self, checkpoint=lambda:None):
+        await self.release_home_enable(checkpoint,cancel=True)
+        checkpoint()
+        await self.jog_command(65, checkpoint)
         self.jog_running=False
 
     async def speed(self, mode, speed):

@@ -5,7 +5,7 @@ import time
 from collections import deque
 from .model import CalibrationStore, SpeedStore, LabError
 from .units import finite
-from .alarms import blocked, describe, jog_blocked
+from .alarms import blocked, describe, jog_blocked, home_blocked
 from .driver import ParameterChanged
 
 
@@ -28,6 +28,7 @@ class Controller:
         self.trusted = False
         self.armed = False
         self.epoch = 0
+        driver.transport.write_guard = self._write_guard
         self.transport_epoch = driver.transport.epoch
         self.state, self.fault = 'DISARMED', ''
         self.applied_speed = 0
@@ -35,13 +36,16 @@ class Controller:
         self.closed = deque(maxlen=10000)
         self.last_heartbeat = self.started = self.last_motion = 0.
         self.pending_stop = self.emergency = False
+        self._stop_sent_epoch = None
+        self._global_stop = False
         self.sample = {}
         self.sample_at = self.last_raw_at = self.stop_at = 0.
         self.last_raw = None
         self.progress_raw = None
         self.home_status = 'not_homed'
+        self.home_phase = 'idle'
         self.home_triggered = self.home_seen_incomplete = False
-        self.home_seen_lower = False
+        self.home_seen_lower = self.home_seen_release = False
         self.home_stable = 0
         self.home_last_raw = None
         self.home_connection = None
@@ -62,6 +66,13 @@ class Controller:
             self.trace.add('configuration_notice',message='release_enable_s仅保留兼容，候选实现不延时自动去使能，以免干预外部运动')
         self._tasks = [asyncio.create_task(self._poll_loop()),asyncio.create_task(self._watchdog())]
 
+    def _write_guard(self):
+        issued = self.epoch
+        def check():
+            if issued != self.epoch:
+                raise MotionCancelled('排队写入已被新手动指令或控制意图取消')
+        return check
+
     def _checkpoint(self, epoch):
         if self.pending_stop:
             raise MotionCancelled('停止命令尚未确认应答，请稍后重新按住')
@@ -75,12 +86,13 @@ class Controller:
             self.closed.append(self.intent)
         self.intent = None
 
-    def _stop_intent(self, emergency=False, reason=''):
+    def _stop_intent(self, emergency=False, reason='', global_stop=False):
         self.jog_no_motion=False
         if reason:
             self.stop_reason=reason
-        if self.pending_stop and (not emergency or self.emergency):
+        if self.pending_stop and (not emergency or self.emergency) and (not global_stop or self._global_stop):
             return
+        self._global_stop = global_stop or emergency or (self.pending_stop and self._global_stop)
         self.stop_confirmation=None
         self.epoch += 1
         self._retire_intent()
@@ -90,12 +102,38 @@ class Controller:
         if self.mode == 'home' and self.home_status != 'complete':
             self.trusted = False
             self.home_status = 'cancelled'
+            self.home_phase = 'cancelled'
         if emergency:
             self.armed = False
             self.fault = '软件急停已锁存；检查后重新允许控制'
         self.trace.add('stop_intent',emergency=emergency,epoch=self.epoch,reason=reason)
 
+    def take_manual_control(self):
+        """Retire automatic intent without adding any device command."""
+        self.epoch += 1
+        self._retire_intent()
+        self.pending_stop = False
+        self.stop_confirmation = None
+        self.stop_reason = ''
+        self.mode = self.direction = self.target_cm = None
+        self.applied_speed = 0
+        self.armed = self.trusted = False
+        self.home_status = 'not_homed'
+        self.home_triggered = False
+        self.jog_no_motion = False
+        self.manual_active = True
+        self.manual_failed = False
+        self.state = 'MANUAL'
+        self.fault = ''
+        # Keep the normal-control emergency latch; raw writes do not re-arm it.
+        self.trace.add('manual_takeover',epoch=self.epoch,automatic_stop=False)
+
     def _fault(self, message, reference_lost=False):
+        if getattr(self, 'manual_active', False):
+            self.armed = self.trusted = False
+            self.fault = str(message)
+            self.trace.add('manual_observation_warning',message=str(message))
+            return
         was_home = self.mode == 'home'
         if reference_lost or was_home:
             self.trusted = False
@@ -112,6 +150,7 @@ class Controller:
         self.state = 'MOTION_UNKNOWN'
         if was_home:
             self.home_status = 'failed'
+            self.home_phase = 'failed'
 
     async def observe(self):
         async with self._sample_lock:
@@ -141,6 +180,10 @@ class Controller:
                 self.home_seen_incomplete=True
             if self.mode=='home' and self.home_triggered and data['lower_limit'] and not data['upper_limit']:
                 self.home_seen_lower=True
+                self.home_phase='leaving_lower'
+            if self.mode=='home' and self.home_triggered and self.home_seen_lower and not data['lower_limit']:
+                self.home_seen_release=True
+                self.home_phase='settling'
             self.last_raw,self.last_raw_at=raw,now
             self.sample,self.sample_at=data,now
             return data
@@ -180,8 +223,20 @@ class Controller:
             if not self.pending_stop:
                 return True
             issued=self.epoch
-            await self.driver.stop(self.emergency)
-            ack_only=self.driver.jog_context
+            def checkpoint():
+                if issued != self.epoch or not self.pending_stop:
+                    raise MotionCancelled('旧停止请求已被新手动指令或控制意图取消')
+            try:
+                if self._stop_sent_epoch!=issued:
+                    if self._global_stop:
+                        await self.driver.stop(self.emergency, checkpoint, global_stop=True)
+                    else:
+                        await self.driver.stop(self.emergency, checkpoint)
+                    checkpoint()
+                    self._stop_sent_epoch=issued
+            except MotionCancelled:
+                return not self.pending_stop
+            ack_only=self.driver.jog_context and not self._global_stop and self.sample.get('alarm_code')!=0x601
             if not ack_only:
                 first=await self.observe()
                 await asyncio.sleep(.06)
@@ -190,6 +245,21 @@ class Controller:
                     return False
             if issued!=self.epoch:
                 return False
+            defer_home_fault=(not ack_only and (first['alarm_code']==0x601 or second['alarm_code']==0x601))
+            if not ack_only and not defer_home_fault:
+                try:
+                    cleaned=await self.driver.release_home_enable(checkpoint)
+                    checkpoint()
+                    defer_home_fault=cleaned is False
+                except Exception:
+                    # Lost cleanup ACK is a stop uncertainty, not just a DI problem.
+                    # The next attempt must send STOP again before feedback/cleanup.
+                    self._stop_sent_epoch=None
+                    raise
+            if defer_home_fault:
+                self.armed=self.trusted=False
+                self.fault='Er.601 回原点失败；已确认静止，保留故障，请点击人工故障复位执行失能清警'+('；软件急停仍锁存' if self.emergency else '')
+                self.trace.add('home_fault_cleanup_deferred',code=0x601,automatic_reset=False)
             self.stop_confirmation='ack' if ack_only else 'feedback'
             self.pending_stop=False
             self.mode=self.direction=self.target_cm=None
@@ -199,17 +269,20 @@ class Controller:
             self.trace.add('stop_acknowledged' if ack_only else 'stop_confirmed')
             return True
 
-    async def stop(self, emergency=False):
-        self._stop_intent(emergency)
+    async def stop(self, emergency=False, global_stop=False):
+        self._stop_intent(emergency, global_stop=global_stop)
         return await self._wait_for_stop()
 
     async def _wait_for_stop(self):
         deadline=time.monotonic()+self.config.stop_timeout_s
         while time.monotonic()<deadline:
+            issued=self.epoch
             try:
                 if await self._confirm_stop():
                     return self.snapshot()
             except Exception as exc:
+                if issued!=self.epoch or not self.pending_stop:
+                    return self.snapshot()
                 self.fault='停止待确认：'+str(exc)
                 self.armed=self.trusted=False
                 self.state='MOTION_UNKNOWN'
@@ -224,30 +297,52 @@ class Controller:
             was_ready = self.armed and not self.emergency and not self.fault
             # Retire all old starts before the only permitted reset write.
             self.armed=False
+            cleanup_before=self.driver.home_cleanup_serial
             await self.stop()
+            cleanup_completed=self.driver.home_cleanup_serial!=cleanup_before
             issued=self.epoch
             data=await self.observe()
             alarm=data['alarm']
-            if not alarm['reset_allowed']:
-                raise LabError(alarm['text']+' 不允许通用复位；'+alarm['advice'])
-            if alarm['code'] in (0x950,0x952) and (data['upper_limit'] or data['lower_limit']):
-                self.armed=was_ready
-                if was_ready:
-                    self.state='IDLE'
-                raise LabError('物理限位仍有效，必须先按允许方向脱离，不能用复位绕过限位')
             def checkpoint():
                 if issued!=self.epoch or self.pending_stop:
                     raise MotionCancelled('故障复位被停止/连接变化取消')
+            reset_confirmed=False
             try:
-                await self.driver.reset_fault(checkpoint,alarm['raw_code'])
+                await self.driver.reset_fault(checkpoint,alarm['raw_code'],home_cleanup_completed=cleanup_completed)
                 data=await self.observe()
                 checkpoint()
                 self.trace.add('manual_reset',previous_alarm=alarm['raw_hex'],remaining=data['alarm']['raw_hex'])
-                await self.driver.read_parameters()
-                checkpoint()
                 if data['alarm_code']:
                     raise LabError('复位后报警仍存在：'+data['alarm_text'])
-                if alarm['code'] in (0x950,0x952) and was_ready:
+                reset_confirmed=True
+                await self.driver.read_parameters()
+                checkpoint()
+                if alarm['code']==0x601:
+                    self.trusted=False
+                    self.home_status='not_homed'
+                    self.home_phase='idle'
+                    report=await self.driver.preflight()
+                    checkpoint()
+                    await self.observe()
+                    checkpoint()
+                    failures=list(report['failures'])
+                    if self.storage_error:
+                        failures.append(self.storage_error)
+                    for mode in ('pp','pv'):
+                        self.config.speed_pr(self.speeds[mode],mode)
+                    if self.emergency:
+                        failures.append('软件急停尚未解除')
+                    if self.sample['alarm_code']:
+                        failures.append('驱动报警仍存在：'+self.sample['alarm_text'])
+                    if failures:
+                        self.fault='601已清除；'+ '；'.join(failures)
+                        self.state='DISARMED'
+                    else:
+                        self.armed=True
+                        self.fault=''
+                        self.state='IDLE'
+                        self.trace.add('home_recovery_ready',automatic_motion=False,position_trusted=False)
+                elif alarm['code'] in (0x950,0x952) and was_ready:
                     self.armed=True
                     self.fault=''
                     self.state='IDLE'
@@ -258,7 +353,8 @@ class Controller:
             except MotionCancelled:
                 raise
             except Exception as exc:
-                self._fault('故障复位未确认：'+str(exc),True)
+                prefix='601已清除，但恢复检查未通过：' if reset_confirmed and alarm['code']==0x601 else '故障复位未确认：'
+                self._fault(prefix+str(exc),True)
                 raise LabError(self.fault,503)
 
     def _speed_cap(self, mode):
@@ -319,13 +415,11 @@ class Controller:
             raise LabError('请先停止当前动作再回原点')
         data=await self.observe()
         self._checkpoint(issued)
-        reason=blocked(data,homing=True)
+        reason=home_blocked(data)
         if reason:
             raise LabError(reason)
-        params=await self.driver.read_parameters()
+        params=self.config.home_parameters(await self.driver.read_parameters())
         self._checkpoint(issued)
-        if params['home_method']!=17:
-            raise LabError('当前驱动回零方式不是17；请维护人员核实，禁止自动替换未知配置')
         if params['home_offset']!=self.config.home_reference_pulse:
             raise LabError('驱动原点偏移与已确认配置不一致，不自动改写或采用')
         if any(params[key]<=0 for key in ('home_speed','home_creep_speed','home_acceleration')):
@@ -335,8 +429,9 @@ class Controller:
         self.trusted=False
         self.mode,self.direction,self.target_cm='home','down',None
         self.home_status='starting'
+        self.home_phase='preparing'
         self.home_triggered=self.home_seen_incomplete=False
-        self.home_seen_lower=False
+        self.home_seen_lower=self.home_seen_release=False
         self.home_stable=0
         self.home_last_raw=None
         self.home_connection=self.driver.transport.epoch
@@ -346,6 +441,9 @@ class Controller:
         self.state='STARTING'
         def triggered():
             self.home_triggered=True
+            self.home_seen_lower=self.driver.home_start_sample['lower_limit']
+            self.home_phase='leaving_lower' if self.home_seen_lower else 'seeking_lower'
+            self.started=self.last_motion=time.monotonic()
         try:
             await self.driver.home(lambda:self._checkpoint(issued),triggered)
             self._checkpoint(issued)
@@ -378,16 +476,19 @@ class Controller:
             try:
                 data=await self.observe()
                 checkpoint()
-                if enabled and (self.emergency or data['alarm_code'] not in (0,0x950,0x952)):
-                    raise LabError('存在报警或软件急停，不能独立使能')
-                if enabled:
-                    await self.driver.prepare_jog(checkpoint)
-                    await self.driver.jog_command(1,checkpoint)
-                    checkpoint()
-                else:
-                    await self.driver.jog_command(65,checkpoint)
-                    checkpoint()
-                self.driver.jog_context=True
+                if enabled and self.emergency:
+                    raise LabError('软件急停尚未解除，不能独立使能')
+                # JOG stop normally confirms only ACK; these independent buttons
+                # additionally require stationary feedback before changing DI.
+                first=data
+                await asyncio.sleep(.06)
+                second=await self.observe()
+                checkpoint()
+                if abs(first['speed_rpm'])>1 or abs(second['speed_rpm'])>1 or abs(first['position_feedback']-second['position_feedback'])>20:
+                    raise LabError('设备尚未静止，未切换使能给定；请停止后重试')
+                await self.driver.set_force_servo_given(enabled,checkpoint)
+                checkpoint()
+                self.driver.jog_context=False
                 self.driver.jog_running=False
                 self.armed=False
                 self.state='FAULT' if self.fault else 'DISARMED'
@@ -413,7 +514,7 @@ class Controller:
                     self.trace.add('obsolete_stop_ignored',intent=cancelled)
                     return self.snapshot()
                 self.closed.append(cancelled)
-            return await self.stop(action=='estop')
+            return await self.stop(action=='estop',global_stop=action=='estop' or not cancelled)
         if action=='reset_fault':
             return await self.reset_fault(command)
         if action=='heartbeat':
@@ -528,15 +629,17 @@ class Controller:
             return self.snapshot()
 
     async def _monitor_home(self,data):
-        reason=blocked(data,homing=True)
-        # Only this HOME's observed switch transition can explain a latched 952.
-        if data['alarm_code']==0x952 and self.home_seen_lower and not data['upper_limit'] and self.home_connection==self.driver.transport.epoch:
-            reason=''
+        if data['alarm_code']==0x601:
+            self._fault('回原点失败；保留601，按需人工复位',True)
+            return
+        reason=home_blocked(data)
         if reason:
             self._fault('回零中断：'+reason,True)
             return
         now=time.monotonic()
-        if not data['home_attained'] and self._stalled(data,now):
+        stalled=self._stalled(data,now)
+        reversal_budget=self.driver.parameters.get('home_speed',0)/max(1,self.driver.parameters.get('home_acceleration',1))+self.config.stall_s
+        if not data['home_attained'] and stalled and now-self.last_motion>max(self.config.stall_s,reversal_budget):
             self._fault('回零启动无运动或堵转，请检查机构与负限位',True)
             return
         if now-self.started>self.config.home_timeout_s:
@@ -545,8 +648,14 @@ class Controller:
         if not self.home_seen_incomplete and now-self.started>self.config.home_start_timeout_s:
             self._fault('未观察到本次回零未完成状态，不能采用旧完成位',True)
             return
+        if self.driver.force_status()['selection']!=0 or data.get('di3_logic')!=1 or data.get('di3_function')!=1 or not (data['di_monitor']&4):
+            self._fault('HOME使能给定或物理DI配置改变',True)
+            return
         if not self.home_seen_incomplete or not data['home_attained']:
             self.home_stable=0
+            return
+        if not self.home_seen_lower or not self.home_seen_release:
+            self._fault('未观察到本次负限位触发和释放，不能建立参考',True)
             return
         if data['lower_limit'] or data['upper_limit']:
             self._fault('回零完成但限位仍有效，不能建立参考',True)
@@ -566,6 +675,7 @@ class Controller:
             self.zero=self.config.home_reference_pulse
             self.trusted=True
             self.home_status='complete'
+            self.home_phase='complete'
             self.home_triggered=False
             self._stop_intent()
             self.trace.add('home_confirmed',reference_pulse=self.zero,final_raw=raw)
@@ -621,10 +731,6 @@ class Controller:
                     await self._monitor_home(data)
                 elif self.state=='MOVING':
                     await self._monitor_motion(data)
-                elif self.state=='IDLE' and data['alarm_code'] not in (0,0x950,0x952):
-                    self.armed=False
-                    self.fault=data['alarm_text']+' '+data['alarm']['name']
-                    self.state='FAULT'
                 if not self.pending_stop and not getattr(self,'manual_active',False) and not self._sequence.locked():
                     async with self._sequence:
                         issued=self.epoch
@@ -636,8 +742,8 @@ class Controller:
                             else:
                                 await self.driver.renew_jog(self.direction,lambda:self._checkpoint(issued))
                         if issued==self.epoch and not self.pending_stop:
-                            await self.driver.monitor_parameter_turn(compare=bool(self.driver.expected_words) and self.mode!='pv')
-                        if self.mode and self.mode!='pv' and self.state in ('MOVING','HOMING'):
+                            await self.driver.monitor_parameter_turn(compare=bool(self.driver.expected_words) and self.mode not in ('pv','home'))
+                        if self.mode=='pp' and self.state in ('MOVING','HOMING'):
                             self.driver.require_monitor_fresh()
             except asyncio.CancelledError:
                 raise
@@ -659,12 +765,14 @@ class Controller:
             if self.mode=='home' and self.state in ('HOMING','STARTING') and now-self.started>self.config.home_timeout_s:
                 self._fault('回零超时',True)
             if self.pending_stop:
+                issued=self.epoch
                 try:
                     await self._confirm_stop()
                 except Exception as exc:
-                    self.state='MOTION_UNKNOWN'
-                    self.fault='停止重试中：'+str(exc)
-                    self.armed=self.trusted=False
+                    if issued==self.epoch and self.pending_stop:
+                        self.state='MOTION_UNKNOWN'
+                        self.fault='停止重试中：'+str(exc)
+                        self.armed=self.trusted=False
             await asyncio.sleep(.05)
 
     def snapshot(self):
@@ -704,7 +812,7 @@ class Controller:
             intent_id=self.intent,epoch=self.epoch,faults=[x for x in (self.fault,self.storage_error) if x],
             travel_height_cm=self.config.travel_cm,base_height_cm=self.config.base_cm,
             soft_lower_cm=self.config.soft_lower_cm,soft_upper_cm=self.config.soft_upper_cm,
-            home_status=self.home_status,parameters=params,alarm_history=list(self.alarms),
+            home_status=self.home_status,home_phase=self.home_phase,parameters=params,alarm_history=list(self.alarms),
             limit_protection=dict(host='PP目标校验；基础JOG仅按物理限位方向拦截，不依赖软件高度',
                 driver='待实机验证：不假定P0A/P10软限位覆盖PV/JOG或HOME；仅只读观察',
                 motion_profile_verified=self.config.motion_profile_verified,mechanical='无电机抱闸；传动自锁，机械端点非日常停止方式'),

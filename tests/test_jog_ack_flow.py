@@ -9,7 +9,7 @@ from lab.service import Service
 class JogAckFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.s=Service(Config(mode='sim', state_file=str(Path(self.tmp.name)/'state.json'),stop_timeout_s=.12))
+        self.s=Service(Config(mode='sim',home_enable_hold_s=0,home_disable_hold_s=0, state_file=str(Path(self.tmp.name)/'state.json'),stop_timeout_s=.12))
         self.s.connected=True
         self.s.connection_state='connected'
         self.c=self.s.controller
@@ -28,6 +28,63 @@ class JogAckFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def jog(self,direction='up',token='first'):
         return await self.c.command(dict(action=direction,intent_id=token))
+
+    async def test_global_stop_always_sends_bus_stop_and_cancels_jog(self):
+        for action,value,jog_value in (('stop',256,1),('estop',512,65)):
+            await self.c.arm()
+            await self.jog(token=action)
+            self.s.trace.clear()
+            result=await self.c.command({'action':action})
+            self.assertIn((0x0D08,value),self.writes())
+            self.assertIn((0x0D0B,jog_value),self.writes())
+            self.assertLess(self.writes().index((0x0D08,value)),self.writes().index((0x0D0B,jog_value)))
+            self.assertEqual(result['details']['stop_confirmation'],'feedback')
+            self.assertIsNone(self.c.intent)
+            self.assertIsNone(self.sim.motion)
+
+    async def test_global_stop_escalates_pending_jog_stop(self):
+        await self.jog()
+        self.c._stop_intent()
+        self.s.trace.clear()
+        await self.c.command({'action':'stop'})
+        self.assertIn((0x0D08,256),self.writes())
+
+    async def test_failed_bus_stop_still_attempts_jog_stop_but_remains_unconfirmed(self):
+        await self.jog()
+        original=self.sim.transaction
+        async def fail_bus(request,*args,**kwargs):
+            if request[1:6]==bytes.fromhex('06 0d 08 01 00'):
+                raise TimeoutError('bus stop reply lost')
+            return await original(request,*args,**kwargs)
+        with patch.object(self.sim,'transaction',side_effect=fail_bus):
+            with self.assertRaises(LabError):
+                await self.c.command({'action':'stop'})
+        self.assertIn((0x0D0B,1),self.writes())
+        self.assertTrue(self.c.pending_stop)
+        self.assertIsNone(self.sim.motion)
+
+    async def test_jog_does_not_clear_unowned_di3_polarity(self):
+        self.sim.regs[0x0307]=1
+        self.assertFalse(self.c.driver.home_enable_owned)
+        self.s.trace.clear()
+        await self.jog()
+        await self.c.stop()
+        self.assertEqual(self.sim.regs[0x0307],1)
+        self.assertFalse(any(a in (0x0307,0x0D08) for a,v in self.writes()))
+        self.assertNotIn((0x0D0B,65),self.writes())
+
+    async def test_jog_retires_owned_home_enable_once_before_direction(self):
+        self.c.driver.home_enable_owned=True
+        self.sim.regs[0x0307]=1
+        self.s.trace.clear()
+        await self.jog()
+        writes=self.writes()
+        self.assertLess(writes.index((0x0307,0)),writes.index((0x0D0B,17)))
+        self.assertFalse(self.c.driver.home_enable_owned)
+        await self.c.stop()
+        self.s.trace.clear()
+        await self.jog('down','second')
+        self.assertFalse(any(a in (0x0307,0x0D08) for a,v in self.writes()))
 
     async def test_stop_ack_returns_without_sampling_or_claiming_stationary(self):
         await self.jog()
@@ -70,10 +127,10 @@ class JogAckFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.jog()
         entered,resume=asyncio.Event(),asyncio.Event()
         original=self.c.driver.stop
-        async def delayed(emergency=False):
+        async def delayed(emergency=False,checkpoint=lambda:None):
             entered.set()
             await resume.wait()
-            await original(emergency)
+            await original(emergency,checkpoint)
         self.s.trace.clear()
         with patch.object(self.c.driver,'stop',side_effect=delayed):
             first=asyncio.create_task(self.c.stop())
@@ -138,13 +195,13 @@ class JogAckFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.c.command(dict(action='servo_disable'))
         self.s.trace.clear()
         await self.c.stop()
-        self.assertEqual(self.writes(),[(0x0d0b,65)])
+        self.assertEqual(self.writes(),[(0x0d08,256)])
         self.assertFalse(self.sim.enabled)
 
-    async def test_new_jog_after_explicit_disable_enables_once_without_disable_cycle(self):
+    async def test_new_jog_after_force_disable_uses_current_jog_readback(self):
         await self.jog()
         await self.c.command(dict(action='servo_disable'))
         await self.c.arm()
         self.s.trace.clear()
         await self.jog('down','reenable')
-        self.assertEqual([v for a,v in self.writes() if a==0x0d0b],[1,33])
+        self.assertEqual([v for a,v in self.writes() if a==0x0d0b],[33])

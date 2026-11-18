@@ -440,7 +440,8 @@ class Service:
                 # Command registers have write-ACK evidence, never pretend that
                 # a read of a trigger register reports an active command.
                 if address not in REFRESH_EXCLUDED:
-                    await ctrl.driver.wire.read_registers(address,width)
+                    await ctrl.driver._read_words(address,width)
+                    ctrl.driver._limit_config_epoch = None
         return self.register_snapshot()
 
     async def manual_transaction(self,client,body):
@@ -508,6 +509,9 @@ class Service:
                 try:
                     # Recheck *inside* the shared bus lock, so a queued raw
                     # start cannot be sent after an emergency-stop intent.
+                    if parsed['address'] <= 0x0D0B < parsed['address']+parsed['count']:
+                        ctrl.driver.jog_context=True
+                        ctrl.driver.jog_running=True
                     response=await transport.transaction(parsed['request'],parsed['expected_length'],before_send=checkpoint)
                     validate_response(parsed,response)
                     checkpoint()
@@ -536,7 +540,7 @@ class Service:
         if self.config.implementation=='candidate' and self.controller._sequence.locked():
             raise LabError('控制操作正在执行，不能同时修改配置')
         state=self.controller.snapshot()['details']
-        if state.get('motion') not in ('stopped',None) or state.get('pending_stop') or state.get('state') in ('STARTING','MOVING'):
+        if state.get('motion') not in ('stopped','stop_acknowledged',None) or state.get('pending_stop') or state.get('state') in ('STARTING','MOVING'):
             raise LabError('运动中或停止未确认，不能改配置')
         if self.config.implementation=='baseline':
             raise LabError('冻结基线配置通过启动文件指定；不热更新',400)
@@ -548,7 +552,21 @@ class Service:
         if self.config.mode=='real':
             # A changed safety profile must be physically re-validated, never inherit approval.
             candidate.motion_profile_verified=False
-        async with self.controller._sequence:
+        ctrl=self.controller
+        async with ctrl._sequence:
+            issued=ctrl.epoch
+            if self.manual_active or ctrl.mode is not None or ctrl.pending_stop:
+                raise LabError('运动中或停止未确认，不能改配置')
+            if self.connected:
+                # ACK completes a JOG stop command, not physical standstill.
+                # Verify only for configuration changes; consecutive JOG stays ACK-only.
+                first=await ctrl.observe()
+                await asyncio.sleep(.06)
+                second=await ctrl.observe()
+                if abs(first['speed_rpm'])>1 or abs(second['speed_rpm'])>1 or abs(first['position_feedback']-second['position_feedback'])>20:
+                    raise LabError('尚未确认静止，请等待升降杆停止后再保存参数')
+            if ctrl is not self.controller or issued!=ctrl.epoch or ctrl.pending_stop:
+                raise LabError('控制状态已变化，请重新保存参数')
             self.controller.epoch+=1
             self.controller.armed=False
             self.controller.trusted=False

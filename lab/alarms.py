@@ -63,8 +63,8 @@ _WARNINGS = [
 ('939','电机动力线断线',True,30,'停机检查电机动力线、接头与相电流；禁止直接重启。'),
 ('941','变更参数需重新上电生效',True,30,'记录参数差异，按现场规程重新上电后重新预检；工具不自动断电。'),
 ('942','参数存储频繁',True,30,'读取 P0C-13，核查频繁写参来源；工具不自动修改 EEPROM 更新设置。'),
-('950','正向超程警告',True,30,'核对上限位 DI；仅允许条件明确的反向脱离，不靠清报警越过限位。'),
-('952','反向超程警告',True,30,'核对下限位 DI；仅允许条件明确的反向脱离或模式17预期回零过程。'),
+('950','正向超程警告',True,30,'核对实际上下限位DI；现场下限位也可能报950。基础JOG方向按当前DI：无限位时双向可用，单侧有效时只许反向；残留950/952不要求重新检查，可人工复位清除。'),
+('952','反向超程警告',True,30,'核对实际上下限位DI；基础JOG方向按当前DI：无限位时双向可用，单侧有效时只许反向；不以报警名称猜方向，残留警告可人工复位清除。'),
 ('980','编码器内部故障',True,30,'联系厂家检查编码器，维护后重新回零。'),
 ('A40','内部故障',True,30,'检查电机自学习、编码器线缆及类型；不自动自学习。'),
 ]
@@ -120,3 +120,20 @@ def blocked(sample, direction=None, homing=False):
     if code == 0x952 and lower and not upper and (direction=='up' or homing):
         return ''
     return describe(sample.get('alarm_raw',code))['text']+'：报警未满足方向放行条件'
+
+
+def jog_blocked(sample, direction):
+    """Physical DI determines direction; field captures show DI5 + E950."""
+    if sample.get('di4_function') != 14 or sample.get('di5_function') != 15:
+        return '限位映射不符合预期'
+    if sample.get('di4_logic') not in (0, 1) or sample.get('di5_logic') not in (0, 1):
+        return '限位极性未知'
+    upper, lower = sample.get('upper_limit'), sample.get('lower_limit')
+    if type(upper) is not bool or type(lower) is not bool or (upper and lower):
+        return '限位未知或上下同时有效'
+    code = sample.get('alarm_code', 0)
+    if code not in (0, 0x950, 0x952):
+        return describe(sample.get('alarm_raw', code))['text']+'：故障未解除'
+    if (upper and direction == 'up') or (lower and direction == 'down'):
+        return '物理限位禁止该方向'
+    return ''

@@ -12,7 +12,7 @@ from lab.transport import Simulator, Trace
 
 class EepromTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.config = Config(poll_s=.02)
+        self.config = Config(mode='sim', poll_s=.02)
         self.trace = Trace()
         self.sim = Simulator(self.config, self.trace)
         self.driver = Driver(self.config, self.sim)
@@ -62,7 +62,7 @@ class EepromTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_connection_checks_before_arm_and_status_exposes_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = Service(Config(state_file=str(Path(tmp)/'zero.json'), poll_s=.02))
+            service = Service(Config(mode='sim', state_file=str(Path(tmp)/'zero.json'), poll_s=.02))
             service.transport.regs[0x0C0D] = 1
             await service.start()
             try:

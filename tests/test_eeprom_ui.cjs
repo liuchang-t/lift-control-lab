@@ -49,7 +49,7 @@ get('manualFrame').value='01 06 02 00 00 09';vm.runInContext("pendingFrame='old'
 context.regs={registers:[{parameter:'P10-25',address_hex:'0x1019',name:'PP速度',width:2,value:30000,raw_words:[30000,0],access:'RW',source:'write_ack',age_s:12.9,stale:false,epoch:1,operations:['PP'],polling_kind:'low_frequency',polling_label:'自动低频',polling_notice:'仅空闲读取'}],notice:'缓存'};
 vm.runInContext('renderRegisters(regs)',context);assert.equal(get('registerRows').children.length,1);assert.equal(get('registerRows').children[0].children[4].children[0].textContent,'写入回显');assert.equal(get('registerRows').children[0].children[4].textContent,'12 秒');assert.equal(get('registerRows').children[0].children[1].children[0].textContent,'自动低频');assert.equal(get('registerRows').children[0].children[1].children[0].dataset.tip,undefined);assert.equal(get('registerRows').children[0].dataset.tip,undefined);assert.equal(get('registerRows').children[0].children[2].textContent,'RW');get('registerFilter').value='missing';vm.runInContext('filterRegisters()',context);assert.equal(get('registerRows').children.length,0);
 context.units={status:'consistent',path:'direct',encoder_counts_per_rev:8388608,pulses_setting:10000,gear_numerator:8388608,gear_denominator:10000,effective_command_per_rev:10000,effective_fraction:'10000/1',configured_command_per_rev:10000,consistent:true,mechanical_cm_per_rev:.35,mechanical_verified:false,notice:'驱动读回一致，机械位移仍需实测',observed_age_s:12.9};
-vm.runInContext('renderConversion(units)',context);assert.equal(get('conversionStatus').textContent,'驱动/配置数值一致');assert.equal(get('conversionPath').textContent,'P05-02 直接设定');assert.equal(get('conversionEncoder').textContent,8388608);assert.equal(get('conversionEffective').textContent,10000);assert.equal(get('mechanicalCm').value,.35);assert.match(get('conversionStatus').dataset.tip,/12 秒前/);assert.doesNotMatch(html,/待实机核实|id="conversionNotice"/);assert.equal(get('registerNotice').hidden,true);assert.match(html,/保存控制台比例/);assert.match(html,/新比例 = 旧比例 × 实测位移 \/ 指令位移/);assert.match(html,/PP\/PV期望cm\/s不变/);
+vm.runInContext('renderConversion(units)',context);assert.equal(get('conversionStatus').textContent,'驱动/配置数值一致');assert.equal(get('conversionPath').textContent,'P05-02 直接设定');assert.equal(get('conversionEncoder').textContent,8388608);assert.equal(get('conversionEffective').textContent,10000);assert.equal(get('mechanicalCm').value,.35);assert.match(get('conversionStatus').dataset.tip,/12 秒前/);assert.doesNotMatch(html,/待实机核实|id="conversionNotice"/);assert.equal(get('registerNotice').hidden,true);assert.match(html,/保存控制台比例/);assert.match(html,/新比例 = 旧比例 × 实测位移 \/ 指令位移/);assert.match(html,/PP\/JOG期望cm\/s不变/);
 get('mechanicalCm').value='0.4';get('mechanicalCm').events.input();context.units.mechanical_cm_per_rev=.35;vm.runInContext('renderConversion(units)',context);assert.equal(get('mechanicalCm').value,'0.4');
 context.units.status='mismatch';context.units.path='ratio';context.units.effective_command_per_rev=5000;context.units.consistent=false;vm.runInContext('renderConversion(units)',context);assert.equal(get('conversionStatus').textContent,'驱动与配置不一致');assert.equal(get('conversionPath').textContent,'电子齿轮比');assert.equal(get('conversionEffective').textContent,5000);
 vm.runInContext('renderConversion(undefined)',context);assert.equal(get('conversionStatus').textContent,'驱动换算未确认');assert.equal(get('conversionEffective').textContent,'—');
@@ -81,7 +81,7 @@ async function connectionSnapshotRace(){
   assert.equal(get('connectionState').textContent,'已连接');assert.equal(get('height').textContent,'1.00 cm');assert.doesNotMatch(get('state').textContent,/未连接/);
   console.log('Connection snapshot race passed: initial SSE renders atomically and stale GET cannot erase current metrics.');
 }
-requests().then(connectionRequests).then(mechanicalRequest).then(connectionSnapshotRace).catch(e=>{console.error(e);process.exitCode=1;});
+requests().then(connectionRequests).then(mechanicalRequest).then(connectionSnapshotRace).then(limitWarningReset).catch(e=>{console.error(e);process.exitCode=1;});
 
 
 // Force-input readback is distinct from the observed DI level and servo completion.
@@ -115,3 +115,65 @@ const paused=get('logs').textContent;vm.runInContext("logBuffer.accept({items:[{
 vm.runInContext('pageLogs(1000)',context);assert.match(get('logs').textContent,/^1 /);assert.equal(get('olderLogs').disabled,true);
 context.Date=Date;
 console.log('Log rendering bound: 20,000 retained; 300 DOM lines/date formats per page; 0 formats on unchanged poll; oldest history remains accessible; paused content stays fixed.');
+
+// Candidate real mode must not expose the legacy forced-DI PP/HOME path.
+context.jogReal={...context.connected,mode:'real',current:{...context.connected.current,mode:'real'}};
+vm.runInContext('renderConnection(jogReal); applyConnectionState()',context);
+for(const id of ['home','goto','min','max'])assert.equal(get(id).disabled,true);
+assert.match(html,/>JOG 速度/);
+assert.doesNotMatch(html,/只允许软件保护范围内|回零后先全收到软件下限|靠近边界时保护逻辑可能降低/);
+console.log('Basic JOG UI: independent speed label, no homing/software-bound hints; unsafe real PP/HOME disabled.');
+
+context.ackStop={status:{online:true,implementation:'candidate',details:{state:'IDLE',stop_confirmation:'ack',observed_motion:true,untracked_motion:true,speed_rpm:80,armed:true}}};
+vm.runInContext('render(ackStop)',context);
+assert.match(get('state').textContent,/停止指令已应答/);
+assert.match(get('state').textContent,/反馈仍有运动/);
+assert.doesNotMatch(get('state').textContent,/静止/);
+
+context.noMotion={status:{online:true,implementation:'candidate',details:{state:'MOVING',motion_notice:'命令已应答，未检测到运动',speed_rpm:0,armed:true,position_trusted:false}}};
+vm.runInContext('render(noMotion)',context);
+assert.match(get('state').textContent,/未检测到运动/);
+assert.doesNotMatch(get('state').textContent,/故障锁定|待检查/);
+assert.doesNotMatch(fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8'),/松开后重新按住可发起新点动/);
+
+// Cleared limit notices must not remain after fresh feedback, or hide other faults.
+context.limitEvent={status:{online:true,control_mode:'sim',implementation:'candidate',details:{upper_limit:false,lower_limit:true,di4_function:14,di5_function:15,di4_logic:0,di5_logic:0}},lease:{}};
+vm.runInContext("notify('点动已结束：物理限位禁止该方向。请按界面指引处理后再操作。');render(limitEvent)",context);
+assert.equal(get('rejection').hidden,false);
+context.limitEvent.status.online=false;context.limitEvent.status.details.lower_limit=false;
+vm.runInContext('render(limitEvent)',context);assert.equal(get('rejection').hidden,false);
+context.limitEvent.status.online=true;
+vm.runInContext('render(limitEvent)',context);assert.equal(get('rejection').hidden,true);
+vm.runInContext("notify('过载');render(limitEvent)",context);assert.equal(get('rejection').textContent,'过载');
+get('registerFilter').value='';
+vm.runInContext("renderRegisters({registers:[{parameter:'DI',visible:false},{parameter:'P0D-11',visible:true,value:1,source:'read',raw_words:[1],age_s:0}]})",context);
+assert.equal(get('registerRows').children.length,1);
+assert.equal(get('registerRows').children[0].children[4].children[0].textContent,'读回');
+
+context.loadEvent={status:{online:true,control_mode:'sim',implementation:'candidate',details:{load_signed:-1,load_raw:65535,load_percent:null}},lease:{}};
+vm.runInContext('render(loadEvent)',context);
+assert.match(get('sensors').textContent,/负载原码 -1/);
+assert.doesNotMatch(get('sensors').textContent,/65535%|-1%/);
+
+async function limitWarningReset(){
+  vm.runInContext('ask=async()=>true;refreshReadiness=async()=>{};renderConnection(connected)',context);
+  for(const armed of [true,false]){
+    context.loadEvent.status.details.alarm={code:0x950,reset_allowed:true};
+    vm.runInContext('render(loadEvent)',context);
+    context.fetch=async()=>({ok:true,json:async()=>({status:{details:{armed}}})});
+    await get('resetFault').events.click();
+    assert.match(get('rejection').textContent,armed?/可继续点动/:/检查 \/ 恢复/);
+  }
+  console.log('Limit warning reset UI: preserved readiness and recovery guidance passed.');
+}
+
+context.warningHint={status:{online:true,implementation:'candidate',details:{state:'MOVING',motion_notice:'命令已应答，未检测到运动（Er.950）',motion_advice:'当前存在Er.950，可能是驱动器内部仍在阻止运动。请先松开点动，再点击“人工故障复位”。',armed:true}}};
+vm.runInContext('render(warningHint);renderReadiness({summary:warningHint.status.details.motion_notice,steps:[warningHint.status.details.motion_advice],checks:[],actions:[]})',context);
+assert.match(get('guideSteps').textContent,/可能是驱动器内部仍在阻止运动/);
+assert.match(get('guideSteps').textContent,/人工故障复位/);
+assert.match(get('state').dataset.tip,/先松开点动/);
+context.warningHint.status.details.motion_notice='命令已应答，未检测到运动';
+context.warningHint.status.details.motion_advice='';
+vm.runInContext('render(warningHint);renderReadiness({summary:warningHint.status.details.motion_notice,steps:[],checks:[],actions:[]})',context);
+assert.doesNotMatch(get('state').dataset.tip,/驱动器内部/);
+assert.doesNotMatch(get('guideSteps').textContent,/驱动器内部/);

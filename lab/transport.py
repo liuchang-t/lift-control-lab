@@ -113,13 +113,14 @@ class Simulator:
         self.counter_offset = 0.0
         self.rpm = 0
         self.enabled = False
+        self.jog_active = False
         self.motion = None
         self.home_attained = False
         self.home_started = None
         self.home_phase = None
         self.lower_active = True
         self.last = time.monotonic()
-        self.regs = {0x0200: 9, 0x1003: 3, 0x0C0D: 0, 0x0C1A: config.low_word_setting,
+        self.regs = {0x4604:100,0x0D11:0,0x0D12:511,0x0200: 9, 0x1003: 3, 0x0C0D: 0, 0x0C1A: config.low_word_setting,
                      0x0502: config.pulses_per_rev, 0x0306: 1, 0x0307: 0,
                      0x0308: 14, 0x0309: 0, 0x030A: 15, 0x030B: 0, 0x0B22: 0,
                      0x0A28: 2, 0x1023: 17}
@@ -173,7 +174,7 @@ class Simulator:
                             self.motion=None
                             self.home_phase=None
             elif self.motion in ("up", "down"):
-                speed = abs(self._i32(0x102A)) * (1 if self.motion == "up" else -1)
+                speed = (self.regs[0x4604]*self.config.pulses_per_rev/60 if self.jog_active else abs(self._i32(0x102A))) * (1 if self.motion == "up" else -1)
             else:
                 delta = self._i32(0x100E) - (self.physical + self.counter_offset)
                 speed = abs(self._i32(0x1019)) * (1 if delta > 0 else -1)
@@ -264,13 +265,27 @@ class Simulator:
             if address == int(self.faults["write_failure"]):
                 self.faults["write_failure"] = -1
                 raise TimeoutError("injected write failure")
-            if address == 0x0D08 and values[0] in (256, 512) and self.faults["lost_stop"]:
+            if ((address == 0x0D08 and values[0] in (256,512)) or (address == 0x0D0B and values[0] in (1,65))) and self.faults['lost_stop']:
                 self.faults["lost_stop"] -= 1
                 raise TimeoutError("stop not delivered")
             if address == 0x0D01 and self.faults['reset_failure']:
                 raise TimeoutError('reset not delivered')
             for offset, value in enumerate(values):
                 self.regs[address+offset] = value
+            if address == 0x0D0B:
+                value=values[0]
+                if value in (1,65):
+                    self.enabled=value==1
+                    self.motion=None
+                    self.home_phase=None
+                    self.jog_active=False
+                elif value in (17,33):
+                    self.jog_active=True
+                    self.enabled=True
+                    self.motion='up' if value==17 else 'down'
+                    if self.faults['lost_start_ack']:
+                        self.faults['lost_start_ack']=False
+                        raise TimeoutError('JOG start applied, acknowledgement lost')
             if address == 0x0D12:
                 self.enabled = values[0] == 507
                 if not self.enabled:
@@ -280,6 +295,7 @@ class Simulator:
                 if not self.faults['alarm_persistent']:
                     self.regs[0x0B22] = 0
             if address == 0x0D08:
+                self.jog_active=False
                 value = values[0]
                 if value in (256, 512):
                     self.motion = None

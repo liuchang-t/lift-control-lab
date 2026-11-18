@@ -23,6 +23,13 @@ def command_units_per_revolution(pulses_setting, encoder_counts, numerator, deno
     return Fraction(pulses_setting,1) if pulses_setting else Fraction(encoder_counts*denominator,numerator)
 
 
+def signed_word(value):
+    """Interpret one complete uint16 wire word as two's-complement int16."""
+    if type(value) is not int or not 0 <= value <= 0xFFFF:
+        raise ValueError('必须是完整16位寄存器原码')
+    return value - 0x10000 if value & 0x8000 else value
+
+
 def finite(value):
     if isinstance(value, bool):
         raise ValueError('布尔值不是数值')
@@ -50,6 +57,13 @@ class Units:
 
     def rpm(self, pr_s):
         return finite(pr_s) / self.pulses_per_rev * 60
+
+    def jog_rpm(self, cm_s):
+        value = Decimal(str(finite(cm_s))) * 60 / Decimal(str(self.cm_per_rev))
+        rpm = integer(value)
+        if not 1 <= rpm <= 65535:
+            raise ValueError('JOG速度换算后须为1～65535整数rpm（报文范围，不是设备额定范围）')
+        return rpm
 
     def rpm_to_cm_s(self, rpm):
         return finite(rpm) / 60 * self.cm_per_rev

@@ -87,19 +87,25 @@ def make_handler(service,loop,web_root):
     return Handler
 
 
+async def create_service(config):
+    """Restore settings without connecting to a remembered real device."""
+    service=Service(config)
+    if config.mode == 'sim':
+        await service.start()
+    return service
+
+
 def main():
-    parser=argparse.ArgumentParser(description='Independent lift laboratory (default: simulator)')
+    parser=argparse.ArgumentParser(description='Independent lift laboratory (default: real device, disconnected)')
     parser.add_argument('--config')
     parser.add_argument('--port',type=int,default=8765)
     parser.add_argument('--implementation',choices=['candidate','baseline'])
-    parser.add_argument('--allow-real',action='store_true')
+    parser.add_argument('--allow-real',action='store_true',help='兼容旧命令；实机始终需页面确认连接')
     args=parser.parse_args()
     cfg=load_config(args.config)
     if args.implementation:
         cfg.implementation=args.implementation
     cfg.validate()
-    if cfg.mode=='real' and not args.allow_real:
-        parser.error('real transport requires --allow-real; default is simulated')
     # Bind before touching hardware, so a busy HTTP port cannot leave an invisible controller.
     server=ThreadingHTTPServer(('127.0.0.1',args.port),BaseHTTPRequestHandler)
     server.daemon_threads=True
@@ -107,8 +113,7 @@ def main():
     thread=threading.Thread(target=loop.run_forever,daemon=True)
     thread.start()
     async def setup():
-        service=Service(cfg)
-        await service.start()
+        service=await create_service(cfg)
         mqtt=asyncio.create_task(publish_loop(service))
         return service,mqtt
     service,mqtt=asyncio.run_coroutine_threadsafe(setup(),loop).result(timeout=5)

@@ -18,8 +18,12 @@ class HttpTests(unittest.TestCase):
         cls.tmp=tempfile.TemporaryDirectory()
         sock=socket.socket();sock.bind(('127.0.0.1',0));cls.port=sock.getsockname()[1];sock.close()
         config=Path(cls.tmp.name)/'config.json'
-        config.write_text(json.dumps(dict(state_file=str(Path(cls.tmp.name)/'zero.json'),bridge_enabled=True,bridge_token='http-test',poll_s=.03)),encoding='utf-8')
-        cls.process=subprocess.Popen([sys.executable,'-B','-m','lab.server','--port',str(cls.port),'--config',str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        config.write_text(json.dumps(dict(mode='sim',state_file=str(Path(cls.tmp.name)/'zero.json'),bridge_enabled=True,bridge_token='http-test',poll_s=.03)),encoding='utf-8')
+        # Isolate persisted settings too: startup files no longer override them.
+        bootstrap=("import sys; from pathlib import Path; import lab.model,lab.service; "
+                   "lab.model.ROOT=lab.service.ROOT=Path(sys.argv.pop(1)); "
+                   "from lab.server import main; main()")
+        cls.process=subprocess.Popen([sys.executable,'-B','-c',bootstrap,cls.tmp.name,'--port',str(cls.port),'--config',str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         cls.base='http://127.0.0.1:'+str(cls.port)
         for _ in range(80):
             try:

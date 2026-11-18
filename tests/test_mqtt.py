@@ -44,7 +44,7 @@ class MqttTests(unittest.IsolatedAsyncioTestCase):
                 await writer.wait_closed()
         server=await asyncio.start_server(handle,'127.0.0.1',0)
         with tempfile.TemporaryDirectory() as temp:
-            cfg=Config(state_file=str(Path(temp)/'zero.json'),mqtt_host='127.0.0.1',mqtt_port=server.sockets[0].getsockname()[1],mqtt_username='user',mqtt_password='pass')
+            cfg=Config(mode='sim', state_file=str(Path(temp)/'zero.json'),mqtt_host='127.0.0.1',mqtt_port=server.sockets[0].getsockname()[1],mqtt_username='user',mqtt_password='pass')
             svc=Service(cfg)
             task=asyncio.create_task(publish_loop(svc))
             try:

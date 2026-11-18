@@ -33,7 +33,7 @@ class UnitsTests(unittest.TestCase):
         self.assertEqual(units.percent_to_cm(50,180),90)
 
     def test_pp_pv_ranges_are_independent_and_zero_is_zero(self):
-        cfg=Config(min_pp_speed=1000,max_pp_speed=50000,min_pv_speed=5000,max_pv_speed=100000).validate()
+        cfg=Config(mode='sim', min_pp_speed=1000,max_pp_speed=50000,min_pv_speed=5000,max_pv_speed=100000).validate()
         self.assertEqual(cfg.speed_pr(0,'pp'),0)
         self.assertEqual(cfg.speed_pr(0,'pv'),0)
         self.assertEqual(cfg.speed_pr(cfg.cm(2000),'pp'),2000)
@@ -46,7 +46,7 @@ class UnitsTests(unittest.TestCase):
             cfg.speed_pr(.5,'unselected')
 
     def test_legacy_minimum_migrates_and_limit_order_is_checked(self):
-        cfg=Config(min_speed=4000).validate()
+        cfg=Config(mode='sim', min_speed=4000).validate()
         self.assertEqual((cfg.min_pp_speed,cfg.min_pv_speed),(4000,4000))
         self.assertEqual(cfg.soft_lower_cm,1)
         for values in (dict(min_pp_speed=100001),dict(min_pv_speed=0),
@@ -55,7 +55,7 @@ class UnitsTests(unittest.TestCase):
                 Config(**values).validate()
 
     def test_stopping_distance_includes_delay_and_margin(self):
-        cfg=Config(verified_deceleration_cm_s2=2,control_latency_s=1,limit_margin_cm=.1)
+        cfg=Config(mode='sim', verified_deceleration_cm_s2=2,control_latency_s=1,limit_margin_cm=.1)
         self.assertAlmostEqual(cfg.stopping_distance(2),3.1)
         self.assertEqual(cfg.stopping_distance(-2),cfg.stopping_distance(2))
 
@@ -63,24 +63,24 @@ class UnitsTests(unittest.TestCase):
 class SpeedStoreTests(unittest.TestCase):
     def test_restart_restores_cm_s_without_link_to_new_maximum(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg=Config(state_file=str(Path(tmp)/'zero.json'))
+            cfg=Config(mode='sim', state_file=str(Path(tmp)/'zero.json'))
             SpeedStore(cfg).save({'pp':1.2,'pv':.4})
-            restarted=Config(state_file=cfg.state_file,max_pp_speed=60000,max_pv_speed=80000)
+            restarted=Config(mode='sim', state_file=cfg.state_file,max_pp_speed=60000,max_pv_speed=80000)
             self.assertEqual(SpeedStore(restarted).load(restarted),{'pp':1.2,'pv':.4})
 
     def test_sim_real_and_device_profiles_are_isolated(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg=Config(state_file=str(Path(tmp)/'zero.json'))
+            cfg=Config(mode='sim', state_file=str(Path(tmp)/'zero.json'))
             store=SpeedStore(cfg)
             store.save({'pp':1.2,'pv':.4})
             for changes in (dict(mode='real'),dict(host='other'),dict(slave_id=2)):
-                other=Config(state_file=cfg.state_file,**changes)
+                other=Config(state_file=cfg.state_file,**{'mode':'sim',**changes})
                 self.assertNotEqual(store.path,SpeedStore(other).path)
                 self.assertNotEqual(SpeedStore(other).load(other),{'pp':1.2,'pv':.4})
 
     def test_corrupt_or_out_of_range_files_do_not_silently_restore_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg=Config(state_file=str(Path(tmp)/'zero.json'))
+            cfg=Config(mode='sim', state_file=str(Path(tmp)/'zero.json'))
             store=SpeedStore(cfg)
             store.save({'pp':1.2,'pv':.4})
             original=store.path.read_text()
@@ -88,13 +88,13 @@ class SpeedStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.load(cfg)
             store.path.write_text(original)
-            restricted=Config(state_file=cfg.state_file,max_pp_speed=10000)
+            restricted=Config(mode='sim', state_file=cfg.state_file,max_pp_speed=10000)
             with self.assertRaises(ValueError):
                 SpeedStore(restricted).load(restricted)
 
     def test_failed_atomic_replace_keeps_previous_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg=Config(state_file=str(Path(tmp)/'zero.json'))
+            cfg=Config(mode='sim', state_file=str(Path(tmp)/'zero.json'))
             store=SpeedStore(cfg)
             store.save({'pp':1.2,'pv':.4})
             with patch('lab.model.os.replace',side_effect=OSError('disk full')):
@@ -104,7 +104,7 @@ class SpeedStoreTests(unittest.TestCase):
 
 
 class ConfigLoadTests(unittest.TestCase):
-    def test_saved_default_configuration_restores_and_explicit_file_wins(self):
+    def test_saved_configuration_overrides_startup_seed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
             (root/'.runtime').mkdir()
@@ -115,7 +115,7 @@ class ConfigLoadTests(unittest.TestCase):
                 restored=load_config()
                 self.assertEqual(restored.soft_lower_cm,1.2)
                 self.assertEqual(restored.min_pp_speed,4000)
-                self.assertEqual(load_config(str(explicit)).soft_lower_cm,1.5)
+                self.assertEqual(load_config(str(explicit)).soft_lower_cm,1.2)
 
     def test_missing_explicit_or_corrupt_saved_configuration_is_not_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:

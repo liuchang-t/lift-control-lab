@@ -9,7 +9,7 @@ from lab.service import Service
 class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
-        self.service=Service(Config(state_file=str(Path(self.temp.name)/'zero.json'),stop_timeout_s=.15))
+        self.service=Service(Config(mode='sim', state_file=str(Path(self.temp.name)/'zero.json'),stop_timeout_s=.15))
         self.ctrl=self.service.controller
         self.sim=self.service.transport
 
@@ -26,8 +26,8 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.sim.motion)
         self.assertFalse(self.ctrl.trusted)
         self.assertFalse(self.ctrl.armed)
-        self.assertEqual(self.sim.regs[0x0D11],1)
-        self.assertEqual(self.sim.regs[0x0D12],507)
+        self.assertEqual(self.sim.regs[0x0D11],0)
+        self.assertEqual(self.sim.regs[0x0D0B],1)
         self.assertFalse(any(a==0x0D08 and v in (1,3,5,7,8,16,32,64,128) for a,v in self.writes()))
 
     async def test_disable_stops_motion_before_force_write(self):
@@ -35,14 +35,16 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         self.sim.motion='up'
         self.sim.physical=self.sim.config.pulse(5)
         self.ctrl.mode='pv'
+        self.ctrl.driver.jog_context=True
+        self.ctrl.driver.jog_running=True
         self.ctrl.state='MOVING'
         self.ctrl.armed=True
         await self.ctrl.command({'action':'servo_disable'})
         self.assertFalse(self.sim.enabled)
         self.assertIsNone(self.sim.motion)
         events=list(self.service.trace.items)
-        confirmed=next(i for i,x in enumerate(events) if x['kind']=='stop_confirmed')
-        force=next(i for i,x in enumerate(events) if x['kind']=='tx' and bytes.fromhex(x['frame'])[1:4]==bytes([6,13,18]))
+        confirmed=next(i for i,x in enumerate(events) if x['kind']=='stop_acknowledged')
+        force=next(i for i,x in enumerate(events) if x['kind']=='tx' and bytes.fromhex(x['frame'])[1:6]==bytes([6,13,11,0,65]))
         self.assertLess(confirmed,force)
 
     async def test_stop_failure_does_not_send_disable(self):
@@ -66,33 +68,32 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         await self.ctrl.command({'action':'servo_disable'})
         self.assertEqual(self.sim.regs[0x0D12],511)
 
-    async def test_stop_cancels_enable_during_readback(self):
+    async def test_stop_cancels_enable_during_preparation(self):
         entered=asyncio.Event()
         resume=asyncio.Event()
-        original=self.ctrl.driver.write_force_input
-        async def delayed(address,value):
-            await original(address,value)
-            if value==511:
-                entered.set()
-                await resume.wait()
-        with patch.object(self.ctrl.driver,'write_force_input',side_effect=delayed):
+        original=self.ctrl.driver.prepare_jog
+        async def delayed(checkpoint):
+            await original(checkpoint)
+            entered.set()
+            await resume.wait()
+            checkpoint()
+        with patch.object(self.ctrl.driver,'prepare_jog',side_effect=delayed):
             task=asyncio.create_task(self.ctrl.command({'action':'servo_enable'}))
-            await entered.wait()
+            await asyncio.wait_for(entered.wait(),1)
             await self.ctrl.stop()
             resume.set()
-            with self.assertRaises(LabError):
-                await task
-        self.assertNotIn((0x0D12,507),self.writes())
+            with self.assertRaises(LabError): await task
+        self.assertNotIn((0x0D0B,1),self.writes())
 
-    async def test_readback_failure_does_not_continue_enable(self):
+    async def test_force_selection_readback_failure_prevents_enable(self):
+        self.sim.regs[0x0d11]=1
         original=self.ctrl.driver.wire.read_registers
         async def wrong(address,count):
             values=await original(address,count)
-            if address==0x0D11 and self.sim.regs.get(0x0D12)==511:
-                return [values[0],0]
+            if address==0x0D11: return [1,511]
             return values
         with patch.object(self.ctrl.driver.wire,'read_registers',side_effect=wrong):
             with self.assertRaises(LabError):
                 await self.ctrl.command({'action':'servo_enable'})
-        self.assertNotIn((0x0D12,507),self.writes())
+        self.assertNotIn((0x0D0B,1),self.writes())
         self.assertTrue(self.ctrl.pending_stop)

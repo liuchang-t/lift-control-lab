@@ -5,10 +5,10 @@ import time
 from dataclasses import asdict
 from baseline.lift_modbus import OukeServoLiftClient, normalize_alarm_code, format_alarm_code, di_input_active
 from .model import LabError
-from .alarms import describe, blocked
-from baseline.lift_modbus import registers_to_int32_le_word
-from .units import command_units_per_revolution
-from .registers import MONITOR_GROUPS, MONITOR_INTERVAL, MONITOR_MAX_AGE, REFERENCE_ADDRESSES
+from .alarms import describe, blocked, jog_blocked
+from baseline.lift_modbus import registers_to_int32_le_word, build_write_single_register, parse_write_single_register
+from .units import command_units_per_revolution, signed_word
+from .registers import PREFLIGHT_GROUPS, MONITOR_ADDRESSES, MONITOR_GROUPS, MONITOR_INTERVAL, MONITOR_MAX_AGE, REFERENCE_ADDRESSES
 
 
 class ParameterChanged(LabError):
@@ -30,12 +30,17 @@ class Driver:
         self.parameter_words = {}
         self.expected_words = {}
         self.unit_error = ''
+        self._limit_config_epoch = None
         self.monitor_index = 0
         self.monitor_last = 0.
         self.monitor_started = 0.
         self.force_requested = {}
         self.force_observed = None
         self.force_error = ''
+        self.jog_context = False
+        self.jog_running = False
+        self.jog_enable_epoch = None  # Last acknowledged command, not power-stage feedback.
+        self.jog_last_sent = 0.
 
     async def read_force_inputs(self, di=None):
         try:
@@ -173,7 +178,7 @@ class Driver:
 
     async def establish_parameter_baseline(self):
         values={}
-        for address,count in MONITOR_GROUPS:
+        for address,count in PREFLIGHT_GROUPS:
             words=await self._read_words(address,count)
             values.update({address+i:word for i,word in enumerate(words)})
         changed=any(address in self.expected_words and self.expected_words[address]!=value
@@ -184,7 +189,10 @@ class Driver:
 
     async def verify_before_motion(self):
         await self.require_units()
-        for address,count in MONITOR_GROUPS:
+        for address,count in PREFLIGHT_GROUPS:
+            # JOG speed is prepared separately and is not a PP/HOME invariant.
+            if address == 0x4604:
+                continue
             await self._check_block(address,count)
 
     async def _write_checked(self,address,values):
@@ -212,11 +220,10 @@ class Driver:
             await self._write_register(0x0200,9)
 
     async def check_active_parameters(self,mode,checkpoint):
-        blocks=[(0x1003,1)]
+        blocks=[(0x4604,1)] if mode=='pv' else [(0x1003,1)]
         if mode=='pp':
             blocks.extend([(0x100E,2),(0x1019,2)])
-        elif mode=='pv':
-            blocks.append((0x102A,2))
+
         elif mode=='home':
             blocks.append((0x1023,7))
         for address,count in blocks:
@@ -232,13 +239,16 @@ class Driver:
         self.monitor_index=(self.monitor_index+1)%len(MONITOR_GROUPS)
         self.monitor_last=now
         values=await self._read_words(address,count)
-        if compare:
+        # Idle 0x4604 may revert (observed 600 -> 100). Keep its actual
+        # readback visible without revoking readiness or replacing user speed.
+        # Active JOG checks it strictly in check_active_parameters instead.
+        if compare and address != 0x4604:
             self._changed(address,values)
 
     def monitor_status(self):
         now=time.monotonic()
         ages=[now-self.parameter_words[address]['at'] for address in self.expected_words
-              if address in self.parameter_words]
+              if address in MONITOR_ADDRESSES and address in self.parameter_words]
         return dict(interval_s=MONITOR_INTERVAL,nominal_cycle_s=MONITOR_INTERVAL*len(MONITOR_GROUPS),
                     max_age_s=max(ages) if ages else None,allowed_age_s=MONITOR_MAX_AGE,
                     notice='活动模式/目标/速度每保护周期核对，其余分块轮转；外部并发写仍有检测延迟，非硬实时互锁。')
@@ -283,9 +293,18 @@ class Driver:
 
     async def sample(self):
         eeprom = await self.read_eeprom_setting()
-        # Re-read limit mapping; do not let device resets preserve a stale cache.
-        self.wire._limit_switch_config = None
+        # Fixed mapping is refreshed at connection/check/manual refresh, not every sample.
+        if self._limit_config_epoch != self.transport.epoch:
+            self.wire._limit_switch_config = None
         value = asdict(await self.wire.read_status())
+        # The frozen baseline exposes an unsigned word as percent. Preserve
+        # the wire evidence; P0B-02 percent scaling is not established.
+        value['load_raw'] = value['load_percent']
+        value['load_signed'] = signed_word(value['load_raw'])
+        value['load_percent'] = None
+        value['load_scale_verified'] = False
+        self._limit_config_epoch = self.transport.epoch
+        await self.wire.read_registers(0x0D0B,1)
         value['eeprom_write'] = eeprom
         value['alarm_raw'] = value['alarm_code']
         value['alarm'] = describe(value['alarm_raw'])
@@ -315,6 +334,7 @@ class Driver:
         return result
 
     async def preflight(self):
+        self.wire._limit_switch_config = None
         result = {}
         for key, address in [('bus_mode',0x0200), ('word_order',0x0C1A), ('enable_function',0x0306), ('enable_logic',0x0307)]:
             result[key] = (await self.wire.read_registers(address,1))[0]
@@ -329,12 +349,11 @@ class Driver:
             failures.append('P0C-26 与已核实的低字优先设置不一致')
         if result['unit_verification']['consistent'] is not True:
             failures.append(result['unit_verification']['reason'] or '单位换算依据未知')
-        if result['enable_function'] != 1 or result['enable_logic'] != 0:
-            failures.append('507/511 使能方式要求 DI3=功能1、低电平有效')
+        # Basic JOG does not derive S-ON from DI3 polarity.
         if result['di4_function'] != 14 or result['di5_function'] != 15 or result['di4_logic'] not in (0,1) or result['di5_logic'] not in (0,1):
             failures.append('DI4/DI5 限位配置不符合当前驱动适配条件')
-        direction='down' if result['alarm_code']==0x950 else 'up'
-        reason=blocked(result,direction)
+        direction='down' if result['upper_limit'] else 'up'
+        reason=jog_blocked(result,direction)
         if reason:
             failures.append(reason)
         if result['parameters']['max_velocity'] <= 0:
@@ -342,7 +361,91 @@ class Driver:
         result['failures'] = failures
         return result
 
+    async def jog_command(self, value, checkpoint):
+        request=build_write_single_register(self.config.slave_id,0x0D0B,value)
+        try:
+            response=await self.transport.transaction(request,8,before_send=checkpoint)
+            parse_write_single_register(response,self.config.slave_id,0x0D0B,value)
+        except Exception:
+            self.jog_enable_epoch=None
+            raise
+        self.jog_enable_epoch=self.transport.epoch if value in (1,17,33) else None
+
+    def trace_jog_command_read(self, value):
+        self.transport.trace.add('jog_command_read',value=value,send_enable=value!=1,
+                                 completion_confirmed=False)
+
+    async def prepare_jog(self, checkpoint):
+        self.jog_context = True
+        self.jog_running = False
+        checkpoint()
+        words = await self.read_force_inputs()
+        checkpoint()
+        if words[0] != 0:
+            await self.wire.write_register(0x0D11, 0)
+            await self.read_force_inputs()
+            checkpoint()
+        if self.force_status()['selection'] != 0:
+            raise LabError('强制DI未解除，禁止点动')
+
+    async def jog_speed(self, speed):
+        rpm = self.config.units.jog_rpm(self.config.cm(speed))
+        await self.wire.write_register(0x4604, rpm)
+        self.expected_words[0x4604]=rpm
+        return rpm
+
+    async def start_jog(self, speed, direction, checkpoint):
+        data = await self.sample()
+        checkpoint()
+        reason = jog_blocked(data, direction)
+        if reason:
+            raise LabError(reason)
+        if data['eeprom_write'] != 0:
+            raise LabError('P0C-13 非0，禁止写入JOG速度')
+        await self.prepare_jog(checkpoint)
+        await self.jog_speed(speed)
+        checkpoint()
+        # Read the current command register on every new JOG intent. This
+        # chooses whether to send 1; it does not confirm power-stage readiness.
+        current=(await self.wire.read_registers(0x0D0B,1))[0]
+        checkpoint()
+        self.trace_jog_command_read(current)
+        if current != 1:
+            await self.jog_command(1, checkpoint)
+        else:
+            self.jog_enable_epoch=self.transport.epoch
+        checkpoint()
+        data = await self.sample()
+        checkpoint()
+        reason = jog_blocked(data, direction)
+        if reason or self.force_status()['selection'] != 0:
+            raise LabError(reason or '强制DI已改变，禁止点动')
+        # Mark before transmission: an ACK loss still requires JOG stop.
+        self.jog_running = True
+        await self.jog_command(17 if direction == 'up' else 33, checkpoint)
+        checkpoint()
+        self.jog_last_sent = time.monotonic()
+
+    async def renew_jog(self, direction, checkpoint):
+        if time.monotonic()-self.jog_last_sent < 1.0:
+            return
+        checkpoint()
+        if self.force_status()['selection'] != 0:
+            raise LabError('强制DI已改变，停止点动')
+        await self.jog_command(17 if direction == 'up' else 33, checkpoint)
+        checkpoint()
+        self.jog_last_sent = time.monotonic()
+
+    def require_bus_motion_supported(self):
+        if self.config.mode == 'real':
+            raise LabError('实机PP/HOME旧使能会屏蔽物理限位；新兼容方式未核实，当前请使用基础点动')
+
     async def start(self, mode, speed, target, direction, checkpoint):
+        if mode == 'pv':
+            return await self.start_jog(speed, direction, checkpoint)
+        self.require_bus_motion_supported()
+        self.jog_context = False
+
         async def step(operation, *args):
             checkpoint()
             value = await operation(*args)
@@ -375,6 +478,8 @@ class Driver:
         await step(self.wire.write_register,0x0D08,3 if mode=='pp' else (16 if direction=='up' else 32))
 
     async def home(self, checkpoint, triggered):
+        self.require_bus_motion_supported()
+        self.jog_context = False
         async def step(operation,*args):
             checkpoint()
             result=await operation(*args)
@@ -413,12 +518,21 @@ class Driver:
         checkpoint()
 
     async def stop(self, emergency=False):
-        await self.wire.write_register(0x0D08,512 if emergency else 256)
+        if self.jog_context:
+            keep_enabled=self.jog_running or self.jog_enable_epoch==self.transport.epoch
+            await self.jog_command(65 if emergency or not keep_enabled else 1, lambda:None)
+            self.jog_running=False
+        else:
+            await self.wire.write_register(0x0D08,512 if emergency else 256)
+
 
     async def disable(self):
-        await self.write_force_input(0x0D12,511)
+        await self.jog_command(65, lambda:None)
+        self.jog_running=False
 
     async def speed(self, mode, speed):
+        if mode == 'pv':
+            return await self.jog_speed(speed)
         if await self.read_eeprom_setting()!=0:
             raise LabError('P0C-13 非0，拒绝写入速度参数')
         address=0x1019 if mode=='pp' else 0x102A

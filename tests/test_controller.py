@@ -20,7 +20,7 @@ async def until(predicate,timeout=5):
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp=tempfile.TemporaryDirectory()
-        self.cfg=Config(state_file=str(Path(self.temp.name)/'zero.json'),soft_lower_cm=0,poll_s=.02,deadman_s=.3,startup_grace_s=.15,stall_s=.1,stop_timeout_s=.3,bridge_enabled=True,bridge_token='test')
+        self.cfg=Config(mode='sim', state_file=str(Path(self.temp.name)/'zero.json'),soft_lower_cm=0,poll_s=.02,deadman_s=.3,startup_grace_s=.15,stall_s=.1,stop_timeout_s=.3,bridge_enabled=True,bridge_token='test')
         self.service=Service(self.cfg)
         self.ctrl=self.service.controller
         self.sim=self.service.transport
@@ -180,19 +180,25 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
     async def test_running_speed_change_writes_register(self):
         await self.jog()
         await self.ctrl.command(dict(action='set_speed',mode='pv',speed_cm_s=.35))
-        self.assertEqual(self.sim._i32(0x102A),10000)
+        self.assertEqual(self.sim.regs[0x4604],60)
         self.assertEqual(self.ctrl.applied_speed,10000)
 
-    async def test_stall_from_start_latches_fault(self):
+    async def test_no_jog_motion_is_notice_without_locking(self):
         self.cfg.deadman_s=2
         self.sim.inject('stall')
         await self.jog()
-        await until(lambda:not self.ctrl.armed)
-        await until(lambda:not self.ctrl.pending_stop)
-        self.assertIsNone(self.sim.motion)
-        self.assertIn('堵转',self.ctrl.fault)
+        await until(lambda:self.ctrl.jog_no_motion)
+        self.assertTrue(self.ctrl.armed)
+        self.assertFalse(self.ctrl.pending_stop)
+        self.assertEqual(self.ctrl.fault,'')
+        self.assertIn('未检测到运动',self.ctrl.snapshot()['details']['motion_notice'])
+        await self.ctrl.command(dict(action='heartbeat',intent_id='a'))
+        await self.ctrl.stop()
+        self.assertEqual(self.ctrl.snapshot()['details']['motion_notice'],'')
+        await self.jog('next-without-recheck')
 
     async def test_live_lower_limit_rejects_down(self):
+        self.sim.physical=0
         with self.assertRaises(LabError):
             await self.ctrl.command(dict(action='down',intent_id='lower'))
 
@@ -243,14 +249,16 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         if not self.ctrl.trusted:
             await self.calibrate()
         await self.jog('after-pp-failure')
-        self.assertEqual(self.sim.regs[0x1003],3)
+        self.assertEqual(self.sim.regs[0x1003],1)  # JOG is independent of P10 mode
+        self.assertEqual(self.sim.regs[0x0D0B],17)
+        self.assertEqual(self.sim.regs[0x0D11],0)
 
     async def test_preflight_refuses_eeprom_and_wrong_di(self):
         self.sim.regs[0x0C0D]=1
         with self.assertRaises(LabError):
             await self.ctrl.arm()
         self.sim.regs[0x0C0D]=0
-        self.sim.regs[0x0307]=1
+        self.sim.regs[0x0308]=0
         with self.assertRaises(LabError):
             await self.ctrl.arm()
 

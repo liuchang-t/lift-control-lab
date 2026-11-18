@@ -13,7 +13,7 @@ async def compare():
     results={}
     with tempfile.TemporaryDirectory() as temp:
         for implementation in ('baseline','candidate'):
-            cfg=Config(implementation=implementation,state_file=str(Path(temp)/(implementation+'.json')),poll_s=.02,stop_timeout_s=.4,soft_lower_cm=0)
+            cfg=Config(mode="sim",implementation=implementation,state_file=str(Path(temp)/(implementation+'.json')),poll_s=.02,stop_timeout_s=.4,soft_lower_cm=0)
             svc=Service(cfg)
             ctl=svc.controller
             try:

@@ -20,7 +20,7 @@ async def until(predicate, timeout=5):
 class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.cfg=Config(state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,
+        self.cfg=Config(mode='sim', state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,
                         travel_cm=5,soft_upper_cm=4,max_move_pulse=1000000,
                         deadman_s=.3,home_timeout_s=1.5,home_start_timeout_s=.4,
                         stop_timeout_s=.4,control_latency_s=.1,limit_margin_cm=.05)
@@ -51,7 +51,7 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         return [(int.from_bytes(x[2:4],'big'),int.from_bytes(x[4:6],'big')) for x in frames if x[1] in (6,16)]
 
     async def test_unreferenced_normal_movement_is_rejected(self):
-        for command in ({'action':'up','intent_id':'unhomed'},{'action':'goto','target_cm':2}):
+        for command in ({'action':'goto','target_cm':2},):
             with self.assertRaises(LabError):
                 await self.ctrl.command(command)
         self.assertIsNone(self.sim.motion)
@@ -105,7 +105,7 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.ctrl.trusted)
         self.assertIsNone(self.sim.motion)
 
-    async def test_pp_rejects_outside_bounds_and_pv_stops_before_upper_limit(self):
+    async def test_pp_rejects_outside_bounds_but_jog_ignores_software_limit(self):
         await self.home()
         await self.retract()
         for target in (.9,4.1):
@@ -113,10 +113,10 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await self.ctrl.command({'action':'goto','target_cm':target})
         self.cfg.deadman_s=5
         await self.ctrl.command({'action':'up','intent_id':'boundary'})
-        await until(lambda:self.ctrl.mode is None,timeout=6)
-        height=self.ctrl.snapshot()['details']['height_cm']
-        self.assertLessEqual(height,self.cfg.soft_upper_cm)
-        self.assertFalse(self.ctrl.sample['upper_limit'])
+        await until(lambda:self.ctrl.snapshot()['details']['height_cm']>self.cfg.soft_upper_cm,timeout=4)
+        self.assertEqual(self.ctrl.mode,'pv')
+        await self.ctrl.stop()
+        self.assertIsNone(self.sim.motion)
 
     async def test_speed_settings_are_independent_and_restore_without_arming(self):
         await self.home()
@@ -124,9 +124,9 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.ctrl.command({'action':'set_speed','mode':'pp','speed_cm_s':.7})
         await self.ctrl.command({'action':'set_speed','mode':'pv','speed_cm_s':.35})
         await self.ctrl.command({'action':'up','intent_id':'speed'})
-        self.assertEqual(self.sim._i32(0x102A),10000)
+        self.assertEqual(self.sim.regs[0x4604],60)
         await self.ctrl.command({'action':'set_speed','mode':'pp','speed_cm_s':1.05})
-        self.assertEqual(self.sim._i32(0x102A),10000)
+        self.assertEqual(self.sim.regs[0x4604],60)
         await self.ctrl.stop()
         restarted=Service(self.cfg)
         self.assertEqual(restarted.controller.speeds,{'pp':1.05,'pv':.35})
@@ -138,7 +138,7 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.home()
         await self.retract()
         await self.ctrl.command({'action':'up','intent_id':'speed-failure'})
-        self.sim.inject('write_failure',0x102A)
+        self.sim.inject('write_failure',0x4604)
         with self.assertRaises((LabError,TimeoutError)):
             await self.ctrl.command({'action':'set_speed','mode':'pv','speed_cm_s':.35})
         await until(lambda:not self.ctrl.pending_stop)
@@ -185,7 +185,8 @@ class HomingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ctrl.sample['alarm_code'],0x952)
         await self.ctrl.command({'action':'reset_fault','confirm_reset':True})
         self.assertEqual(self.sim.regs[0x0B22],0)
-        self.assertFalse(self.ctrl.armed)
+        self.assertTrue(self.ctrl.armed)
+        self.assertIsNone(self.sim.motion)
 
     async def test_active_limit_cannot_be_cleared_to_bypass_switch(self):
         self.sim.inject('alarm',0x952)

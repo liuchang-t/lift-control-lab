@@ -24,12 +24,12 @@ class UnitArithmeticTests(unittest.TestCase):
                 command_units_per_revolution(*args)
         for value in (True,'0.35',float('inf'),float('nan'),0,-1):
             with self.assertRaises(ValueError):
-                Config(cm_per_rev=value).validate()
+                Config(mode='sim', cm_per_rev=value).validate()
 
 
 class UnitReadbackTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.cfg=Config()
+        self.cfg=Config(mode='sim')
         self.sim=Simulator(self.cfg,Trace())
         self.driver=Driver(self.cfg,self.sim)
 
@@ -91,7 +91,7 @@ class MechanicalConfigurationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
             with patch('lab.service.ROOT',root):
-                service=Service(Config(state_file=str(root/'zero.json')))
+                service=Service(Config(mode='sim', state_file=str(root/'zero.json')))
                 await service.start()
                 try:
                     await service.controller.arm()
@@ -117,7 +117,7 @@ class MechanicalConfigurationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
             with patch('lab.service.ROOT',root):
-                service=Service(Config(state_file=str(root/'zero.json')))
+                service=Service(Config(mode='sim', state_file=str(root/'zero.json')))
                 await service.start()
                 try:
                     speeds=dict(service.controller.speeds)

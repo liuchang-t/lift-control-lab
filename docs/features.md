@@ -1,95 +1,80 @@
 # 功能、接口与行为差异
 
-候选实现覆盖升降领域，不包含云台、视频或机器狗业务。冻结基线用于复现旧算法；候选 API、配置和网页有明确行为变化，不是原平台逐字节兼容服务。
+候选实现只覆盖升降杆，不包含云台、视频或机器狗业务。冻结原平台基线用于模拟对照；本工具的 API、配置和网页不承诺原平台逐字节兼容。
 
-## 功能
+## 功能边界
 
-| 功能 | 候选行为 |
+| 功能 | 当前行为 |
 |---|---|
-| 模拟/实机 | 默认模拟；页面选择模式后需明确点击连接，real另需确认；CLI直接real仍需--allow-real |
-| 连接/断开 | 保存目标不自动生效；显式连接无需重启，切换和断开遇本后端活动任务时先确认停止；纯监视直接关闭；停止失败保留旧保护任务 |
-| 检查 / 恢复 | 参数预检与故障后运行恢复检查，不是操作者权限授予，也不等同于回零 |
-| HOME | 本地人工确认，模式17寻找负限位释放沿，要求本次完成证据与静止后确认参考 |
-| 全收 | PP 到 soft_lower_cm，默认1cm，直接显示1cm |
-| 全升 | PP 到 soft_upper_cm，受单次位移限制 |
-| 定高 | target_cm 输入，可信参考和目标范围检查 |
-| 按住升降 | PV 独立速度，intent_id/heartbeat，松手、失焦、隐藏、超时停止 |
-| 限位保护 | PP目标检查；PV依据停止模型提前处理；物理DI方向拦截 |
-| 停止/软件急停 | 取消旧启动，停机待确认，失败后台重试；停止不受客户端独占限制 |
-| PP/PV调速 | 独立上下限与cm/s设置；只改当前运行模式寄存器，另一模式仅保存 |
-| 速度恢复 | 设备/模拟身份隔离、原子保存；不恢复使能或运动意图 |
-| 报警 | 手册字典、原始码、分类、人工建议及平台处置策略；未知码保守阻挡 |
-| 人工故障复位 | 本地、确认原因已处理、确认停止、一次复位并读回；不自动重启或恢复参考 |
-| 设备参数 | 读取P0A/P10软限位和HOME参数等，实际值与期望值分开 |
-| P0C-13 | 连接后只读检查，1明确警告，不自动修改 |
-| 共享客户端 | 私有客户端共享操作，不设独占、获取/释放、续期或租约超时停止；串行处理与停止优先保留 |
-| 条件与恢复 | 固定提示区显示缺失条件、最近拒绝原因和下一步；不会替代执行时的保护检查 |
-| 手动总线 | 页面支持自动CRC或完整RTU报文，03/06/10；确认写优先接管，停止/报警保护保留，原始运动不承诺软件限位 |
-| 寄存器监视 | 按当前监视目录；快速状态、分组扫描与空闲刷新分开，读回/写应答/过期分开 |
-| 动态参数 | 按风险分类监视外部变化，区分工具自写与未预期变化；公开读取策略与新鲜度 |
-| 日志/状态 | 原始RTU、命令、故障及状态变更；HTTP、SSE、可选MQTT |
+| 启动 | 默认真实设备且断开，不创建真实通信；显式保存的模拟选择仍可恢复并自动运行模拟器 |
+| 连接设置 | 页面保存模式、主机、端口、从站、超时；下一次显式连接生效，无需重启；真实连接需确认 |
+| 检查 / 恢复 | 设备条件预检及故障后恢复，不是权限获取，不自动运动或回零 |
+| 基础JOG | P0D-11=1/17/33/65，速度0x4604整数rpm；无回零/位置可信/软件高度范围门槛 |
+| 使能/失能 | 独立命令，不启动运动；命令应答与实际功率级状态分开 |
+| 连续点动 | 每次读取P0D-11，非1才使能；停止以正确应答完成，不等待静止，不循环失能/使能 |
+| 点动保护 | 实际DI限制方向；950/952单独不锁定；其他故障、松手、动作心跳和通信保护保留 |
+| 点动无运动 | 仅诊断，不锁定或自动停止；同时存在950时建议人工复位，952不作同等推断 |
+| PP与HOME | 仅模拟开放；实机旧强制DI路径暂禁用 |
+| 模拟定位 | 可信参考、目标范围和单次位移检查；允许从软件范围外返回范围内目标 |
+| 模拟回零 | 模式17，确认本次启动/完成及最终参考；全收默认参考上方1cm |
+| 速度与参数 | PP/JOG独立cm/s速度；统一换算，原子保存；重启不恢复运动或位置可信度 |
+| 报警 | 原码、手册解释、工具策略与处置建议；人工复位，不自动重启 |
+| 寄存器 | 快速保护采样、动态轮转、固定配置按需读取；硬件R/W属性与读/写应答分开 |
+| 手动485 | 自动CRC，03/06/10；确认写优先处理，不自动重试原始写入 |
+| 日志 | 20,000条缓存、暂停固定视图、清空和导出；重启清空内存记录 |
+| 私有客户端 | 共享后端，无独占租约；停止优先和旧动作取消机制保留 |
+
+当前交付参数为软件范围1–182cm、行程183.7cm、机械比例0.35921486cm/转。配置加载顺序为默认值、启动文件、页面参数保存、连接保存；后者覆盖前者。速度档案按设备身份保存，旧键 `pv` 对应 JOG。负载只展示原码：`load_raw`为uint16，`load_signed`为int16解释，`load_percent=null`、`load_scale_verified=false`。
 
 ## HTTP
 
-默认 <http://127.0.0.1:8765>，只监听本机。POST 要求 `X-Patrol-Client-Id`；跨站写拒绝。不应开放至公网。
+默认地址 <http://127.0.0.1:8765>。POST要求 `X-Patrol-Client-Id`，跨站写拒绝。标识用于关联请求，不是独占控制权。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/api/config` | 已脱敏配置 |
-| GET | `/api/connection` | 当前连接、保存目标及连接状态/错误 |
-| POST | `/api/connection/save` | 保存下一次连接目标，不自动连接；兼容POST `/api/connection` |
-| POST | `/api/connection/connect` | 应用目标并显式连接；real须confirm_real |
-| POST | `/api/connection/disconnect` | 本后端活动任务先确认停止；纯监视不发停止，关闭连接与采集 |
-| POST | `/api/config` | 静止时修改允许的参数并原子保存；使参考/允许状态失效 |
-| GET | `/api/status` 或 `/api/devices/lift_pole_1/lift/status` | 缓存状态及观测年龄 |
-| POST | `/api/arm` | `{hardware_confirmed:true}`，实机必须确认 |
-| POST | `/api/control` 或 `/api/devices/lift_pole_1/lift/control` | 升降命令 |
-| GET | `/api/devices/lift_pole_1/lease` | 旧客户端兼容状态；不代表独占权限 |
-| POST | `/api/devices/lift_pole_1/lease/{acquire,renew,release}` | 旧客户端兼容无操作，不续期、不抢占、不停止 |
-| GET | `/api/events` | SSE，`{status,lease,mqtt}` |
-| GET | `/api/logs` | 最近2000条事件/报文 |
-| POST | `/api/inject` | 仅开发测试的模拟故障接口；实机拒绝，页面不显示 |
-| GET | `/api/readiness` | 当前页面的条件、恢复步骤和最近拒绝原因 |
-| GET | `/api/registers` | 寄存器观测缓存 |
-| POST | `/api/registers/refresh` | 空闲刷新可读清单；运动/接管时返回缓存 |
-| GET | `/api/manual/status` | 手动接管与锁定状态 |
-| POST | `/api/manual/transaction` | 完整RTU报文；写需confirm_write，首次写优先接管 |
-| POST | `/api/manual/exit` | 确认停止并结束手动接管 |
+| GET / POST | `/api/config` | 脱敏配置 / 停机时保存允许的参数，撤销旧参考与检查状态 |
+| GET | `/api/connection` | 当前连接、保存目标、连接状态和错误 |
+| POST | `/api/connection/save` | 保存下一次目标；兼容POST `/api/connection` |
+| POST | `/api/connection/connect` | 显式连接；真实设备要求 `confirm_real` |
+| POST | `/api/connection/disconnect` | 本工具活动任务先停止；纯监视只断开 |
+| GET | `/api/status` | 缓存状态；兼容 `/api/devices/lift_pole_1/lift/status` |
+| POST | `/api/arm` | 检查 / 恢复，实机需 `hardware_confirmed:true` |
+| POST | `/api/control` | 升降命令；兼容 `/api/devices/lift_pole_1/lift/control` |
+| GET | `/api/readiness` | 缺失条件、当前诊断、恢复步骤与拒绝原因 |
+| GET | `/api/registers`、`/api/parameters` | 观测缓存/参数；断开时不隐式连接 |
+| POST | `/api/registers/refresh` | 空闲读回；运动和接管期间返回缓存 |
+| GET | `/api/logs` | 当前保留的事件与报文 |
+| POST | `/api/logs/tail`、`/api/logs/clear` | 增量读取 / 清空缓存 |
+| GET | `/api/events` | SSE状态更新 |
+| GET | `/api/manual/status` | 手动写接管状态 |
+| POST | `/api/manual/transaction` | 完整RTU帧；写需 `confirm_write` |
+| POST | `/api/manual/exit` | 停止并结束手动接管 |
+| POST | `/api/inject` | 仅模拟开发测试，实机拒绝、页面不展示 |
 
-命令示例：
+旧 `/api/devices/lift_pole_1/lease` 及其 `acquire/renew/release` 接口只提供兼容状态/无操作，不抢占、不续期、不因租约停止。
+
+常用控制请求：
 
 ```json
-{"action":"home","confirm_homing":true}
-{"action":"min"}
-{"action":"max"}
-{"action":"goto","target_cm":10}
-{"action":"set_speed","mode":"pp","speed_cm_s":1.05}
-{"action":"set_speed","mode":"pv","speed_cm_s":0.35}
 {"action":"up","intent_id":"每次按下的新UUID"}
-{"action":"heartbeat","intent_id":"同一次按下的UUID"}
-{"action":"stop","intent_id":"松开的UUID"}
+{"action":"heartbeat","intent_id":"本次按下的UUID"}
+{"action":"stop","intent_id":"本次松开的UUID"}
+{"action":"set_speed","mode":"pv","speed_cm_s":0.35}
+{"action":"set_speed","mode":"pp","speed_cm_s":1.05}
 {"action":"estop"}
 {"action":"reset_fault","confirm_reset":true}
+{"action":"home","confirm_homing":true}
+{"action":"goto","target_cm":10}
+{"action":"min"}
+{"action":"max"}
 ```
 
-`goto.height` 保留为百分比兼容输入，百分比相对于 `travel_cm`，仍须通过软件上下限检查；新客户端优先使用 `target_cm`。无模式的旧 `set_speed` 在候选实现中拒绝，避免含糊地修改两套速度。候选拒绝旧 `set_retracted_zero`，不能用任意位置人工设零代替HOME。
+HOME、goto、min/max目前仅模拟。心跳只延续已有动作，不能启动；迟到的旧意图停止不能打断新点动。无模式的旧 `set_speed` 拒绝；`goto.height` 仅为相对 `travel_cm` 的百分比兼容输入，仍验证软件范围。候选不接受旧 `set_retracted_zero`。
 
-心跳只延续已有运动，不能启动新运动。开始/停止使用相同 intent_id，使迟到启动在停止后仍被拒绝。HOME 和 PP 不以页面保活作为完成条件；仍受停止、故障和自身保护约束。客户端共享不取消PV点动的动作心跳和迟到启动拦截。
+状态包含 `online/control_mode/implementation/details`；details提供高度、速度、期望速度、报警建议、可信参考、参数观测和停止状态。`motion_notice/motion_advice` 是诊断，不等价于故障锁定。950无运动建议随运动恢复、动作结束或950消失清除；物理限位停止提示在有效新反馈确认脱离后清除，历史日志保留。
 
-状态包含 `online/control_mode/implementation/details`。details 提供高度、转速、速度设置与已下发速度、报警/建议/历史、HOME 状态、位置可信度、参数快照、软件范围、限位保护说明、观测年龄和停机待确认。控制响应包含 `ok/operation/payload.state/status`。
+## Bridge、MQTT与冻结基线
 
-连接目标包含`mode/host/port/slave_id/timeout`；选择或保存目标不会改变当前通信。断开后状态、寄存器及参数读取不得隐式连接，主动设备操作需先显式连接。
+Bridge默认关闭，启用后使用 `X-Patrol-Bridge-Token` 或 Bearer token，支持health、snapshot、lift/status、lift/lease、lift/control。不向Bridge开放HOME、人工故障复位、max/min和旧设零操作；不伪造升降以外设备数据。共享客户端不取消Bridge的启用和token边界。MQTT为可选状态发布，MQTT3.1.1 QoS0、无TLS。
 
-界面采用固定状态栏与内部滚动面板；开发用集中平台对照与故障注入不呈现在操作页面。手动总线规则和完整寄存器清单见[寄存器说明](registers.md)。
-
-## Bridge
-
-启用后使用 `X-Patrol-Bridge-Token` 或 `Authorization: Bearer ...`。支持 health、snapshot、lift/status、lift/lease 及 lift/control。不实施客户端独占租约。HOME、人工故障复位、max/min 和旧设零操作不向 Bridge 开放；既有Bridge启用开关与token校验保留，不因共享客户端而自动放宽网络边界。升降以外数据保持为空，不伪造其他设备。
-
-## 冻结基线
-
-只允许模拟。基线保留旧比例速度、人工零点和原控制缺陷，用于对照；不支持候选HOME/复位/独立速度。原 UI 代码作为证据保存但不运行。新工具网页及HTTP外壳不属于冻结原算法。
-
-## 观察边界
-
-驱动器软限位的两套参数关系、PV/JOG适用性、HOME例外和触限停止方式待实机验证，仅展示读取值。模拟器的机械/开关位置、回差和HOME结束过程是测试模型，不能作为现场事实。模拟器不证明惯性、自锁承载、停机距离或真实断网保护有效。
+冻结基线仅模拟，保留原比例速度、人工零点及已知缺陷；不支持候选HOME、复位和独立速度。原UI证据不运行。模拟模型不能证明实机惯性、开关响应、自锁承载、驱动器软限位或断网停机能力。实机PP/HOME边界与未验证事项见[验证说明](validation.md)。

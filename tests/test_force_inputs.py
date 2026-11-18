@@ -6,7 +6,7 @@ from lab.transport import Simulator, Trace
 
 class ForceInputTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.transport=Simulator(Config(),Trace())
+        self.transport=Simulator(Config(mode='sim'),Trace())
         self.driver=Driver(self.transport.config,self.transport)
 
     async def test_givens_are_read_independently_without_claiming_completion(self):
@@ -19,9 +19,11 @@ class ForceInputTests(unittest.IsolatedAsyncioTestCase):
         rows=self.transport.registers.snapshot(1)['registers']
         self.assertEqual(next(r for r in rows if r['address']==0x0D12)['source'],'read')
         await self.driver.disable()
-        self.assertEqual(self.driver.force_status()['given'],511)
+        self.assertEqual(self.driver.force_status()['given'],507)
+        self.assertEqual(self.transport.regs[0x0D0B],65)
+        self.assertFalse(self.transport.enabled)
         events=[x for x in self.transport.trace.items if x['kind']=='force_input_readback']
-        self.assertEqual([x['requested'] for x in events],[1,507,511])
+        self.assertEqual([x['requested'] for x in events],[1,507])
 
     async def test_readback_mismatch_prevents_start(self):
         original=self.driver.wire.read_registers

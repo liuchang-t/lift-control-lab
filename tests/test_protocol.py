@@ -26,7 +26,7 @@ class ProtocolTests(unittest.TestCase):
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_fragmented_rtu_over_tcp_and_write_echo(self):
-        cfg=Config()
+        cfg=Config(mode='sim')
         sim=Simulator(cfg,Trace())
         async def handle(reader,writer):
             try:
@@ -65,7 +65,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
         server=await asyncio.start_server(handle,'127.0.0.1',0)
-        cfg=Config(host='127.0.0.1',port=server.sockets[0].getsockname()[1],timeout=.05)
+        cfg=Config(mode='sim', host='127.0.0.1',port=server.sockets[0].getsockname()[1],timeout=.05)
         tr=TcpTransport(cfg,Trace())
         try:
             with self.assertRaises(asyncio.TimeoutError):

@@ -58,7 +58,7 @@ class FrameTests(unittest.TestCase):
 class ManualBusTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.service=Service(Config(state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,stop_timeout_s=.5))
+        self.service=Service(Config(mode='sim', state_file=str(Path(self.tmp.name)/'zero.json'),poll_s=.02,stop_timeout_s=.5))
         self.ctrl=self.service.controller
         self.sim=self.service.transport
         self.headers={'X-Patrol-Client-Id':'manual-test'}
@@ -189,7 +189,7 @@ class ManualBusTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_catalog_and_manual_cache_only(self):
         result=await self.service.refresh_registers()
         self.assertEqual(len(result['registers']),len(CATALOG))
-        self.assertTrue(all(r['value'] is not None for r in result['registers'] if r['address'] not in (0x0D01,0x0D08)))
+        self.assertTrue(all(r['value'] is not None for r in result['registers'] if r['address'] not in (0x0D01,0x0D08,0x0D0B)))
         await self.send(6,0x0D12,507)
         with patch.object(self.ctrl.driver.wire,'read_registers',side_effect=AssertionError('refresh must not issue reads')):
             result=await self.service.refresh_registers()

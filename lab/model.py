@@ -20,7 +20,7 @@ class LabError(Exception):
 
 @dataclass
 class Config:
-    mode: str = "sim"
+    mode: str = "real"
     implementation: str = "candidate"
     host: str = "10.21.31.15"
     port: int = 8899
@@ -184,14 +184,22 @@ class SpeedStore:
 
 
 def load_config(filename=None):
-    """Explicit startup file wins; otherwise restore locally saved configuration."""
-    path=Path(filename) if filename else ROOT/'.runtime/config.json'
-    if filename and not path.exists():
-        raise FileNotFoundError('指定启动配置不存在：'+str(path))
-    values=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-    connection=ROOT/'.runtime/connection.json'
-    if not filename and connection.exists():
-        values.update(json.loads(connection.read_text(encoding='utf-8')))
+    """Startup files seed defaults; persisted UI settings always take precedence."""
+    paths=[]
+    if filename:
+        path=Path(filename)
+        if not path.exists():
+            raise FileNotFoundError('指定启动配置不存在：'+str(path))
+        paths.append(path)
+    paths.extend((ROOT/'.runtime/config.json',ROOT/'.runtime/connection.json'))
+    values={}
+    for path in paths:
+        if not path.exists():
+            continue
+        saved=json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(saved,dict):
+            raise ValueError('配置必须是JSON对象：'+str(path))
+        values.update(saved)
     return Config(**values).validate()
 
 

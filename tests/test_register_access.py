@@ -10,7 +10,7 @@ class RegisterAccessTests(unittest.TestCase):
         rows={row[0]:row for row in CATALOG}
         for address in (0x0C0D,0x0C1A,0x0502,0x0507,0x0509,0x0202,0x0306,0x030B,0x0A28,0x0A29,0x0A2B,0x1010,0x1012,0x1014,0x1016,0x101B,0x101D,0x101F,0x1024,0x1026,0x1028):
             self.assertEqual(rows[address][4],'RW',rows[address][2])
-        self.assertEqual(sum(row[4]=='RW' for row in CATALOG),36)
+        self.assertEqual(sum(row[4]=='RW' for row in CATALOG),38)
 
     def test_trigger_readability_does_not_change_refresh_policy(self):
         rows={row[0]:row for row in CATALOG}

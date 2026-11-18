@@ -11,7 +11,7 @@ from lab.legacy import Legacy
 class BaselineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        self.cfg=Config(implementation='baseline',state_file=str(Path(self.tmp.name)/'zero.json'))
+        self.cfg=Config(mode='sim', implementation='baseline',state_file=str(Path(self.tmp.name)/'zero.json'))
         self.sim=Simulator(self.cfg,Trace())
         self.old=Legacy(self.cfg,self.sim,Trace())
         await self.old.adapter.refresh_status()

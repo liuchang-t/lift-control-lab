@@ -22,10 +22,10 @@ class TraceTests(unittest.TestCase):
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_save_is_deferred_and_explicit_file_wins(self):
+    async def test_save_is_deferred_and_survives_explicit_startup_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
-            service=Service(Config(state_file=str(root/'state.json')))
+            service=Service(Config(mode='sim', state_file=str(root/'state.json')))
             body=dict(host='192.168.10.20',port=8899,slave_id=2,timeout=.8)
             with patch('lab.service.ROOT',root),patch('lab.model.ROOT',root):
                 await service.request('POST','/api/connection',body,{'X-Patrol-Client-Id':'test'})
@@ -35,12 +35,12 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(load_config().mode,'sim')
                 explicit=root/'explicit.json'
                 explicit.write_text(json.dumps(dict(host='127.0.0.1')),encoding='utf-8')
-                self.assertEqual(load_config(str(explicit)).host,'127.0.0.1')
+                self.assertEqual(load_config(str(explicit)).host,body['host'])
                 observed=await service.request('GET','/api/connection')
                 self.assertEqual(observed['saved'],dict(body,mode='sim'))
 
     async def test_invalid_connection_and_unknown_mode_rejected(self):
-        service=Service(Config())
+        service=Service(Config(mode='sim'))
         headers={'X-Patrol-Client-Id':'test'}
         for body in [dict(host='http://bad',port=1,slave_id=1,timeout=.5),
                      dict(host='host',port=0,slave_id=1,timeout=.5),
@@ -49,7 +49,7 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
                 await service.request('POST','/api/connection',body,headers)
 
     async def test_log_endpoints_clear_without_resetting_cursor(self):
-        service=Service(Config())
+        service=Service(Config(mode='sim'))
         headers={'X-Patrol-Client-Id':'test'}
         service.trace.add('tx',frame='one')
         batch=await service.request('POST','/api/logs/tail',{'after':0},headers)

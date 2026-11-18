@@ -11,7 +11,7 @@ from lab.readiness import build_readiness
 class ReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.service = Service(Config(state_file=str(Path(self.tmp.name) / 'zero.json')))
+        self.service = Service(Config(mode='sim', state_file=str(Path(self.tmp.name) / 'zero.json')))
         # This fixture observes directly without starting Service lifecycle tasks.
         self.service.connected = True
         self.service.connection_state = 'connected'
@@ -192,7 +192,7 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         # Observe the stationary endpoint after the injected repositioning.
         await self.ctrl.observe()
         self.ctrl.trusted = True
-        self.assertFalse(self.view()['can_move'])
+        self.assertTrue(self.view()['can_move'])
         actions = self.actions()
         self.assertTrue(actions.get('max', {}).get('enabled', False))
         self.assertNotIn('min', actions)

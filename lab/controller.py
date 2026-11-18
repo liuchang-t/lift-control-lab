@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from collections import deque
 from .model import CalibrationStore, SpeedStore, LabError
 from .units import finite
-from .alarms import blocked, describe
+from .alarms import blocked, describe, jog_blocked
 from .driver import ParameterChanged
 
 
@@ -55,6 +54,8 @@ class Controller:
         self._closed = False
         self._observed_motion = False
         self.stop_reason = ''
+        self.stop_confirmation = None
+        self.jog_no_motion = False
 
     async def start(self):
         if self.config.release_enable_s:
@@ -62,7 +63,11 @@ class Controller:
         self._tasks = [asyncio.create_task(self._poll_loop()),asyncio.create_task(self._watchdog())]
 
     def _checkpoint(self, epoch):
-        if epoch != self.epoch or self.pending_stop or not self.armed:
+        if self.pending_stop:
+            raise MotionCancelled('停止命令尚未确认应答，请稍后重新按住')
+        if not self.armed:
+            raise MotionCancelled(self.fault or '请先点击检查 / 恢复')
+        if epoch != self.epoch:
             raise MotionCancelled('启动已被停止或新控制意图取消')
 
     def _retire_intent(self):
@@ -71,8 +76,12 @@ class Controller:
         self.intent = None
 
     def _stop_intent(self, emergency=False, reason=''):
+        self.jog_no_motion=False
         if reason:
             self.stop_reason=reason
+        if self.pending_stop and (not emergency or self.emergency):
+            return
+        self.stop_confirmation=None
         self.epoch += 1
         self._retire_intent()
         self.pending_stop = True
@@ -115,7 +124,7 @@ class Controller:
                     self._fault('驱动连接周期变化，必须重新回原点',True)
             raw = data['position_feedback']
             self._observed_motion=abs(data['speed_rpm'])>1 or (self.last_raw is not None and abs(raw-self.last_raw)>2)
-            if self.trusted and self.mode and self.last_raw is not None:
+            if self.trusted and self.mode not in (None, 'pv') and self.last_raw is not None:
                 elapsed = max(0,now-self.last_raw_at)
                 allowed = self.config.pulse(2)+max(self.config.max_pp_speed,self.config.max_pv_speed)*elapsed*1.5
                 if abs(raw-self.last_raw) > allowed:
@@ -151,8 +160,6 @@ class Controller:
             if self.config.mode=='real':
                 if not hardware_confirmed:
                     raise LabError('请先核实独立硬急停、物理限位、机械自锁、单位与方向')
-                if not self.config.motion_profile_verified:
-                    raise LabError('真实设备的停止距离、通信延迟和HOME配置尚未确认；请完成现场验收并设置 motion_profile_verified')
             report=await self.driver.preflight()
             if report.get('reference_changed'):
                 self.trusted=False
@@ -170,21 +177,26 @@ class Controller:
 
     async def _confirm_stop(self):
         async with self._stop_lock:
+            if not self.pending_stop:
+                return True
             issued=self.epoch
             await self.driver.stop(self.emergency)
-            first=await self.observe()
-            await asyncio.sleep(.06)
-            second=await self.observe()
+            ack_only=self.driver.jog_context
+            if not ack_only:
+                first=await self.observe()
+                await asyncio.sleep(.06)
+                second=await self.observe()
+                if abs(first['speed_rpm'])>1 or abs(second['speed_rpm'])>1 or abs(first['position_feedback']-second['position_feedback'])>20:
+                    return False
             if issued!=self.epoch:
                 return False
-            if abs(first['speed_rpm'])>1 or abs(second['speed_rpm'])>1 or abs(first['position_feedback']-second['position_feedback'])>20:
-                return False
+            self.stop_confirmation='ack' if ack_only else 'feedback'
             self.pending_stop=False
             self.mode=self.direction=self.target_cm=None
             self.applied_speed=0
             self.stop_at=time.monotonic()
             self.state='FAULT' if self.fault else ('IDLE' if self.armed else 'DISARMED')
-            self.trace.add('stop_confirmed')
+            self.trace.add('stop_acknowledged' if ack_only else 'stop_confirmed')
             return True
 
     async def stop(self, emergency=False):
@@ -208,6 +220,8 @@ class Controller:
         if command.get('confirm_reset') is not True:
             raise LabError('请先确认已按建议排查原因；复位不会恢复运动',400)
         async with self._sequence:
+            # Clearing only a limit warning must not add a recheck requirement.
+            was_ready = self.armed and not self.emergency and not self.fault
             # Retire all old starts before the only permitted reset write.
             self.armed=False
             await self.stop()
@@ -217,6 +231,9 @@ class Controller:
             if not alarm['reset_allowed']:
                 raise LabError(alarm['text']+' 不允许通用复位；'+alarm['advice'])
             if alarm['code'] in (0x950,0x952) and (data['upper_limit'] or data['lower_limit']):
+                self.armed=was_ready
+                if was_ready:
+                    self.state='IDLE'
                 raise LabError('物理限位仍有效，必须先按允许方向脱离，不能用复位绕过限位')
             def checkpoint():
                 if issued!=self.epoch or self.pending_stop:
@@ -230,8 +247,13 @@ class Controller:
                 checkpoint()
                 if data['alarm_code']:
                     raise LabError('复位后报警仍存在：'+data['alarm_text'])
-                self.fault='驱动报警已复位；仍需重新检查并允许控制'+('，必须回原点' if not self.trusted else '')
-                self.state='DISARMED'
+                if alarm['code'] in (0x950,0x952) and was_ready:
+                    self.armed=True
+                    self.fault=''
+                    self.state='IDLE'
+                else:
+                    self.fault='驱动报警已复位；仍需重新检查并允许控制'+('，必须回原点' if not self.trusted else '')
+                    self.state='DISARMED'
                 return self.snapshot()
             except MotionCancelled:
                 raise
@@ -240,17 +262,9 @@ class Controller:
                 raise LabError(self.fault,503)
 
     def _speed_cap(self, mode):
+        if mode == 'pv':
+            return self.config.max_pv_speed
         return min(getattr(self.config,'max_'+mode+'_speed'),self.driver.parameters.get('max_velocity',0))
-
-    def _pv_speed(self, requested, data, direction):
-        height=self.config.cm(data['position_feedback']-self.zero)
-        distance=(self.config.soft_upper_cm-height if direction=='up' else height-self.config.soft_lower_cm)
-        usable=max(0,distance-self.config.limit_margin_cm)
-        a,t=self.config.verified_deceleration_cm_s2,self.config.control_latency_s
-        allowed=max(0,-a*t+math.sqrt((a*t)**2+2*a*usable))
-        # Floor at the wire boundary: never round above a protection speed cap.
-        capped=min(requested,max(0,math.floor(allowed/self.config.cm_per_rev*self.config.pulses_per_rev)))
-        return capped if capped>=self.config.min_pv_speed else 0
 
     async def _set_speed(self, command, issued):
         mode=command.get('mode')
@@ -263,6 +277,8 @@ class Controller:
             raise LabError(str(exc),400)
         if self.storage_error:
             raise LabError(self.storage_error)
+        if mode=='pv' and pr:
+            self.config.units.jog_rpm(value)
         if pr>self._speed_cap(mode):
             raise LabError('速度超过驱动器读回的最大速度限制')
         if value==0 and self.mode==mode:
@@ -279,10 +295,10 @@ class Controller:
             try:
                 data=await self.observe()
                 self._checkpoint(issued)
-                reason=blocked(data,self.direction)
+                reason=jog_blocked(data,self.direction) if self.mode=='pv' else blocked(data,self.direction)
                 if reason:
                     raise LabError(reason)
-                applied=self._pv_speed(pr,data,self.direction) if mode=='pv' else pr
+                applied=pr
                 if not applied:
                     return await self.stop()
                 await self.driver.speed(mode,applied)
@@ -360,25 +376,19 @@ class Controller:
             await self._wait_for_stop()
             checkpoint()
             try:
-                mapping=await self.driver.wire.read_registers(0x0306,2)
-                checkpoint()
-                if mapping!=[1,0]:
-                    raise LabError('DI3必须为S-ON、低电平有效，未修改强制给定')
                 data=await self.observe()
                 checkpoint()
-                if enabled and (self.emergency or data['alarm_raw']):
+                if enabled and (self.emergency or data['alarm_code'] not in (0,0x950,0x952)):
                     raise LabError('存在报警或软件急停，不能独立使能')
-                await self.driver.wire.write_register(0x0D08,0)
-                checkpoint()
-                # Establish OFF before selecting forced DI, so an old ON given
-                # cannot become effective when forced DI is selected.
-                await self.driver.write_force_input(0x0D12,511)
-                checkpoint()
-                await self.driver.write_force_input(0x0D11,1)
-                checkpoint()
                 if enabled:
-                    await self.driver.write_force_input(0x0D12,507)
+                    await self.driver.prepare_jog(checkpoint)
+                    await self.driver.jog_command(1,checkpoint)
                     checkpoint()
+                else:
+                    await self.driver.jog_command(65,checkpoint)
+                    checkpoint()
+                self.driver.jog_context=True
+                self.driver.jog_running=False
                 self.armed=False
                 self.state='FAULT' if self.fault else 'DISARMED'
                 self.trace.add('servo_given',enabled=enabled,completion_confirmed=False)
@@ -396,7 +406,12 @@ class Controller:
             return await self.set_servo_given(action=='servo_enable')
         if action in ('stop','estop'):
             cancelled=command.get('intent_id')
-            if isinstance(cancelled,str) and cancelled:
+            if isinstance(cancelled,str) and cancelled and action=='stop':
+                if cancelled in self.closed or (self.intent and cancelled!=self.intent):
+                    if cancelled not in self.closed:
+                        self.closed.append(cancelled)
+                    self.trace.add('obsolete_stop_ignored',intent=cancelled)
+                    return self.snapshot()
                 self.closed.append(cancelled)
             return await self.stop(action=='estop')
         if action=='reset_fault':
@@ -419,7 +434,7 @@ class Controller:
                 raise LabError('未知升降动作',400)
             if self.mode=='home':
                 raise LabError('回零进行中，普通运动被禁止；可执行停止')
-            if not self.trusted:
+            if not self.trusted and action not in ('up','down'):
                 raise LabError('位置参考未可信，请先完成模式17回原点')
             intent=command.get('intent_id')
             if action in ('up','down'):
@@ -431,14 +446,15 @@ class Controller:
                     self.last_heartbeat=time.monotonic()
                     return self.snapshot()
             if self.mode:
-                self._retire_intent()
+                self._stop_intent()
+                issued=self.epoch
                 if not await self._confirm_stop():
                     self._fault('切换动作前未确认停止')
                     raise LabError('切换动作前未确认停止')
                 self._checkpoint(issued)
             data=await self.observe()
             self._checkpoint(issued)
-            if not self.trusted:
+            if not self.trusted and action not in ('up','down'):
                 raise LabError('新反馈使位置参考失效，请重新回原点')
             current=self.config.cm(data['position_feedback']-self.zero)
             mode='pv' if action in ('up','down') else 'pp'
@@ -467,27 +483,27 @@ class Controller:
                 direction='up' if delta>0 else 'down'
             else:
                 direction=action
-            reason=blocked(data,direction)
+            reason=jog_blocked(data,direction) if mode=='pv' else blocked(data,direction)
             if reason:
                 raise LabError(reason)
-            # HOME can end below the normal working range. Only explicit PP min
-            # may return from that known reference; arbitrary PV is not allowed.
+            # A trusted reference permits PP from outside to any in-range target.
+            # Explicit endpoint recovery retains its existing creep speed.
             outside=current < self.config.soft_lower_cm-.001 or current > self.config.soft_upper_cm+.001
             recovering=outside and ((action=='min' and current<self.config.soft_lower_cm) or (action=='max' and current>self.config.soft_upper_cm))
-            if outside and not recovering:
-                raise LabError('当前位置在软件范围外，请用全收/全升向最近工作端点返回')
-            if not outside and ((current>=self.config.soft_upper_cm and direction=='up') or (current<=self.config.soft_lower_cm and direction=='down')):
+            if mode=='pp' and not outside and ((current>=self.config.soft_upper_cm and direction=='up') or (current<=self.config.soft_lower_cm and direction=='down')):
                 raise LabError('软件行程边界禁止该方向')
             speed=self.config.speed_pr(self.speeds[mode],mode)
             if speed>self._speed_cap(mode):
                 raise LabError('期望速度超过驱动器最大速度限制')
-            if mode=='pv':
-                speed=self._pv_speed(speed,data,direction)
+            if mode=='pv' and speed:
+                self.config.units.jog_rpm(self.speeds['pv'])
             if not speed:
                 raise LabError('速度为0或剩余距离不足以安全点动，不启动运动')
             if recovering:
                 speed=min(speed,self.driver.parameters['home_creep_speed'])
             self.state='STARTING'
+            self.stop_confirmation=None
+            self.jog_no_motion=False
             self.stop_reason=''
             self.mode,self.direction,self.target_cm,self.intent=mode,direction,cm,intent
             self.last_heartbeat=self.started=self.last_motion=time.monotonic()
@@ -555,9 +571,21 @@ class Controller:
             self.trace.add('home_confirmed',reference_pulse=self.zero,final_raw=raw)
 
     async def _monitor_motion(self,data):
-        reason=blocked(data,self.direction)
+        reason=jog_blocked(data,self.direction) if self.mode=='pv' else blocked(data,self.direction)
         if reason:
-            self._fault(reason,data['alarm']['reference_lost'])
+            if self.mode=='pv' and reason=='物理限位禁止该方向':
+                self._stop_intent(reason=reason)
+            else:
+                self._fault(reason,data['alarm']['reference_lost'])
+            return
+        if self.mode=='pv':
+            if self.driver.force_status()['selection'] != 0:
+                self._fault('强制DI已改变，物理限位不可依赖')
+                return
+            no_motion=self._stalled(data,time.monotonic())
+            if no_motion!=self.jog_no_motion:
+                self.trace.add('jog_motion_observation',motion_detected=not no_motion)
+            self.jog_no_motion=no_motion
             return
         height=self.config.cm(data['position_feedback']-self.zero)
         lower,upper=self.config.soft_lower_cm,self.config.soft_upper_cm
@@ -568,25 +596,6 @@ class Controller:
             if abs(height-self.target_cm)<=self.config.cm(20) and abs(data['speed_rpm'])<=1:
                 self._stop_intent()
                 return
-        elif self.mode=='pv':
-            remaining=upper-height if self.direction=='up' else height-lower
-            actual=max(abs(self.config.units.rpm_to_cm_s(data['speed_rpm'])),self.config.cm(self.applied_speed))
-            if remaining<=self.config.stopping_distance(actual):
-                self._stop_intent()
-                return
-            requested=self.config.speed_pr(self.speeds['pv'],'pv')
-            safe=self._pv_speed(min(requested,self._speed_cap('pv')),data,self.direction)
-            if not safe:
-                self._stop_intent()
-                return
-            if safe<self.applied_speed:
-                issued=self.epoch
-                async with self._sequence:
-                    self._checkpoint(issued)
-                    if self.mode=='pv' and self.state=='MOVING':
-                        await self.driver.speed('pv',safe)
-                        self._checkpoint(issued)
-                        self.applied_speed=safe
         if self._stalled(data,time.monotonic()):
             self._fault('启动无运动或堵转，禁止保活重启')
 
@@ -621,9 +630,14 @@ class Controller:
                         issued=self.epoch
                         if self.mode and self.state in ('MOVING','HOMING'):
                             await self.driver.check_active_parameters(self.mode,lambda:self._checkpoint(issued))
+                        if self.mode=='pv' and self.state=='MOVING':
+                            if time.monotonic()-self.last_heartbeat >= self.config.deadman_s:
+                                self._stop_intent(reason='点动保活超时')
+                            else:
+                                await self.driver.renew_jog(self.direction,lambda:self._checkpoint(issued))
                         if issued==self.epoch and not self.pending_stop:
-                            await self.driver.monitor_parameter_turn(compare=bool(self.driver.expected_words))
-                        if self.mode and self.state in ('MOVING','HOMING'):
+                            await self.driver.monitor_parameter_turn(compare=bool(self.driver.expected_words) and self.mode!='pv')
+                        if self.mode and self.mode!='pv' and self.state in ('MOVING','HOMING'):
                             self.driver.require_monitor_fresh()
             except asyncio.CancelledError:
                 raise
@@ -658,6 +672,12 @@ class Controller:
         data['eeprom_check']=self.driver.eeprom_status()
         data['force_inputs']=self.driver.force_status()
         data['stop_reason']=self.stop_reason
+        data['stop_confirmation']=self.stop_confirmation
+        data['motion_notice']='命令已应答，未检测到运动' if self.mode=='pv' and self.state=='MOVING' and self.jog_no_motion else ''
+        data['motion_advice']=''
+        if data['motion_notice'] and data.get('alarm_code') == 0x950:
+            data['motion_notice']+='（Er.950）'
+            data['motion_advice']='当前存在Er.950，可能是驱动器内部仍在阻止运动。请先松开点动，待停止命令应答后点击“人工故障复位”，再手动点动。工具不会自动复位。'
         data['unit_verification']=self.driver.unit_status()
         data['parameter_monitor']=self.driver.monitor_status()
         data['observed_motion']=self._observed_motion
@@ -675,7 +695,7 @@ class Controller:
                 rpm=self.config.units.rpm(pr),ratio=pr/getattr(self.config,'max_'+mode+'_speed'))
         params=dict(self.driver.parameters)
         params['stale']=params.get('connection_epoch')!=self.driver.transport.epoch or not fresh
-        data.update(state=self.state,motion=('homing' if self.state=='HOMING' else self.direction if self.state=='MOVING' else 'unknown' if self.pending_stop else 'stopped'),
+        data.update(state=self.state,motion=('homing' if self.state=='HOMING' else self.direction if self.state=='MOVING' else 'unknown' if self.pending_stop else 'stop_acknowledged' if self.stop_confirmation=='ack' else 'stopped'),
             height_cm=height,total_height_cm=None if height is None else self.config.base_cm+height,
             height=None if height is None else height/self.config.travel_cm*100,target_cm=self.target_cm,
             target_height=None if self.target_cm is None else self.target_cm/self.config.travel_cm*100,
@@ -685,7 +705,7 @@ class Controller:
             travel_height_cm=self.config.travel_cm,base_height_cm=self.config.base_cm,
             soft_lower_cm=self.config.soft_lower_cm,soft_upper_cm=self.config.soft_upper_cm,
             home_status=self.home_status,parameters=params,alarm_history=list(self.alarms),
-            limit_protection=dict(host='目标校验、方向拦截、PV提前限速/停止',
+            limit_protection=dict(host='PP目标校验；基础JOG仅按物理限位方向拦截，不依赖软件高度',
                 driver='待实机验证：不假定P0A/P10软限位覆盖PV/JOG或HOME；仅只读观察',
                 motion_profile_verified=self.config.motion_profile_verified,mechanical='无电机抱闸；传动自锁，机械端点非日常停止方式'),
             limits={'min':bool(self.trusted and height is not None and height<=self.config.soft_lower_cm),

@@ -153,14 +153,13 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(actions.get('reset_fault', {}).get('enabled', False))
 
 
-    async def test_reset_success_requires_arm_without_unnecessarily_rehoming(self):
+    async def test_idle_reset_preserves_readiness_and_reference(self):
         await self.prepared()
         self.sim.inject('alarm', 0x620)
         await self.ctrl.observe()
         await self.ctrl.reset_fault({'confirm_reset': True})
         self.assertTrue(self.ctrl.trusted)
-        self.assertFalse(self.view()['can_move'])
-        self.assertTrue(self.actions().get('arm', {}).get('enabled', False))
+        self.assertTrue(self.view()['can_move'])
         self.assertNotIn('home', self.actions())
 
     async def test_manual_takeover_explains_exit_and_does_not_offer_normal_start(self):

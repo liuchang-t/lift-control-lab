@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import asdict
 from pathlib import Path
-from .controller import Controller
+from .controller import Controller, DIRECT_ACTIONS
 from .driver import Driver
 from .legacy import Legacy
 from .model import Config, LabError, atomic_json_write, ROOT
@@ -302,7 +302,8 @@ class Service:
             if path=='/api/connection/disconnect':
                 return await self.disconnect(client)
             is_stop=suffix in ('/lift/control','/api/control') and body.get('action') in ('stop','estop')
-            self._require_connected(allow_stop=is_stop or path in ('/api/manual/transaction','/api/registers/refresh'))
+            is_direct=suffix in ('/lift/control','/api/control') and body.get('action') in DIRECT_ACTIONS
+            self._require_connected(allow_stop=is_stop or is_direct or path in ('/api/manual/transaction','/api/registers/refresh'))
             if path=='/api/manual/transaction':
                 return await self.manual_transaction(client,body)
             if path=='/api/manual/exit':
@@ -350,6 +351,13 @@ class Service:
                     if bridge:
                         await self.acquire(client,role,'central')
                     self._require_owner(client)
+                if action in DIRECT_ACTIONS and self.config.implementation=='candidate':
+                    self._require_manual_connection()
+                    # Explicit register buttons replace old raw/automatic intent.
+                    self._clear_manual()
+                    if self.connection_state=='stop_pending':
+                        self.connection_state='connected'
+                        self.connection_error=''
                 if self.manual_active:
                     if action not in ('stop','estop'):
                         self.last_rejection=dict(message='手动接管中；点击允许控制结束手动并重新检查，然后重新回零',action=action,at=time.time())

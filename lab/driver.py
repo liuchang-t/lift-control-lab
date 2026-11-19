@@ -665,43 +665,6 @@ class Driver:
         self.jog_enable_epoch=None
         self.jog_running=False
 
-    async def reset_fault(self,checkpoint,expected_raw,home_cleanup_completed=False):
-        checkpoint()
-        home_failure=describe(expected_raw)['code']==0x601
-        if home_failure and not home_cleanup_completed:
-            # After restart/readback=0, the controller cannot infer S-ON release.
-            await self.release_home_enable(checkpoint,cancel=True,force=True)
-        elif not home_failure:
-            await self.disable(checkpoint)
-        checkpoint()
-        sample=await self.sample()
-        checkpoint()
-        if home_failure and sample['alarm_raw']==0:
-            self.transport.trace.add('home_fault_cleared_by_manual_disable',reset_command_sent=False)
-            return
-        if sample['alarm_raw']!=expected_raw:
-            self.transport.trace.add('reset_alarm_changed',previous=expected_raw,current=sample['alarm_raw'])
-        await self.wire.write_register(0x0D01,1)
-        checkpoint()
-        if home_failure:
-            # Reset is a trigger: verify the alarm result, not the command echo.
-            deadline=time.monotonic()+self.config.stop_timeout_s
-            while True:
-                checkpoint()
-                remaining=deadline-time.monotonic()
-                if remaining<=0:
-                    raise LabError('601复位后报警未清除，未恢复控制；请检查驱动状态')
-                try:
-                    words=await asyncio.wait_for(self._read_words(0x0B22,1),remaining)
-                except asyncio.TimeoutError as exc:
-                    raise LabError('601复位后读取报警超时，清除结果未知') from exc
-                checkpoint()
-                if words[0]==0:
-                    return
-                if words[0]!=expected_raw:
-                    raise LabError('601复位后出现其他报警，未恢复控制：'+describe(words[0])['text'])
-                await asyncio.sleep(min(.05,self.config.poll_s,max(0,deadline-time.monotonic())))
-
     async def stop(self, emergency=False, checkpoint=lambda:None, global_stop=False):
         errors=[]
         # Global buttons always send the documented bus stop, even after JOG.

@@ -97,7 +97,7 @@ def build_readiness(service, client):
     elif pending:
         home_stopping = getattr(ctrl, 'mode', None) == 'home' or getattr(ctrl.driver, 'home_enable_owned', False)
         summary = '回零停止处理中：等待静止反馈与撤销使能给定' if home_stopping else '停止命令尚未确认应答，请稍后重新按住'
-        steps.append('HOME停止不仅确认命令应答，还需核验实际转速/位置静止，再清除控制字并撤销P03-07的S-ON给定；完成前不能重新启动。通信中断时使用现场停机措施。' if home_stopping else '等待停止命令应答；应答不代表实际静止，实际运动以反馈为准。通信中断时使用现场停机措施。')
+        steps.append('HOME停止不仅确认命令应答，还需核验实际转速/位置静止，再清除控制字并撤销P03-07的S-ON给定；完成前不能重新启动。通信中断时使用现场停机措施。' if home_stopping else '等待停止命令应答；当前转速和位置见状态栏。')
         action('stop', '再次请求停止')
     elif not online:
         summary = '反馈离线或已过期'
@@ -127,12 +127,11 @@ def build_readiness(service, client):
             steps.append('JOG速度为0，点动前设置非零JOG速度并保存。')
         if code:
             steps.append('%s %s：%s' % (alarm.get('text', ''), alarm.get('name', ''), alarm.get('advice', '')))
-            action('reset_fault', '人工故障复位', idle)
+            action('reset_fault', '故障复位', service.connected)
             if directional:
                 steps.append('仅按物理限位允许的反方向点动脱离；不要求回零，不按950/952文字猜测方向。')
             else:
-                steps.append('限位警告保留显示；当前两侧均未触发，可双向点动，无需因警告重新检查；人工故障复位可选。' if code in (0x950,0x952) else ('点击“人工故障复位”，完成失能、清警及检查；通过后可再次点击“一键回零”，不会自动运动。' if code==0x601 else '可按需点击“人工故障复位”，实际是否清除以读回为准。'))
-            steps.append('报警不单独阻止操作；由操作者判断，驱动器决定是否接受。人工复位不保证能清除。')
+                steps.append('限位警告保留显示；当前两侧均未触发，可双向点动，无需因警告重新检查；故障复位可选。' if code in (0x950,0x952) else ('先失能，再点击“故障复位”；读回报警确认结果。' if code==0x601 else '可按需点击“故障复位”，实际是否清除以读回为准。'))
         if not armed and jog_alarm_ok and eeprom_ok and valid_di and storage_ok:
             steps.append('点击“检查 / 恢复”，解除软件锁定并核对驱动条件。')
             action('arm', '检查 / 恢复', idle)

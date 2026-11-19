@@ -13,6 +13,9 @@ class MotionCancelled(LabError):
     pass
 
 
+DIRECT_ACTIONS = {'reset_fault', 'servo_p03_enable', 'servo_p03_disable'}
+
+
 class Controller:
     def __init__(self, config, driver, trace):
         self.config, self.driver, self.trace = config, driver, trace
@@ -60,6 +63,7 @@ class Controller:
         self.stop_reason = ''
         self.stop_confirmation = None
         self.jog_no_motion = False
+        self.operator_result = None
 
     async def start(self):
         if self.config.release_enable_s:
@@ -258,7 +262,7 @@ class Controller:
                     raise
             if defer_home_fault:
                 self.armed=self.trusted=False
-                self.fault='Er.601 回原点失败；已确认静止，保留故障，请点击人工故障复位执行失能清警'+('；软件急停仍锁存' if self.emergency else '')
+                self.fault='Er.601 回原点失败；已确认静止。先失能，再点击故障复位'+('；软件急停仍锁存' if self.emergency else '')
                 self.trace.add('home_fault_cleanup_deferred',code=0x601,automatic_reset=False)
             self.stop_confirmation='ack' if ack_only else 'feedback'
             self.pending_stop=False
@@ -289,73 +293,70 @@ class Controller:
             await asyncio.sleep(.05)
         raise LabError('停止尚未确认，后台仍重试；请现场使用独立硬急停',503)
 
-    async def reset_fault(self, command):
-        if command.get('confirm_reset') is not True:
-            raise LabError('请先确认已按建议排查原因；复位不会恢复运动',400)
-        async with self._sequence:
-            # Clearing only a limit warning must not add a recheck requirement.
-            was_ready = self.armed and not self.emergency and not self.fault
-            # Retire all old starts before the only permitted reset write.
-            self.armed=False
-            cleanup_before=self.driver.home_cleanup_serial
-            await self.stop()
-            cleanup_completed=self.driver.home_cleanup_serial!=cleanup_before
-            issued=self.epoch
-            data=await self.observe()
-            alarm=data['alarm']
-            def checkpoint():
-                if issued!=self.epoch or self.pending_stop:
-                    raise MotionCancelled('故障复位被停止/连接变化取消')
-            reset_confirmed=False
-            try:
-                await self.driver.reset_fault(checkpoint,alarm['raw_code'],home_cleanup_completed=cleanup_completed)
-                data=await self.observe()
+    async def operator_write(self, action, address, value, read_address):
+        # A button is an explicit command, not an automatic recovery program.
+        # Retire queued starts/heartbeats before waiting for their sequence lock.
+        was_armed=self.armed
+        was_trusted=self.trusted
+        was_home=self.mode=='home'
+        was_active=bool(self.mode or self.pending_stop or getattr(self,'manual_active',False))
+        previous_home=self.home_status
+        previous_fault=self.fault
+        self.take_manual_control()
+        issued=self.epoch
+        connection=self.driver.transport.epoch
+        result=dict(action=action,address=address,value=value,write_ack=False,
+                    read_address=read_address,read_value=None,read_error='',at=time.time())
+        self.operator_result=result
+        def checkpoint():
+            if issued!=self.epoch or connection!=self.driver.transport.epoch:
+                raise MotionCancelled('人工命令已被后续操作或连接变化取消')
+        try:
+            async with self._sequence:
                 checkpoint()
-                self.trace.add('manual_reset',previous_alarm=alarm['raw_hex'],remaining=data['alarm']['raw_hex'])
-                if data['alarm_code']:
-                    raise LabError('复位后报警仍存在：'+data['alarm_text'])
-                reset_confirmed=True
-                await self.driver.read_parameters()
+                await self.driver.wire.write_register(address,value)
                 checkpoint()
-                if alarm['code']==0x601:
-                    self.trusted=False
-                    self.home_status='not_homed'
-                    self.home_phase='idle'
-                    report=await self.driver.preflight()
+                result['write_ack']=True
+                try:
+                    words=await self.driver._read_words(read_address,1)
                     checkpoint()
-                    await self.observe()
-                    checkpoint()
-                    failures=list(report['failures'])
-                    if self.storage_error:
-                        failures.append(self.storage_error)
-                    for mode in ('pp','pv'):
-                        self.config.speed_pr(self.speeds[mode],mode)
-                    if self.emergency:
-                        failures.append('软件急停尚未解除')
-                    if self.sample['alarm_code']:
-                        failures.append('驱动报警仍存在：'+self.sample['alarm_text'])
-                    if failures:
-                        self.fault='601已清除；'+ '；'.join(failures)
-                        self.state='DISARMED'
+                    result['read_value']=words[0]
+                    if action=='reset_fault':
+                        alarm=describe(words[0])
+                        result['alarm']=alarm
+                        result['cleared']=words[0]==0
+                        self.sample.update(alarm=alarm,alarm_raw=words[0],alarm_code=alarm['code'],alarm_text=alarm['text'])
+                        if alarm['reference_lost']:
+                            was_trusted=False
                     else:
-                        self.armed=True
-                        self.fault=''
-                        self.state='IDLE'
-                        self.trace.add('home_recovery_ready',automatic_motion=False,position_trusted=False)
-                elif alarm['code'] in (0x950,0x952) and was_ready:
-                    self.armed=True
-                    self.fault=''
-                    self.state='IDLE'
-                else:
-                    self.fault='驱动报警已复位；仍需重新检查并允许控制'+('，必须回原点' if not self.trusted else '')
-                    self.state='DISARMED'
-                return self.snapshot()
-            except MotionCancelled:
-                raise
-            except Exception as exc:
-                prefix='601已清除，但恢复检查未通过：' if reset_confirmed and alarm['code']==0x601 else '故障复位未确认：'
-                self._fault(prefix+str(exc),True)
-                raise LabError(self.fault,503)
+                        result['matched']=words[0]==value
+                        self.sample['di3_logic']=words[0]
+                except MotionCancelled:
+                    raise
+                except Exception as exc:
+                    result['read_error']=str(exc) or type(exc).__name__
+                self.trace.add('operator_write_result',result=dict(result))
+        except MotionCancelled:
+            raise
+        except Exception as exc:
+            result['write_error']=str(exc) or type(exc).__name__
+            self.trace.add('operator_write_result',result=dict(result))
+            raise LabError('写应答未确认：'+result['write_error'],503)
+        finally:
+            if issued==self.epoch:
+                self.manual_active=False
+                self.manual_failed=False
+                self.armed=was_armed and not was_active and not self.emergency
+                self.trusted=was_trusted and not was_home
+                self.home_status=previous_home if not was_home else 'cancelled'
+                if was_home:
+                    self.home_phase='idle'
+                self.fault=previous_fault if self.emergency else ''
+                self.state='IDLE' if self.armed else 'DISARMED'
+        return self.snapshot()
+
+    async def reset_fault(self, command):
+        return await self.operator_write('reset_fault',0x0D01,1,0x0B22)
 
     def _speed_cap(self, mode):
         if mode == 'pv':
@@ -503,6 +504,8 @@ class Controller:
 
     async def command(self, command):
         action=command.get('action')
+        if action in ('servo_p03_enable','servo_p03_disable'):
+            return await self.operator_write(action,0x0307,1 if action=='servo_p03_enable' else 0,0x0307)
         if action in ('servo_enable','servo_disable'):
             return await self.set_servo_given(action=='servo_enable')
         if action in ('stop','estop'):
@@ -812,7 +815,7 @@ class Controller:
             intent_id=self.intent,epoch=self.epoch,faults=[x for x in (self.fault,self.storage_error) if x],
             travel_height_cm=self.config.travel_cm,base_height_cm=self.config.base_cm,
             soft_lower_cm=self.config.soft_lower_cm,soft_upper_cm=self.config.soft_upper_cm,
-            home_status=self.home_status,home_phase=self.home_phase,parameters=params,alarm_history=list(self.alarms),
+            home_status=self.home_status,home_phase=self.home_phase,parameters=params,alarm_history=list(self.alarms),operator_result=self.operator_result,
             limit_protection=dict(host='PP目标校验；基础JOG仅按物理限位方向拦截，不依赖软件高度',
                 driver='待实机验证：不假定P0A/P10软限位覆盖PV/JOG或HOME；仅只读观察',
                 motion_profile_verified=self.config.motion_profile_verified,mechanical='无电机抱闸；传动自锁，机械端点非日常停止方式'),

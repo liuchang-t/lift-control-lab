@@ -20,7 +20,7 @@ vm.runInContext('render(event)',context);assert.equal(get('height').textContent,
 vm.runInContext('editingSpeed.pp=true',context);get('ppSpeed').value='1.5';vm.runInContext('render(event)',context);assert.equal(get('ppSpeed').value,'1.5');get('target').value='1';assert.equal(JSON.stringify(vm.runInContext('targetCommand()',context)),JSON.stringify({action:'goto',target_cm:1}));
 const oldFetch=context.fetch;let observerRequests=0;context.fetch=()=>{observerRequests++;return new Promise(()=>{});};
 context.external={status:{online:true,control_mode:'sim',implementation:'candidate',details:{state:'IDLE',observed_motion:true,untracked_motion:true,speed_rpm:120,armed:false,position_trusted:false}},lease:{holder_name:'其他操作者',remaining_s:90}};
-vm.runInContext('render(external)',context);assert.match(get('state').textContent,/外部\/未跟踪运动/);assert.doesNotMatch(get('state').textContent,/静止/);assert.match(get('state').dataset.tip,/不推断/);assert.equal(observerRequests,0);
+vm.runInContext('render(external)',context);assert.match(get('state').textContent,/外部\/未跟踪运动/);assert.doesNotMatch(get('state').textContent,/静止/);assert.match(get('state').dataset.tip,/当前无控制台运动任务/);assert.equal(observerRequests,0);
 context.external.status.details={state:'MOVING',observed_motion:true,untracked_motion:false,armed:true,position_trusted:true};vm.runInContext('render(external)',context);assert.match(get('state').textContent,/运动中/);assert.doesNotMatch(get('state').textContent,/外部/);assert.equal(observerRequests,0);context.fetch=oldFetch;
 context.startupDisconnected={...context.connected,connected:false,state:'disconnected'};
 vm.runInContext('renderConnection(startupDisconnected)',context);assert.equal(get('height').textContent,'—');
@@ -108,7 +108,7 @@ vm.runInContext('connection=connected;renderForceInputs(force)',context);
 assert.equal(get('force18Read').textContent,507);
 assert.match(get('forceDi3').textContent,/1（高电平）/);
 assert.match(get('forceMatch').textContent,/给定与读回一致/);
-assert.match(html,/给定读回 ≠ 使能完成/);
+assert.match(html,/P03-07 · DI3极性给定/);
 context.force.given=511;vm.runInContext('renderForceInputs(force)',context);
 assert.match(get('forceMatch').textContent,/不同/);
 context.force.fresh=false;vm.runInContext('renderForceInputs(force)',context);
@@ -179,11 +179,22 @@ async function limitWarningReset(){
   for(const armed of [true,false]){
     context.loadEvent.status.details.alarm={code:0x950,reset_allowed:true};
     vm.runInContext('render(loadEvent)',context);
-    context.fetch=async()=>({ok:true,json:async()=>({status:{details:{armed}}})});
+    context.fetch=async()=>({ok:true,json:async()=>({status:{details:{armed,operator_result:{action:'reset_fault',write_ack:true,cleared:true}}}})});
     await get('resetFault').events.click();
-    assert.match(get('rejection').textContent,armed?/可继续点动/:/检查 \/ 恢复/);
+    assert.match(get('rejection').textContent,/报警已清除/);
   }
-  console.log('Limit warning reset UI: preserved readiness and recovery guidance passed.');
+  for(const [id,action,value] of [['servoP03Enable','servo_p03_enable',1],['servoP03Disable','servo_p03_disable',0]]){
+    let sent;
+    context.fetch=async(url,options)=>{sent=JSON.parse(options.body);return {ok:true,json:async()=>({status:{details:{operator_result:{action,write_ack:true,read_value:value,value}}}})};};
+    await get(id).events.click();
+    assert.equal(sent.action,action);
+    assert.match(get('rejection').textContent,new RegExp('P03-07='+value+' 已应答；读回 '+value));
+  }
+  context.persistent={status:{details:{operator_result:{action:'reset_fault',write_ack:true,cleared:false,alarm:{text:'Er.601'}}}}};
+  assert.match(vm.runInContext('operatorMessage(persistent)',context),/当前报警 Er.601/);
+  context.persistent.status.details.operator_result.read_error='读取超时';
+  assert.match(vm.runInContext('operatorMessage(persistent)',context),/已应答；读回失败：读取超时/);
+  console.log('Direct buttons UI: reset result, P03 writes/readback and read failures passed.');
 }
 
 context.warningHint={status:{online:true,implementation:'candidate',details:{state:'MOVING',motion_notice:'命令已应答，未检测到运动（Er.950）',motion_advice:'当前存在Er.950，可能是驱动器内部仍在阻止运动。请先松开点动，再点击“人工故障复位”。',armed:true}}};
@@ -205,3 +216,14 @@ assert.equal(get('home_creep_speed').value,'');
 get('home_speed').value='40000';get('home_creep_speed').value='';get('home_acceleration').value='25000';
 assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),JSON.stringify({home_speed:40000,home_creep_speed:null,home_acceleration:25000}));
 for(const id of ['home_speed','home_creep_speed','home_acceleration'])assert.ok(html.includes('id="'+id+'"'));
+
+// Explicit register controls remain available regardless of alarm or motion state.
+vm.runInContext('renderConnection(connected)',context);
+for(const state of ['FAULT','MOVING','HOMING','DISARMED']){
+  context.directState={status:{implementation:'candidate',online:false,details:{state,pending_stop:true,alarm:{code:0xffff,reset_allowed:false}}}};
+  vm.runInContext('render(directState)',context);
+  for(const id of ['resetFault','servoP03Enable','servoP03Disable'])assert.equal(get(id).disabled,false,id);
+}
+assert.ok(html.includes('复位前先失能'));
+assert.ok(html.includes('P03-07 · DI3极性给定'));
+assert.doesNotMatch(html,/不代替独立硬急停|给定读回 ≠ 使能完成/);

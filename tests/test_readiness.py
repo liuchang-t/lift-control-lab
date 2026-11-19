@@ -174,13 +174,13 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.view()['steps'])
         self.assertFalse(self.view()['can_move'])
 
-    async def test_single_move_rejection_explains_the_configured_distance(self):
+    async def test_legacy_single_move_rejection_does_not_instruct_artificial_segmentation(self):
         await self.prepared()
         self.service.last_rejection = {'message': '目标超过配置的单次位移上限'}
         view = self.view()
         self.assertEqual(view['last_rejection'], self.service.last_rejection)
         bound = '%.2f' % self.service.config.cm(self.service.config.max_move_pulse)
-        self.assertTrue(any(bound in step for step in view['steps']))
+        self.assertFalse(any('分段' in step for step in view['steps']))
 
     async def test_known_upper_limit_outside_work_range_offers_only_return_bound(self):
         await self.prepared()

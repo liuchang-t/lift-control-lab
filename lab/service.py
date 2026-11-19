@@ -8,6 +8,8 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from .controller import Controller, DIRECT_ACTIONS
+
+EXPLICIT_CONTROL_ACTIONS = DIRECT_ACTIONS | {'servo_enable', 'servo_disable'}
 from .driver import Driver
 from .legacy import Legacy
 from .model import Config, LabError, atomic_json_write, ROOT
@@ -266,7 +268,7 @@ class Service:
                     result['notice']='已断开：历史观测仅供参考，不自动连接'
                 return result
             if path=='/api/config':
-                return self.config.public()
+                return self.config.public(include_display=True)
             if path=='/api/logs':
                 return list(self.trace.items)
             if path=='/api/parameters':
@@ -302,7 +304,7 @@ class Service:
             if path=='/api/connection/disconnect':
                 return await self.disconnect(client)
             is_stop=suffix in ('/lift/control','/api/control') and body.get('action') in ('stop','estop')
-            is_direct=suffix in ('/lift/control','/api/control') and body.get('action') in DIRECT_ACTIONS
+            is_direct=suffix in ('/lift/control','/api/control') and body.get('action') in EXPLICIT_CONTROL_ACTIONS
             self._require_connected(allow_stop=is_stop or is_direct or path in ('/api/manual/transaction','/api/registers/refresh'))
             if path=='/api/manual/transaction':
                 return await self.manual_transaction(client,body)
@@ -351,7 +353,7 @@ class Service:
                     if bridge:
                         await self.acquire(client,role,'central')
                     self._require_owner(client)
-                if action in DIRECT_ACTIONS and self.config.implementation=='candidate':
+                if action in EXPLICIT_CONTROL_ACTIONS and self.config.implementation=='candidate':
                     self._require_manual_connection()
                     # Explicit register buttons replace old raw/automatic intent.
                     self._clear_manual()
@@ -550,8 +552,24 @@ class Service:
                     notice='仅发送所编辑报文；应答不代表运动完成，报警/限位仅观测，不自动插入控制指令' if parsed['write'] else '读取完成')
 
     async def update_config(self,body):
+        from .model import HOME_DISPLAY_FIELDS
+        body=dict(body)
+        for display,stored in HOME_DISPLAY_FIELDS.items():
+            if display in body and stored in body:
+                raise LabError('同一回零参数不能同时提交厘米单位与指令单位：'+display,400)
+        # Keep the persisted schema in command units. Conversion is performed
+        # only for explicitly edited display fields, using the candidate scale.
+        display_input={key:body.pop(key) for key in HOME_DISPLAY_FIELDS if key in body}
+        if display_input:
+            conversion=Config(**{**asdict(self.config),**{key:body[key] for key in ('cm_per_rev','pulses_per_rev') if key in body}})
+            try:
+                conversion.validate()
+                for key,value in display_input.items():
+                    body[HOME_DISPLAY_FIELDS[key]]=conversion.home_display_input(value)
+            except (ValueError,TypeError,ZeroDivisionError) as exc:
+                raise LabError(str(exc),400) from exc
         # Connection changes have a separate explicit stop/disconnect/connect lifecycle.
-        allowed={'cm_per_rev','travel_cm','base_cm','max_pp_speed','max_pv_speed','min_pp_speed','min_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','release_enable_s','soft_lower_cm','soft_upper_cm','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s','home_enable_hold_s','home_disable_hold_s','home_speed','home_creep_speed','home_acceleration'}
+        allowed={'pp_acceleration_cm_s2','pp_deceleration_cm_s2','pp_emergency_deceleration_cm_s2','pp_tolerance_cm','cm_per_rev','travel_cm','base_cm','max_pp_speed','max_pv_speed','min_pp_speed','min_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','release_enable_s','soft_lower_cm','soft_upper_cm','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s','home_enable_hold_s','home_disable_hold_s','home_speed','home_creep_speed','home_acceleration'}
         if set(body)-allowed:
             raise LabError('此处仅允许调整行程/速度/保护参数；连接参数请在连接设置中保存，再显式连接',400)
         if self.config.implementation=='candidate' and self.controller._sequence.locked():
@@ -564,6 +582,8 @@ class Service:
         values=asdict(self.config)
         values.update(body)
         candidate=Config(**values).validate()
+        changed={key for key in body if getattr(candidate,key)!=getattr(self.config,key)}
+        pp_runtime_only=changed <= {'pp_tolerance_cm','pp_acceleration_cm_s2','pp_deceleration_cm_s2','pp_emergency_deceleration_cm_s2'}
         for mode in ('pp','pv'):
             candidate.speed_pr(self.controller.speeds[mode],mode)
         if self.config.mode=='real':
@@ -584,13 +604,16 @@ class Service:
                     raise LabError('尚未确认静止，请等待升降杆停止后再保存参数')
             if ctrl is not self.controller or issued!=ctrl.epoch or ctrl.pending_stop:
                 raise LabError('控制状态已变化，请重新保存参数')
-            self.controller.epoch+=1
-            self.controller.armed=False
-            self.controller.trusted=False
             await asyncio.get_running_loop().run_in_executor(None,atomic_json_write,ROOT/'.runtime/config.json',asdict(candidate))
+            self.controller.epoch+=1
             self.config.__dict__.update(candidate.__dict__)
-            self.controller.driver.invalidate_parameters()
-            if not self.controller.pending_stop:
-                self.controller.state='DISARMED'
-            self.controller.home_status='not_homed'
-        return self.config.public()
+            if not pp_runtime_only:
+                self.controller.armed=False
+                self.controller.trusted=False
+                self.controller.driver.invalidate_parameters()
+                if not self.controller.pending_stop:
+                    self.controller.state='DISARMED'
+                self.controller.home_status='not_homed'
+        # PP runtime settings are applied/read back on the next PP start.
+        # Saving them neither changes the coordinate reference nor writes the drive.
+        return self.config.public(include_display=True)

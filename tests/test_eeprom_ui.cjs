@@ -29,6 +29,15 @@ context.atomicEvent.connection=context.startupDisconnected;vm.runInContext('rend
 context.atomicEvent.connection=context.connected;vm.runInContext('render(atomicEvent)',context);
 context.ready={summary:'需要检查',steps:['检查 / 恢复','回零'],checks:[{id:'armed',label:'检查通过',ok:false,detail:'先检查'}],actions:[{id:'arm',label:'检查 / 恢复',enabled:true}],manual:false,last_rejection:{message:'位置未可信',at:1}};
 vm.runInContext('renderReadiness(ready)',context);assert.equal(get('guideSummary').textContent,'需要检查');assert.equal(get('guideSteps').textContent,'检查 / 恢复 → 回零');assert.equal(get('conditions').children[0].textContent,'○ 检查通过');assert.match(get('rejection').textContent,/位置未可信/);assert.equal(get('endManual').disabled,true);
+// A successful command clears the backend rejection even while motion makes
+// can_move false. Do not keep an obsolete rejection until the next idle state.
+context.ready.last_rejection=null;context.ready.can_move=false;
+vm.runInContext('renderReadiness(ready)',context);assert.equal(get('rejection').hidden,true);
+vm.runInContext("notify('启动已被停止或新控制意图取消');renderReadiness(ready)",context);assert.equal(get('rejection').hidden,true);
+vm.runInContext("notify('PP 加减速度已保存，下次定位生效。');renderReadiness(ready)",context);assert.match(get('rejection').textContent,/已保存/);
+context.ready.last_rejection={message:'通信失败',at:2};
+vm.runInContext('renderReadiness(ready)',context);assert.match(get('rejection').textContent,/通信失败/);assert.equal(get('rejection').hidden,false);
+context.ready.last_rejection=null;
 context.ready.manual=true;vm.runInContext('renderReadiness(ready)',context);assert.equal(get('endManual').disabled,false);assert.match(get('manualState').textContent,/手动接管/);
 // Manual send is not gated by normal motion or a pending stop, but needs a live connection.
 context.manualPending={...context.connected,state:'stop_pending'};
@@ -134,14 +143,41 @@ vm.runInContext('pageLogs(1000)',context);assert.match(get('logs').textContent,/
 context.Date=Date;
 console.log('Log rendering bound: 20,000 retained; 300 DOM lines/date formats per page; 0 formats on unchanged poll; oldest history remains accessible; paused content stays fixed.');
 
-// Candidate real mode must not expose the legacy forced-DI PP/HOME path.
+// PP is available in real mode with a valid reference, independent of alarms.
 context.jogReal={...context.connected,mode:'real',current:{...context.connected.current,mode:'real'}};
-vm.runInContext('renderConnection(jogReal); applyConnectionState()',context);
-for(const id of ['goto','min','max'])assert.equal(get(id).disabled,true);
-context.homeReady={status:{online:true,implementation:'candidate',details:{state:'IDLE',armed:true}}};vm.runInContext('render(homeReady)',context);assert.equal(get('home').disabled,false);
+context.homeReady={status:{online:true,implementation:'candidate',details:{state:'IDLE',armed:true,position_trusted:true,alarm:{code:0xffff,reset_allowed:false}}}};
+vm.runInContext('readiness={manual:false};renderConnection(jogReal);render(homeReady)',context);
+for(const id of ['goto','min','max'])assert.equal(get(id).disabled,false);
+assert.equal(get('home').disabled,false);
+for(const change of [{position_trusted:false},{armed:false},{pending_stop:true},{state:'HOMING'},{state:'STARTING'}]){
+  context.ppUnavailable={status:{...context.homeReady.status,details:{...context.homeReady.status.details,...change}}};
+  vm.runInContext('render(ppUnavailable)',context);
+  for(const id of ['goto','min','max'])assert.equal(get(id).disabled,true);
+}
+vm.runInContext('render(homeReady)',context);
 assert.match(html,/>JOG 速度/);
 assert.doesNotMatch(html,/只允许软件保护范围内|回零后先全收到软件下限|靠近边界时保护逻辑可能降低/);
-console.log('Basic JOG UI: independent speed label, no homing/software-bound hints; real HOME available; unsafe PP disabled.');
+assert.match(html,/<div class="row target-row"><input id="target"[^>]*><button id="goto">到位<\/button><\/div>/);
+assert.match(html,/<div class="row work-bounds"><button id="min" data-action="min">收拢<\/button><button id="max" data-action="max">展开<\/button>/);
+assert.match(html,/id="positioningResult"[^>]*height:50px;min-height:50px/);
+for(const [status,label] of [['idle','未定位'],['preparing','定位准备中'],['moving','定位中'],['settling','到位确认中'],['complete','定位完成'],['already_at_target','已在目标范围'],['stopping','停止及收尾中'],['cancelled','定位任务已取消'],['stopped','定位已停止']]){
+  context.ppState={status:{...context.homeReady.status,details:{...context.homeReady.status.details,positioning:{status,target_cm:182,error_cm:-.125},target_cm:10}}};
+  get('target').value='175';
+  vm.runInContext('render(ppState)',context);
+  assert.equal(get('positionStatus').textContent,label);
+  assert.equal(get('positionValues').textContent,'目标 182.00 cm · 误差 -0.13 cm');
+  assert.equal(get('target').value,'175','PP status must not replace the next edited target');
+}
+context.ppState.status.details.positioning.detail='目标误差已满足，等待到位状态';
+vm.runInContext('render(ppState)',context);
+assert.match(get('positionStatus').textContent,/等待到位状态/);
+assert.match(get('positionStatus').dataset.tip,/等待到位状态/);
+vm.runInContext('renderConnection(startupDisconnected)',context);
+assert.equal(get('positionStatus').textContent,'未连接');
+assert.equal(get('stopPosition').disabled,true);
+assert.doesNotMatch(get('positionValues').textContent,/182|-0.13/);
+vm.runInContext('renderConnection(jogReal);render(homeReady)',context);
+console.log('PP UI: real targets enabled with reference; fixed result area; factual states; editable target preserved; disconnected values cleared.');
 
 context.ackStop={status:{online:true,implementation:'candidate',details:{state:'IDLE',stop_confirmation:'ack',observed_motion:true,untracked_motion:true,speed_rpm:80,armed:true}}};
 vm.runInContext('render(ackStop)',context);
@@ -194,7 +230,32 @@ async function limitWarningReset(){
   assert.match(vm.runInContext('operatorMessage(persistent)',context),/当前报警 Er.601/);
   context.persistent.status.details.operator_result.read_error='读取超时';
   assert.match(vm.runInContext('operatorMessage(persistent)',context),/已应答；读回失败：读取超时/);
-  console.log('Direct buttons UI: reset result, P03 writes/readback and read failures passed.');
+  let stopBody;
+  context.fetch=async(url,options)=>{stopBody=JSON.parse(options.body);return {ok:true,json:async()=>({status:{details:{stop_confirmation:'feedback'}}})};};
+  await get('stopPosition').events.click();
+  assert.equal(stopBody.action,'stop');
+  assert.equal(stopBody.intent_id,undefined);
+  assert.match(get('rejection').textContent,/定位停止已确认/);
+  for(const id of ['stop','stopPosition']){
+    for(const stop_notice of ['停止指令已应答，正在等待减速停止及失能收尾','']){
+      context.fetch=async()=>({ok:true,json:async()=>({status:{details:{pending_stop:true,stop_confirmation:'feedback',stop_notice}}})});
+      await get(id).events.click();
+      assert.match(get('rejection').textContent,/正在等待/);
+      assert.doesNotMatch(get('rejection').textContent,/已确认|确认静止|操作被拒绝/);
+      if(stop_notice)assert.equal(get('rejection').textContent,stop_notice);
+    }
+  }
+  get('pp_acceleration_cm_s2').value='1.2';get('pp_deceleration_cm_s2').value='0.4';get('pp_emergency_deceleration_cm_s2').value='';
+  const ppCalls=[];
+  context.fetch=async(url,options)=>{const body=JSON.parse(options.body);ppCalls.push({url,body});return{ok:true,json:async()=>body};};
+  await get('savePpParameters').events.click();
+  assert.equal(ppCalls.length,1);assert.equal(ppCalls[0].url,'/api/config');
+  assert.deepEqual(ppCalls[0].body,{pp_acceleration_cm_s2:1.2,pp_deceleration_cm_s2:.4,pp_emergency_deceleration_cm_s2:null});
+  assert.equal(get('pp_acceleration_cm_s2').value,1.2);assert.equal(get('pp_emergency_deceleration_cm_s2').value,'');
+  assert.match(get('rejection').textContent,/下次定位生效/);
+  assert.equal(JSON.parse(get('config').value).pp_deceleration_cm_s2,.4);
+  get('pp_acceleration_cm_s2').value='0';await get('savePpParameters').events.click();assert.equal(ppCalls.length,1);assert.match(get('rejection').textContent,/必须大于0/);
+  console.log('Direct buttons UI: reset, P03 readback, force DI availability and normal positioning stop passed.');
 }
 
 context.warningHint={status:{online:true,implementation:'candidate',details:{state:'MOVING',motion_notice:'命令已应答，未检测到运动（Er.950）',motion_advice:'当前存在Er.950，可能是驱动器内部仍在阻止运动。请先松开点动，再点击“人工故障复位”。',armed:true}}};
@@ -209,20 +270,30 @@ assert.doesNotMatch(get('state').dataset.tip,/驱动器内部/);
 assert.doesNotMatch(get('guideSteps').textContent,/驱动器内部/);
 
 // HOME intent fields remain separate from actual register monitoring and advanced JSON.
-context.homeConfig={home_speed:30000,home_creep_speed:null,home_acceleration:20000};
+context.homeConfig={home_speed:30000,home_creep_speed:null,home_acceleration:20000,home_display:{home_speed_cm_s:1.07764458,home_creep_speed_cm_s:null,home_acceleration_cm_s2:.71842972},pp_tolerance_cm:.05};
 vm.runInContext('showConfig(homeConfig)',context);
-assert.equal(get('home_speed').value,30000);
-assert.equal(get('home_creep_speed').value,'');
-get('home_speed').value='40000';get('home_creep_speed').value='';get('home_acceleration').value='25000';
-assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),JSON.stringify({home_speed:40000,home_creep_speed:null,home_acceleration:25000}));
-for(const id of ['home_speed','home_creep_speed','home_acceleration'])assert.ok(html.includes('id="'+id+'"'));
+assert.equal(get('home_speed_cm_s').value,1.07764458);
+assert.equal(JSON.parse(get('config').value).pp_tolerance_cm,.05);
+assert.equal(get('home_creep_speed_cm_s').value,'');
+assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),'{}');
+get('home_speed_cm_s').value='1.5';get('home_speed_cm_s').events.input();
+assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),JSON.stringify({home_speed_cm_s:1.5}));
+get('home_acceleration_cm_s2').value='';get('home_acceleration_cm_s2').events.input();
+assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),JSON.stringify({home_speed_cm_s:1.5,home_acceleration_cm_s2:null}));
+get('home_speed_cm_s').value='1.07764458';get('home_speed_cm_s').events.input();
+assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),JSON.stringify({home_acceleration_cm_s2:null}));
+vm.runInContext('showConfig(homeConfig)',context);
+assert.equal(JSON.stringify(vm.runInContext('homeParameterValues()',context)),'{}');
+for(const id of ['home_speed_cm_s','home_creep_speed_cm_s','home_acceleration_cm_s2']){assert.ok(html.includes('id="'+id+'"'));assert.equal(JSON.parse(get('config').value)[id],undefined);}
+assert.match(html,/搜索速度 · P10-36（cm\/s）/);assert.match(html,/回零加减速度 · P10-40（cm\/s²）/);
 
 // Explicit register controls remain available regardless of alarm or motion state.
 vm.runInContext('renderConnection(connected)',context);
 for(const state of ['FAULT','MOVING','HOMING','DISARMED']){
   context.directState={status:{implementation:'candidate',online:false,details:{state,pending_stop:true,alarm:{code:0xffff,reset_allowed:false}}}};
   vm.runInContext('render(directState)',context);
-  for(const id of ['resetFault','servoP03Enable','servoP03Disable'])assert.equal(get(id).disabled,false,id);
+  for(const id of ['resetFault','servoP03Enable','servoP03Disable','servoEnable','servoDisable'])assert.equal(get(id).disabled,false,id);
+  assert.equal(get('stopPosition').disabled,false);
 }
 assert.ok(html.includes('复位前先失能'));
 assert.ok(html.includes('P03-07 · DI3极性给定'));

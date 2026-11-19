@@ -10,6 +10,11 @@ from pathlib import Path
 from .units import Units, finite, integer
 
 ROOT = Path(__file__).resolve().parents[1]
+HOME_DISPLAY_FIELDS = {
+    'home_speed_cm_s':'home_speed',
+    'home_creep_speed_cm_s':'home_creep_speed',
+    'home_acceleration_cm_s2':'home_acceleration',
+}
 
 
 class LabError(Exception):
@@ -38,6 +43,10 @@ class Config:
     soft_lower_cm: float = 1.0
     soft_upper_cm: float = None
     home_reference_pulse: int = 0
+    pp_acceleration_cm_s2: float = None
+    pp_deceleration_cm_s2: float = None
+    pp_emergency_deceleration_cm_s2: float = None
+    pp_tolerance_cm: float = 0.05
     home_tolerance_cm: float = 0.05
     home_timeout_s: float = 600.0
     home_start_timeout_s: float = 3.0
@@ -100,9 +109,13 @@ class Config:
                 raise ValueError('每种模式必须满足 0 < 最低速度 <= 最高速度 <= int32')
         if not 0 <= finite(self.soft_lower_cm) < finite(self.soft_upper_cm) <= self.travel_cm:
             raise ValueError('必须满足 0 <= 软件下限 < 软件上限 <= 行程')
-        for name in ('home_tolerance_cm','home_timeout_s','home_start_timeout_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm'):
+        for name in ('pp_tolerance_cm','home_tolerance_cm','home_timeout_s','home_start_timeout_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm'):
             if finite(getattr(self,name)) <= 0:
                 raise ValueError(name+' 必须为有限正数')
+        for name in ('pp_acceleration_cm_s2','pp_deceleration_cm_s2','pp_emergency_deceleration_cm_s2'):
+            value=getattr(self,name)
+            if value is not None:
+                self.acceleration_pr(value)
         for name in ('home_speed','home_creep_speed','home_acceleration'):
             value=getattr(self,name)
             if value is not None and (type(value) is not int or not 1 <= value <= 2147483647):
@@ -119,6 +132,16 @@ class Config:
         if self.mode == "real" and self.bridge_enabled and not self.bridge_token:
             raise ValueError("real Bridge requires a token")
         return self
+
+    def home_display_input(self, value):
+        if value is None:
+            return None
+        if finite(value)<=0:
+            raise ValueError('回零速度和加减速度必须为有限正数')
+        result=self.pulse(value)
+        if not 1<=result<=2147483647:
+            raise ValueError('回零参数换算后须为1～2147483647指令单位')
+        return result
 
     def home_parameters(self, actual):
         # Saved intent is separate from the drive's observed values.
@@ -152,6 +175,15 @@ class Config:
             raise ValueError('取整后速度越界')
         return result
 
+    def acceleration_pr(self, cm_s2):
+        value=finite(cm_s2)
+        if value<=0:
+            raise ValueError('PP加减速度必须为有限正数')
+        result=self.pulse(value)
+        if not 1<=result<=2147483647:
+            raise ValueError('PP加减速度换算后须为1～2147483647指令单位/s²')
+        return result
+
     def stopping_distance(self, cm_s):
         value=abs(finite(cm_s))
         return value*self.control_latency_s+value*value/(2*self.verified_deceleration_cm_s2)+self.limit_margin_cm
@@ -162,8 +194,13 @@ class Config:
         maximum = self.max_pp_speed if mode == "pp" else self.max_pv_speed
         return max(getattr(self,'min_'+mode+'_speed'), min(maximum, integer(ratio * maximum)))
 
-    def public(self):
-        return {k: v for k, v in asdict(self).items() if k not in {"bridge_token","mqtt_password"}}
+    def public(self, include_display=False):
+        result={k: v for k, v in asdict(self).items() if k not in {"bridge_token","mqtt_password"}}
+        if include_display:
+            result['home_display']={
+                display:None if getattr(self,stored) is None else self.cm(getattr(self,stored))
+                for display,stored in HOME_DISPLAY_FIELDS.items()}
+        return result
 
 
 class CalibrationStore:

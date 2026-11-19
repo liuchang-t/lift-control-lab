@@ -44,7 +44,7 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.sim.enabled)
         self.assertIsNone(self.sim.motion)
         events=list(self.service.trace.items)
-        confirmed=next(i for i,x in enumerate(events) if x['kind']=='stop_acknowledged')
+        confirmed=next(i for i,x in enumerate(events) if x['kind']=='servo_stationary_confirmed')
         force=next(i for i,x in enumerate(events) if x['kind']=='tx' and bytes.fromhex(x['frame'])[1:6]==bytes([6,13,17,0,1]))
         self.assertLess(confirmed,force)
 
@@ -53,13 +53,20 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LabError):
             await self.ctrl.command({'action':'servo_disable'})
         self.assertFalse(any(a in (0x0D11,0x0D12) for a,v in self.writes()))
-        self.assertTrue(self.ctrl.pending_stop)
+        self.assertFalse(self.ctrl.pending_stop)
+        self.assertTrue(self.ctrl.manual_failed)
 
-    async def test_enable_rejected_while_moving(self):
+    async def test_enable_stops_current_motion_then_sets_given(self):
         self.ctrl.mode='pv'
-        with self.assertRaises(LabError):
-            await self.ctrl.command({'action':'servo_enable'})
-        self.assertEqual(self.writes(),[])
+        self.ctrl.driver.jog_context=True
+        self.ctrl.driver.jog_running=True
+        self.sim.enabled=True
+        self.sim.motion='up'
+        self.sim.physical=self.sim.config.pulse(5)
+        await self.ctrl.command({'action':'servo_enable'})
+        self.assertIsNone(self.sim.motion)
+        self.assertTrue(self.sim.enabled)
+        self.assertLess(self.writes().index((0x0D08,256)),self.writes().index((0x0D11,1)))
 
     async def test_alarm_does_not_gate_enable_or_disable(self):
         self.sim.regs[0x0B22]=0x6121
@@ -103,7 +110,8 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(LabError):
                 await self.ctrl.command({'action':'servo_enable'})
         self.assertNotIn((0x0D12,507),self.writes())
-        self.assertTrue(self.ctrl.pending_stop)
+        self.assertFalse(self.ctrl.pending_stop)
+        self.assertTrue(self.ctrl.manual_failed)
 
 
     async def test_buttons_write_and_read_each_force_step_in_order(self):
@@ -152,3 +160,68 @@ class ServoButtonTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(LabError):
                 await self.ctrl.command({'action':'servo_disable'})
         self.assertFalse(any(a in (0x0D11,0x0D12) for a,v in self.writes()))
+
+    async def test_failed_old_cleanup_never_runs_from_explicit_buttons(self):
+        for enabled in (True,False):
+            self.ctrl.mode='pp'
+            self.ctrl.pending_stop=True
+            self.ctrl.driver.bus_enable_owned=True
+            self.ctrl.fault='old cleanup timeout'
+            with patch.object(self.ctrl.driver,'release_bus_enable',side_effect=AssertionError('old cleanup must not run')):
+                await self.ctrl.command({'action':'servo_enable' if enabled else 'servo_disable'})
+            self.assertFalse(self.ctrl.driver.bus_enable_owned)
+            self.assertFalse(self.ctrl.pending_stop)
+            self.assertFalse(self.ctrl.armed)
+            self.assertEqual(self.sim.regs[0x0D12],507 if enabled else 511)
+
+    async def test_software_estop_and_alarm_do_not_block_given_and_latch_remains(self):
+        for action in ('servo_enable','servo_disable'):
+            self.ctrl.emergency=True
+            self.ctrl.pending_stop=True
+            self.sim.regs[0x0B22]=0xFFFF
+            await self.ctrl.command({'action':action})
+            self.assertTrue(self.ctrl.emergency)
+            self.assertFalse(self.ctrl.armed)
+        self.assertNotIn((0x0D01,1),self.writes())
+
+    async def test_service_manual_and_stop_pending_allow_explicit_servo_buttons(self):
+        self.service.connected=True
+        for action in ('servo_enable','servo_disable'):
+            self.service.connection_state='stop_pending'
+            self.service.manual_active={'holder_id':'old-client'}
+            self.ctrl.manual_active=True
+            self.ctrl.pending_stop=True
+            await self.service.request('POST','/api/control',{'action':action},{'X-Patrol-Client-Id':'new-client'})
+            self.assertEqual(self.sim.regs[0x0D12],507 if action=='servo_enable' else 511)
+            self.assertFalse(self.ctrl.manual_active)
+
+    async def test_new_explicit_button_cancels_inflight_old_cleanup(self):
+        entered,resume=asyncio.Event(),asyncio.Event()
+        self.ctrl.mode='pp'
+        self.ctrl.driver.bus_enable_owned=True
+        self.ctrl._stop_intent()
+        async def old_cleanup(checkpoint):
+            entered.set()
+            await resume.wait()
+            checkpoint()
+            raise AssertionError('old cleanup resumed')
+        with patch.object(self.ctrl.driver,'release_bus_enable',side_effect=old_cleanup):
+            old=asyncio.create_task(self.ctrl._confirm_stop())
+            await asyncio.wait_for(entered.wait(),1)
+            await asyncio.wait_for(self.ctrl.command({'action':'servo_disable'}),1)
+            resume.set()
+            with self.assertRaises(LabError):await old
+        self.assertEqual(self.sim.regs[0x0D11],0)
+        self.assertEqual(self.sim.regs[0x0D12],511)
+        self.assertFalse(self.ctrl.driver.bus_enable_owned)
+        self.assertFalse(self.ctrl.pending_stop)
+
+    async def test_failed_explicit_sequence_allows_next_button_without_recovery(self):
+        original=self.ctrl.driver.set_force_servo_given
+        with patch.object(self.ctrl.driver,'set_force_servo_given',side_effect=TimeoutError('readback failed')):
+            with self.assertRaises(LabError):await self.ctrl.command({'action':'servo_enable'})
+        self.assertTrue(self.ctrl.manual_failed)
+        self.assertFalse(self.ctrl.pending_stop)
+        await self.ctrl.command({'action':'servo_disable'})
+        self.assertEqual(self.sim.regs[0x0D12],511)
+        self.assertFalse(self.ctrl.manual_failed)

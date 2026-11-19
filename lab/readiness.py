@@ -95,9 +95,9 @@ def build_readiness(service, client):
         action('stop', '停止')
         action('exit_manual', '结束手动')
     elif pending:
-        home_stopping = getattr(ctrl, 'mode', None) == 'home' or getattr(ctrl.driver, 'home_enable_owned', False)
-        summary = '回零停止处理中：等待静止反馈与撤销使能给定' if home_stopping else '停止命令尚未确认应答，请稍后重新按住'
-        steps.append('HOME停止不仅确认命令应答，还需核验实际转速/位置静止，再清除控制字并撤销P03-07的S-ON给定；完成前不能重新启动。通信中断时使用现场停机措施。' if home_stopping else '等待停止命令应答；当前转速和位置见状态栏。')
+        home_stopping = getattr(ctrl, 'mode', None) in ('home','pp') or getattr(ctrl.driver, 'bus_enable_owned', False)
+        summary = '总线运动收尾：等待静止反馈与撤销使能给定' if home_stopping else '停止命令尚未确认应答，请稍后重新按住'
+        steps.append('等待转速与位置稳定，再清除控制字并撤销P03-07给定。' if home_stopping else '等待停止命令应答；当前转速和位置见状态栏。')
         action('stop', '再次请求停止')
     elif not online:
         summary = '反馈离线或已过期'
@@ -105,7 +105,7 @@ def build_readiness(service, client):
     elif moving:
         home_phases = {'preparing':'回零：准备参数与使能给定', 'seeking_lower':'回零：寻找下限位', 'leaving_lower':'回零：脱离下限位', 'settling':'回零：核对完成位、位置和静止'}
         summary = data.get('motion_notice') or (home_phases.get(data.get('home_phase'), '回零进行中') if getattr(ctrl, 'mode', None) == 'home' else '运动进行中')
-        steps.append(data.get('motion_advice') or ('此提示不锁定点动；松开即发送停止。' if data.get('motion_notice') else '等待完成；需要中断时点击“停止”或“软件急停”。'))
+        steps.append(data.get('motion_advice') or (('可点击停止中断定位。' if getattr(ctrl,'mode',None)=='pp' else '松开点动按钮停止。') if data.get('motion_notice') else '等待完成；需要中断时点击“停止”或“软件急停”。'))
         action('stop', '停止')
     elif data.get('untracked_motion') and data.get('stop_confirmation')!='ack':
         summary = '设备正在运动（非本后端任务）'
@@ -156,9 +156,7 @@ def build_readiness(service, client):
     if rejection:
         message = rejection.get('message', '')
         hint = None
-        if '单次位移' in message:
-            hint = '本次位移过大：分段设置目标，每次不超过 %.2f cm。' % service.config.cm(service.config.max_move_pulse)
-        elif '速度为0' in message or '安全点动' in message:
+        if '速度为0' in message or '安全点动' in message:
             hint = '检查对应模式速度是否为0；距端点太近时，改用PP定位到端点。'
         elif '目标超出' in message:
             hint = '将目标高度设在 %.2f–%.2f cm 范围内。' % (lo, hi)

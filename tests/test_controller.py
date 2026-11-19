@@ -168,7 +168,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda:self.ctrl.mode is None)
         self.assertAlmostEqual(self.cfg.cm(self.sim.physical+self.sim.counter_offset-self.cfg.home_reference_pulse),.2,places=2)
         with self.assertRaises(LabError):
-            await self.ctrl.command(dict(action='max'))
+            await self.ctrl.command(dict(action='goto',target_cm=self.cfg.soft_upper_cm+1))
 
     async def test_zero_speed_never_falls_back_to_default(self):
         await self.ctrl.command(dict(action='set_speed',mode='pv',speed_cm_s=0))

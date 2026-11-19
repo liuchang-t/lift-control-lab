@@ -52,7 +52,7 @@ window.addEventListener('blur',releaseAll);window.addEventListener('pagehide',re
 document.addEventListener('visibilitychange',()=>{if(document.hidden)releaseAll();});
 document.querySelectorAll('[data-jog]').forEach(b=>bindHold(b,b.dataset.jog));
 click('arm',async()=>{if(connection.mode==='real'&&!await ask('检查 / 恢复前确认','即将检查驱动参数；检查本身不启动运动。请确认现场可随时停止设备，再继续。'))return;await api('/api/arm',{hardware_confirmed:true});notify('检查通过。按上方恢复指引继续。');});
-click('stop',async()=>{releaseAll(false);const result=await control({action:'stop'});const d=result.status?.details||result.payload?.state;notify(d?.stop_confirmation==='feedback'?'全局停止已发送并确认静止。':'停止请求已处理，请核对实际反馈。');});
+click('stop',async()=>{releaseAll(false);const result=await control({action:'stop'});const d=result.status?.details||result.payload?.state;notify(d?.pending_stop?(d.stop_notice||'停止请求已提交，正在等待静止及收尾。'):d?.stop_confirmation==='feedback'?'全局停止已发送并确认静止。':'停止请求已处理，请核对实际反馈。');});
 click('estop',async()=>{releaseAll(false);settleConfirmation(false);pendingFrame=null;$('writeConfirm').hidden=true;await control({action:'estop'});notify('软件急停已锁定。排查原因后点“检查 / 恢复”；位置未可信时还需回零。');});
 click('home',async()=>{if(baseline())throw new Error('冻结基线不支持回零');if(connection.mode==='real'&&!await ask('模式17回零','将向负限位寻找并反向脱离。已确认方向、限位、HOME速度和行程安全？'))return;await control({action:'home',confirm_homing:true});notify('正在回零。请观察回零阶段、限位和位置反馈。');});
 function operatorMessage(result){
@@ -70,6 +70,7 @@ click('servoP03Disable',async()=>{releaseAll(false);notify(operatorMessage(await
 function inputNumber(id){const text=String($(id).value).trim();if(!text||!Number.isFinite(Number(text)))throw new Error('请输入有效数值');return Number(text);}
 function targetCommand(){const target=inputNumber('target');return baseline()?{action:'goto',height:target/config.travel_cm*100}:{action:'goto',target_cm:target};}
 click('goto',()=>control(targetCommand()));
+click('stopPosition',async()=>{releaseAll(false);const result=await control({action:'stop'});const d=result.status?.details||result.payload?.state;notify(d?.pending_stop?(d.stop_notice||'定位停止请求已提交，正在等待静止及收尾。'):d?.stop_confirmation==='feedback'?'定位停止已确认。':'定位停止请求已提交。');});
 document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',async()=>{try{await control({action:b.dataset.action});await refreshReadiness();}catch(e){notify(e.message);refreshReadiness();}}));
 async function saveSpeed(mode){if(baseline())throw new Error('冻结基线不支持独立速度设置');const result=await control({action:'set_speed',mode,speed_cm_s:inputNumber(mode+'Speed')});editingSpeed[mode]=false;notify(mode.toUpperCase()+' 速度已保存。');return result;}
 for(const mode of ['pp','pv'])$(mode+'Speed').addEventListener('input',()=>editingSpeed[mode]=true);
@@ -77,20 +78,35 @@ click('savePpSpeed',()=>saveSpeed('pp'));click('savePvSpeed',()=>saveSpeed('pv')
 click('saveLegacySpeed',()=>control({action:'set_speed',speed:inputNumber('legacySpeed')}));
 click('legacyZero',async()=>{if(await ask('基线设零','仅模拟：将当前反馈记为软件零点，不执行回零。'))await control({action:'set_retracted_zero',confirm_retracted:true});});
 $('target').addEventListener('focus',()=>draggingTarget=true);$('target').addEventListener('blur',()=>draggingTarget=false);
-const configKeys=['travel_cm','base_cm','soft_lower_cm','soft_upper_cm','min_pp_speed','max_pp_speed','min_pv_speed','max_pv_speed','max_move_pulse','deadman_s','poll_s','startup_grace_s','stall_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s','home_enable_hold_s','home_disable_hold_s'];
-const homeParameterKeys=['home_speed','home_creep_speed','home_acceleration'];
-function homeParameterValues(){return Object.fromEntries(homeParameterKeys.map(k=>[k,$(k).value.trim()===''?null:Number($(k).value)]));}
-function showConfig(value){config=value;for(const k of homeParameterKeys)$(k).value=config[k]??'';if(!editingMechanical&&config.cm_per_rev!==undefined)$('mechanicalCm').value=config.cm_per_rev;$('target').min=config.soft_lower_cm??0;$('target').max=config.soft_upper_cm??config.travel_cm;$('config').value=JSON.stringify(Object.fromEntries(configKeys.filter(k=>config[k]!==undefined).map(k=>[k,config[k]])),null,2);}
+const configKeys=['travel_cm','base_cm','soft_lower_cm','soft_upper_cm','min_pp_speed','max_pp_speed','pp_tolerance_cm','pp_acceleration_cm_s2','pp_deceleration_cm_s2','pp_emergency_deceleration_cm_s2','min_pv_speed','max_pv_speed','deadman_s','poll_s','startup_grace_s','stall_s','verified_deceleration_cm_s2','control_latency_s','limit_margin_cm','home_timeout_s','home_enable_hold_s','home_disable_hold_s'];
+const ppParameterKeys=['pp_acceleration_cm_s2','pp_deceleration_cm_s2','pp_emergency_deceleration_cm_s2'];
+async function savePpParameters(){const values=Object.fromEntries(ppParameterKeys.map(k=>{const raw=$(k).value.trim(),value=raw===''?null:Number(raw);if(value!==null&&(!Number.isFinite(value)||value<=0))throw new Error('加减速度必须大于0，留空则沿用驱动值。');return[k,value];}));showConfig(await api('/api/config',values));notify('PP 加减速度已保存，下次定位生效。');}
+click('savePpParameters',savePpParameters);
+const homeParameterKeys=['home_speed_cm_s','home_creep_speed_cm_s','home_acceleration_cm_s2'];
+const editedHomeParameters=new Set(),homeParameterInitial={};
+for(const k of homeParameterKeys)$(k).addEventListener('input',()=>editedHomeParameters.add(k));
+function homeParameterValues(){return Object.fromEntries(homeParameterKeys.filter(k=>editedHomeParameters.has(k)).map(k=>{const raw=$(k).value.trim(),value=raw===''?null:Number(raw);if(value!==null&&(!Number.isFinite(value)||value<=0))throw new Error('回零速度及加减速度必须大于0，留空则沿用驱动值。');return[k,value];}).filter(([k,value])=>value!==homeParameterInitial[k]));}
+function showConfig(value){config=value;editedHomeParameters.clear();for(const k of homeParameterKeys){const display=config.home_display?.[k]??null;$(k).value=display??'';homeParameterInitial[k]=display;}for(const k of ppParameterKeys)$(k).value=config[k]??'';if(!editingMechanical&&config.cm_per_rev!==undefined)$('mechanicalCm').value=config.cm_per_rev;$('target').min=config.soft_lower_cm??0;$('target').max=config.soft_upper_cm??config.travel_cm;$('config').value=JSON.stringify(Object.fromEntries(configKeys.filter(k=>config[k]!==undefined).map(k=>[k,config[k]])),null,2);}
 click('openConfig',()=>$('configPanel').hidden=false);click('closeConfig',()=>$('configPanel').hidden=true);
-click('saveConfig',async()=>{showConfig(await api('/api/config',{...JSON.parse($('config').value),...homeParameterValues()}));$('configPanel').hidden=true;notify('配置已保存。下一步：检查 / 恢复即可基础点动；定位另需回零。');});
+click('saveConfig',async()=>{showConfig(await api('/api/config',{...JSON.parse($('config').value),...homeParameterValues()}));$('configPanel').hidden=true;notify('配置已保存。');});
 function ageSeconds(value){return value===null||value===undefined?'—':Math.max(0,Math.floor(Number(value)))+' 秒';}
 function number(value,unit='',digits=2){return value===null||value===undefined?'—':Number(value).toFixed(digits)+(unit?' '+unit:'');}
 function renderSpeeds(d){for(const mode of ['pp','pv']){const speed=d.speeds?.[mode];if(!speed){$(mode+'SpeedInfo').textContent='等待读取';continue;}if(!editingSpeed[mode])$(mode+'Speed').value=Number(Number(speed.requested_cm_s).toPrecision(12));$(mode+'Speed').max=speed.max_cm_s;$(mode+'SpeedInfo').textContent=`非零 ${number(speed.min_cm_s,'',3)}–${number(speed.max_cm_s,'',3)} · 比例 ${number(speed.ratio)}`;$(mode+'SpeedInfo').dataset.tip=`已保存 ${number(speed.requested_cm_s,'cm/s',3)}；${number(speed.pr_s,'Pr/s')}；${number(speed.rpm,'rpm')}。速度以cm/s独立保存，0表示不启动。`;}}
 function renderAlarm(d){const alarm=d.alarm;$('alarmTitle').textContent=alarm?`${alarm.text||''} ${alarm.name||''}`:'等待读取';$('alarmCode').textContent=alarm?.raw_hex||'';$('alarmAdvice').textContent=alarm?.advice||'';$('alarmPolicy').textContent=alarm?.policy||'';$('resetFault').disabled=directButtonDisabled();}
+function renderPositioning(value){
+  const p=value||{},labels={idle:'未定位',preparing:'定位准备中',moving:'定位中',settling:'到位确认中',complete:'定位完成',already_at_target:'已在目标范围',stopping:'停止及收尾中',cancelled:'定位任务已取消',stopped:'定位已停止'};
+  const label=labels[p.status]||'未定位';
+  $('positionStatus').textContent=connection.connected?(label+(p.detail?' · '+p.detail:'')):'未连接';
+  $('positionStatus').dataset.tip=connection.connected?(p.detail||''):'';
+  $('positionValues').textContent=`目标 ${number(connection.connected?p.target_cm:null,'cm')} · 误差 ${number(connection.connected?p.error_cm:null,'cm')}`;
+  $('positionValues').dataset.tip='目标高度减当前伸出高度。';
+}
 function render(value){
   // Device status and connection arrive in the same SSE snapshot; render them together.
   if(value.connection)renderConnection(value.connection);
   live=value.status;const d=live.details||{},check=d.eeprom_check;
+  $('min').dataset.tip=`收拢至设定高度 ${number(d.soft_lower_cm??config.soft_lower_cm,'cm')}。`;
+  $('max').dataset.tip=`展开至设定高度 ${number(d.soft_upper_cm??config.soft_upper_cm,'cm')}。`;
   if(live.online&&d.di4_function===14&&d.di5_function===15&&[0,1].includes(d.di4_logic)&&[0,1].includes(d.di5_logic)&&d.upper_limit===false&&d.lower_limit===false&&lastNotice.includes('物理限位禁止该方向'))notify('');
   if(lastNotice.startsWith('正在回零')&&!['starting','homing'].includes(d.home_status))notify('');
   $('eeprom').textContent=check?`P0C-13 ${check.value??'未知'}${check.status==='warning'?' · 待检查':''}`:'冻结基线不提供 P0C-13 检查';$('eeprom').dataset.status=check?.status||'unknown';$('eeprom').dataset.tip=check?.message||'基线仅模拟';
@@ -107,7 +123,9 @@ function render(value){
   $('fault').textContent=(d.faults||[]).join('；');
   $('home').disabled=baseline()||!live.online||!d.armed||!!d.pending_stop||['MOVING','HOMING','STARTING'].includes(d.state);
   $('independentSpeeds').hidden=baseline();$('legacySpeedSettings').hidden=!baseline();if(!baseline())renderSpeeds(d);renderAlarm(d);
-  if(!draggingTarget&&d.target_cm!=null)$('target').value=Number(d.target_cm).toFixed(3);
+  // Keep a newly edited PP target independent of asynchronous status updates.
+  if(baseline()&&!draggingTarget&&d.target_cm!=null)$('target').value=Number(d.target_cm).toFixed(3);
+  renderPositioning(d.positioning);
   renderConversion(d.unit_verification);
   renderForceInputs(d.force_inputs);
   applyConnectionState();
@@ -130,7 +148,7 @@ function renderReadiness(value){
   for(const check of value.checks||[]){const chip=document.createElement('span');chip.className='condition'+(check.ok?' ok':'');chip.textContent=(check.ok?'✓ ':'○ ')+check.label;chip.dataset.tip=check.detail||'';$('conditions').appendChild(chip);}
   $('guideActions').replaceChildren();for(const action of value.actions||[]){const button=document.createElement('button');button.textContent=action.label;button.disabled=action.enabled===false;button.dataset.tip=action.reason||'';button.addEventListener('click',()=>{const map={reset_fault:'resetFault',readParameters:'refreshRegisters',connect:'connectDevice',connect_device:'connectDevice',disconnect:'disconnectDevice'};if(action.id==='exit_manual'){api('/api/manual/exit',{}).then(()=>{notify('手动接管已结束。下一步：检查 / 恢复即可基础点动；定位另需回零。');return refreshReadiness();}).catch(e=>notify(e.message));}else $(map[action.id]||action.id)?.click();});$('guideActions').appendChild(button);}
   applyConnectionState();
-  if(value.last_rejection?.message){const when=value.last_rejection.at||0;if(when>renderReadiness.rejectionAt){renderReadiness.rejectionAt=when;notify('操作被拒绝：'+value.last_rejection.message);}}else if(value.can_move&&lastNotice.startsWith('操作被拒绝：'))notify('');
+  if(value.last_rejection?.message){const when=value.last_rejection.at||0;if(when>renderReadiness.rejectionAt){renderReadiness.rejectionAt=when;notify('操作被拒绝：'+value.last_rejection.message);}}else if(lastNotice.startsWith('操作被拒绝：')||lastNotice.includes('启动已被停止或新控制意图取消'))notify('');
 }
 renderReadiness.rejectionAt=0;
 let readingReadiness=false;
@@ -274,18 +292,23 @@ function applyConnectionState(){
   $('connectDevice').disabled=active||transition||connection.state==='unknown';
   $('disconnectDevice').disabled=!active||transition;
   const disabled=!active||transition||connection.state==='stop_pending';
-  $('servoEnable').disabled=disabled||baseline()||!!readiness?.manual||['MOVING','HOMING','STARTING','STOPPING'].includes(live.details?.state)||!!live.details?.pending_stop;
-  $('servoDisable').disabled=!active||transition||baseline()||!!readiness?.manual;
+  $('servoEnable').disabled=directButtonDisabled();
+  $('servoDisable').disabled=directButtonDisabled();
   for(const id of ['arm','goto','min','max','savePpSpeed','savePvSpeed','saveLegacySpeed','legacyZero'])$(id).disabled=disabled;
   $('refreshRegisters').disabled=!active||transition;
   for(const id of ['sendFrame','confirmFrame'])$(id).disabled=!active||transition;
-  document.querySelectorAll('[data-jog]').forEach(b=>b.disabled=disabled);
-  if(connection.mode==='real'&&!baseline()){for(const id of ['goto','min','max'])$(id).disabled=true;}
+  document.querySelectorAll('[data-jog]').forEach(b=>b.disabled=disabled||!!live.details?.pending_stop);
+  if(!baseline()){
+    const d=live.details||{};
+    const positioningDisabled=disabled||!live.online||!d.armed||!d.position_trusted||!!d.pending_stop||!!readiness?.manual||['HOMING','STARTING','STOPPING'].includes(d.state);
+    for(const id of ['goto','min','max'])$(id).disabled=positioningDisabled;
+  }
   // Stops stay available while a disconnect request is waiting for hardware confirmation.
-  $('stop').disabled=!active;$('estop').disabled=!active;
+  $('stop').disabled=!active;$('estop').disabled=!active;$('stopPosition').disabled=!active;
   if(disabled){$('home').disabled=true;$('endManual').disabled=true;}
   for(const id of ['resetFault','servoP03Enable','servoP03Disable'])$(id).disabled=directButtonDisabled();
   if(!active){
+    renderPositioning(null);
     renderForceInputs(null);
     $('mode').textContent=(connection.mode==='real'?'真实设备':'模拟')+' · 未连接';
     for(const id of ['height','rpm','speedApplied'])$(id).textContent='—';

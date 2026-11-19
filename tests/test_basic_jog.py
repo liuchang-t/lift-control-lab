@@ -161,16 +161,24 @@ class BasicJogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(v['can_jog_down'])
         self.assertIn('无需回零',v['summary'])
 
-    async def test_real_pp_blocked_but_home_uses_physical_di_path(self):
-        self.c.config.mode='real'
+    async def test_real_pp_and_home_use_physical_di_path(self):
+        from lab.transport import Simulator
+        self.assertIsInstance(self.sim,Simulator)
+        self.c.config.mode='real'  # Keep explicit Simulator transport; never connect hardware.
         self.c.trusted=True
         self.s.trace.clear()
-        with self.assertRaisesRegex(LabError,'PP'):
-            await self.c.driver.start('pp',10000,1000,'up',lambda:None)
-        self.assertEqual(self.writes(),[])
+        await self.c.driver.start('pp',10000,self.c.config.pulse(6),'up',lambda:None)
+        self.assertIn((0x0307,1),self.writes())
+        self.assertIn((0x0D08,3),self.writes())
+        self.assertEqual(self.sim.regs[0x0D11],0)
+        self.assertFalse(any(a in (0x0D11,0x0D12) for a,v in self.writes()))
+        await self.c.driver.stop()
+        await self.c.driver.release_bus_enable()
+        self.s.trace.clear()
         await self.c.driver.home(lambda:None,lambda:None)
         self.assertIn((0x0307,1),self.writes())
         self.assertIn((0x0D08,128),self.writes())
+        self.assertEqual(self.sim.regs[0x0D11],0)
         self.assertFalse(any(a in (0x0D11,0x0D12) for a,v in self.writes()))
 
     def test_direction_policy_matrix(self):

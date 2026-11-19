@@ -232,6 +232,7 @@ class HomePhysicalSequenceTests(unittest.IsolatedAsyncioTestCase):
         for target in sequence:
             for timeout in (False,True):
                 with self.subTest(target=target,timeout=timeout):
+                    self.driver.home_enable_owned=False
                     self.driver.home_enable_owned=True
                     await self.driver.wire.write_register(0x0307,1)
                     self.trace.clear()
